@@ -67,7 +67,40 @@ printf unicode >"$TEST_ROOT/order-b/é"
 printf latin >"$TEST_ROOT/order-b/z"
 [[ $(identity "$TEST_ROOT/order-a") == "omarchy-runtime-tree-sha256-v1:908208569b7cb1185938bc9f789810a61d5d284abf48b6539de69c1165c2913d" ]]
 [[ $(identity "$TEST_ROOT/order-b") == "omarchy-runtime-tree-sha256-v1:908208569b7cb1185938bc9f789810a61d5d284abf48b6539de69c1165c2913d" ]]
+literal_order_digest=$({
+  printf 'omarchy-runtime-tree-sha256-v1\0'
+  printf 'F\0\0\0\1z\0\0\1\244\0\0\0\0\0\0\0\5latin'
+  printf 'F\0\0\0\2\303\251\0\0\1\244\0\0\0\0\0\0\0\7unicode'
+} | sha256sum | cut -d' ' -f1)
+[[ $literal_order_digest == 908208569b7cb1185938bc9f789810a61d5d284abf48b6539de69c1165c2913d ]]
 printf 'ok - encoded UTF-8 byte ordering is stable\n'
+
+mkdir -p "$TEST_ROOT/empty-directories/a/b" "$TEST_ROOT/empty-directories/z"
+empty_digest=bdcf87b220d5153f8e9993c42f285c9e2622091d5b21e8697e42d9238970db75
+[[ $(identity "$TEST_ROOT/empty-directories") == "omarchy-runtime-tree-sha256-v1:$empty_digest" ]]
+chmod 0700 "$TEST_ROOT/empty-directories/a" "$TEST_ROOT/empty-directories/a/b"
+chmod 0777 "$TEST_ROOT/empty-directories/z"
+[[ $(identity "$TEST_ROOT/empty-directories") == "omarchy-runtime-tree-sha256-v1:$empty_digest" ]]
+literal_empty_digest=$({
+  printf 'omarchy-runtime-tree-sha256-v1\0'
+  printf 'D\0\0\0\1a\0\0\1\355\0\0\0\0\0\0\0\0'
+  printf 'D\0\0\0\3a/b\0\0\1\355\0\0\0\0\0\0\0\0'
+  printf 'D\0\0\0\1z\0\0\1\355\0\0\0\0\0\0\0\0'
+} | sha256sum | cut -d' ' -f1)
+[[ $literal_empty_digest == "$empty_digest" ]]
+printf 'ok - empty-directory records and normalized directory mode match literal bytes\n'
+
+mkdir "$TEST_ROOT/buffer-boundary"
+head -c 65536 /dev/zero | tr '\0' x >"$TEST_ROOT/buffer-boundary/block"
+buffer_digest=7dbe9417c7868662f1ba31c7d12b3e6921fb236a2aa218c6fa7476f0d030793f
+[[ $(identity "$TEST_ROOT/buffer-boundary") == "omarchy-runtime-tree-sha256-v1:$buffer_digest" ]]
+literal_buffer_digest=$({
+  printf 'omarchy-runtime-tree-sha256-v1\0'
+  printf 'F\0\0\0\5block\0\0\1\244\0\0\0\0\0\1\0\0'
+  head -c 65536 /dev/zero | tr '\0' x
+} | sha256sum | cut -d' ' -f1)
+[[ $literal_buffer_digest == "$buffer_digest" ]]
+printf 'ok - exact copy-buffer-boundary content matches a literal canonical stream\n'
 
 mkdir "$TEST_ROOT/invalid-utf8"
 invalid_name=$(printf 'bad\377')
@@ -132,6 +165,13 @@ identity "$TEST_ROOT/entries" >/dev/null
 : >"$TEST_ROOT/entries/overflow"
 expect_rejection entry-limit "$TEST_ROOT/entries"
 printf 'ok - entry-count boundary is checked below and above\n'
+
+mkdir -p "$TEST_ROOT/nested-entries/bucket"
+for index in $(seq 1 4095); do : >"$TEST_ROOT/nested-entries/bucket/e$index"; done
+identity "$TEST_ROOT/nested-entries" >/dev/null
+: >"$TEST_ROOT/nested-entries/bucket/overflow"
+expect_rejection entry-limit "$TEST_ROOT/nested-entries"
+printf 'ok - global nested entry count is enforced at 4096 and rejected at 4097\n'
 
 mkdir "$TEST_ROOT/path"
 component=$(printf 'p%.0s' $(seq 1 200))
@@ -200,3 +240,24 @@ if wait "$helper_pid"; then
 fi
 grep -qF 'omarchy-plugin-tree: tree-changed:' "$TEST_ROOT/mutating.err"
 printf 'ok - deterministic barrier detects file mutation\n'
+
+mkdir "$TEST_ROOT/replaced-by-fifo"
+printf regular >"$TEST_ROOT/replaced-by-fifo/victim"
+mkfifo "$TEST_ROOT/ready-replacement" "$TEST_ROOT/resume-replacement"
+OMARCHY_PLUGIN_TREE_TEST_HOOK=before-regular-entry-open \
+OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/ready-replacement" \
+OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/resume-replacement" \
+  "$HELPER" identity "$TEST_ROOT/replaced-by-fifo" \
+  >"$TEST_ROOT/replacement.out" 2>"$TEST_ROOT/replacement.err" &
+helper_pid=$!
+marker=$(cat "$TEST_ROOT/ready-replacement")
+[[ $marker == before-regular-entry-open ]]
+rm "$TEST_ROOT/replaced-by-fifo/victim"
+mkfifo "$TEST_ROOT/replaced-by-fifo/victim"
+printf x >"$TEST_ROOT/resume-replacement"
+if wait "$helper_pid"; then
+  printf 'not ok - regular-to-FIFO replacement was accepted\n' >&2
+  exit 1
+fi
+grep -Eq 'omarchy-plugin-tree: (special-file|tree-changed):' "$TEST_ROOT/replacement.err"
+printf 'ok - replacement FIFO is type-checked through O_PATH without blocking\n'

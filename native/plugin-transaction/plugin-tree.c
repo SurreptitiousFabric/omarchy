@@ -309,6 +309,8 @@ static void walk_tree(int directory_fd, int destination_fd, const char *prefix,
   for (size_t index = 0; index < count; index++) {
     char path[MAX_PATH_BYTES + 1];
     build_path(path, prefix, prefix_length, &names[index]);
+    if (context->entries >= MAX_ENTRIES)
+      reject_tree("entry-limit", path);
     context->entries++;
 
     struct stat path_stat;
@@ -349,22 +351,41 @@ static void walk_tree(int directory_fd, int destination_fd, const char *prefix,
       }
       close(child);
     } else if (S_ISREG(path_stat.st_mode)) {
-      if (path_stat.st_nlink != 1)
+      test_hook("before-regular-entry-open");
+      int pinned = openat(directory_fd, names[index].bytes,
+                          O_PATH | O_NOFOLLOW | O_CLOEXEC);
+      if (pinned < 0)
+        fail_io("pin file", path);
+      struct stat pinned_stat;
+      if (fstat(pinned, &pinned_stat) < 0)
+        fail_io("stat pinned file", path);
+      if (!S_ISREG(pinned_stat.st_mode))
+        reject_tree("special-file", path);
+      if (!same_stat(&path_stat, &pinned_stat, false))
+        reject_tree("tree-changed", path);
+      if (pinned_stat.st_nlink != 1)
         reject_tree("hard-link", path);
-      if (path_stat.st_size < 0 || (uint64_t)path_stat.st_size > MAX_FILE_BYTES)
+      if (pinned_stat.st_size < 0 ||
+          (uint64_t)pinned_stat.st_size > MAX_FILE_BYTES)
         reject_tree("file-size-limit", path);
-      uint64_t file_size = (uint64_t)path_stat.st_size;
+      uint64_t file_size = (uint64_t)pinned_stat.st_size;
       if (file_size > MAX_TOTAL_BYTES - context->total_bytes)
         reject_tree("total-size-limit", path);
-      int file = openat(directory_fd, names[index].bytes,
-                        O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+      char pinned_path[64];
+      int pinned_path_length = snprintf(pinned_path, sizeof(pinned_path),
+                                        "/proc/self/fd/%d", pinned);
+      if (pinned_path_length < 0 ||
+          (size_t)pinned_path_length >= sizeof(pinned_path))
+        reject_tree("descriptor-path-overflow", path);
+      int file = open(pinned_path, O_RDONLY | O_CLOEXEC);
       if (file < 0)
-        fail_io("open file", path);
+        fail_io("open pinned file", path);
       struct stat opened;
       if (fstat(file, &opened) < 0)
         fail_io("stat opened file", path);
-      if (!same_stat(&path_stat, &opened, false))
+      if (!same_stat(&pinned_stat, &opened, false))
         reject_tree("tree-changed", path);
+      close(pinned);
       emit_record_header(context, 'F', path, strlen(path),
                          normalized_mode(opened.st_mode, false), file_size);
       int destination_file = -1;

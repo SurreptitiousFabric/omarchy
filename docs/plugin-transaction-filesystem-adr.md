@@ -24,6 +24,9 @@ Rust would improve memory safety but introduces a new compiler and dependency/to
 
 Register the production identifier `omarchy-runtime-tree-sha256-v1`. Its input is a domain-separated canonical byte stream generated from a descriptor-pinned root:
 
+The normative byte-level encoding is specified in
+[`plugin-runtime-tree-sha256-v1.md`](plugin-runtime-tree-sha256-v1.md).
+
 1. Open the supplied root as a directory with `O_NOFOLLOW|O_CLOEXEC`, then traverse only with `openat`/`fstatat(AT_SYMLINK_NOFOLLOW)` relative to already-open directory descriptors.
 2. Reject invalid UTF-8, absolute paths, empty components, `.`/`..`, embedded NUL, symlinks, hard-linked regular files with link count other than one, devices, FIFOs, sockets, and any file type not explicitly allowed.
 3. Exclude exactly the root `.git` entry and everything beneath it. Reject another `.git` path at any lower level. Git metadata is management state, not runtime content.
