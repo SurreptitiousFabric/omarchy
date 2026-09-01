@@ -157,6 +157,28 @@ combined_case 1 false
 combined_case 2 true
 printf 'ok - waiting retry cannot observe provisional publication across success or compensation\n'
 
+indeterminate_operation=36000000-0000-4000-8000-000000000001
+indeterminate_source="$TEST_ROOT/indeterminate"; make_plugin "$indeterminate_source"
+mkfifo "$TEST_ROOT/indeterminate-ready" "$TEST_ROOT/indeterminate-resume"
+OMARCHY_PLUGIN_TREE_TEST_FAIL_FSYNC=publication-parent \
+OMARCHY_PLUGIN_TREE_TEST_HOOK=after-publication-rename \
+OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/indeterminate-ready" \
+OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/indeterminate-resume" \
+  stage "$indeterminate_operation" acme.state-test "$indeterminate_source" \
+  >"$TEST_ROOT/indeterminate.out" 2>"$TEST_ROOT/indeterminate.err" &
+indeterminate_pid=$!
+[[ $(cat "$TEST_ROOT/indeterminate-ready") == after-publication-rename ]]
+indeterminate_temporary=$(jq -r .candidate.temporarySlot "$STATE/journals/$indeterminate_operation.journal")
+mkdir "$STORE/$indeterminate_temporary"
+printf x >"$TEST_ROOT/indeterminate-resume"
+if wait "$indeterminate_pid"; then printf 'not ok - indeterminate publication returned success\n' >&2; exit 1; fi
+[[ $(jq -r .state "$STATE/journals/$indeterminate_operation.journal") == RECOVERY_REQUIRED ]]
+[[ $(jq -r .reason "$STATE/journals/$indeterminate_operation.journal") == publication-indeterminate ]]
+expect_failure manual-attention stage "$indeterminate_operation" acme.state-test "$indeterminate_source"
+[[ $(jq -r .state "$STATE/journals/$indeterminate_operation.journal") == MANUAL_ATTENTION ]]
+[[ -d $STORE/$indeterminate_operation/candidate && -d $STORE/$indeterminate_temporary ]]
+printf 'ok - unprovable publication compensation is durable and exact reconciliation retains evidence\n'
+
 corrupt_operation=40000000-0000-4000-8000-000000000001
 corrupt_source="$TEST_ROOT/corrupt"; make_plugin "$corrupt_source"; stage "$corrupt_operation" acme.state-test "$corrupt_source" >/dev/null
 printf '{"state":"STAGED","state":"MANUAL_ATTENTION"}\n' >"$STATE/journals/$corrupt_operation.journal"
