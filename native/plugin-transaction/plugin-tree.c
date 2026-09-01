@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 enum {
@@ -187,6 +188,8 @@ static int compare_names(const void *left_pointer, const void *right_pointer) {
 static void emit_record_header(WalkContext *context, unsigned char type,
                                const char *path, size_t path_length,
                                mode_t mode, uint64_t length) {
+  if (context->hash_fd < 0)
+    return;
   hash_update(context->hash_fd, &type, 1, path);
   hash_u32(context->hash_fd, (uint32_t)path_length, path);
   hash_update(context->hash_fd, path, path_length, path);
@@ -290,8 +293,8 @@ static Name *read_names(int directory_fd, const char *path, unsigned depth,
   return names;
 }
 
-static void walk_tree(int directory_fd, const char *prefix, unsigned depth,
-                      WalkContext *context) {
+static void walk_tree(int directory_fd, int destination_fd, const char *prefix,
+                      unsigned depth, WalkContext *context) {
   if (depth > MAX_DEPTH)
     reject_tree("depth-limit", prefix);
   struct stat directory_before;
@@ -316,6 +319,9 @@ static void walk_tree(int directory_fd, const char *prefix, unsigned depth,
       reject_tree("symlink", path);
     if (S_ISDIR(path_stat.st_mode)) {
       emit_record_header(context, 'D', path, strlen(path), 0755, 0);
+      if (destination_fd >= 0 &&
+          mkdirat(destination_fd, names[index].bytes, 0755) < 0)
+        fail_io("create destination directory", path);
       int child = openat(directory_fd, names[index].bytes,
                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
       if (child < 0)
@@ -325,7 +331,22 @@ static void walk_tree(int directory_fd, const char *prefix, unsigned depth,
         fail_io("stat opened directory", path);
       if (path_stat.st_dev != opened.st_dev || path_stat.st_ino != opened.st_ino)
         reject_tree("tree-changed", path);
-      walk_tree(child, path, depth + 1, context);
+      int destination_child = -1;
+      if (destination_fd >= 0) {
+        destination_child =
+            openat(destination_fd, names[index].bytes,
+                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (destination_child < 0)
+          fail_io("open destination directory", path);
+        if (fchmod(destination_child, 0755) < 0)
+          fail_io("set destination directory mode", path);
+      }
+      walk_tree(child, destination_child, path, depth + 1, context);
+      if (destination_child >= 0) {
+        if (fsync(destination_child) < 0)
+          fail_io("sync destination directory", path);
+        close(destination_child);
+      }
       close(child);
     } else if (S_ISREG(path_stat.st_mode)) {
       if (path_stat.st_nlink != 1)
@@ -346,6 +367,16 @@ static void walk_tree(int directory_fd, const char *prefix, unsigned depth,
         reject_tree("tree-changed", path);
       emit_record_header(context, 'F', path, strlen(path),
                          normalized_mode(opened.st_mode, false), file_size);
+      int destination_file = -1;
+      if (destination_fd >= 0) {
+        destination_file =
+            openat(destination_fd, names[index].bytes,
+                   O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (destination_file < 0)
+          fail_io("create destination file", path);
+        if (fchmod(destination_file, normalized_mode(opened.st_mode, false)) < 0)
+          fail_io("set destination mode", path);
+      }
       unsigned char buffer[COPY_BUFFER_BYTES];
       uint64_t remaining = file_size;
       while (remaining > 0) {
@@ -356,7 +387,10 @@ static void walk_tree(int directory_fd, const char *prefix, unsigned depth,
           fail_io("read file", path);
         if (received == 0)
           reject_tree("tree-changed", path);
-        hash_update(context->hash_fd, buffer, (size_t)received, path);
+        if (context->hash_fd >= 0)
+          hash_update(context->hash_fd, buffer, (size_t)received, path);
+        if (destination_file >= 0)
+          fd_write_all(destination_file, buffer, (size_t)received, path);
         remaining -= (uint64_t)received;
       }
       test_hook("before-file-restat");
@@ -366,6 +400,11 @@ static void walk_tree(int directory_fd, const char *prefix, unsigned depth,
       close(file);
       if (!same_stat(&opened, &after, false))
         reject_tree("tree-changed", path);
+      if (destination_file >= 0) {
+        if (fsync(destination_file) < 0)
+          fail_io("sync destination file", path);
+        close(destination_file);
+      }
       context->total_bytes += file_size;
     } else {
       reject_tree("special-file", path);
@@ -403,7 +442,7 @@ static void print_identity(const char *root_path) {
   int hash = open_hash();
   hash_update(hash, DOMAIN, sizeof(DOMAIN) - 1, ".");
   WalkContext context = {.hash_fd = hash, .total_bytes = 0, .entries = 0};
-  walk_tree(root, "", 0, &context);
+  walk_tree(root, -1, "", 0, &context);
   close(root);
   if (send(hash, NULL, 0, 0) < 0)
     fail_io("finalize sha256", "AF_ALG");
@@ -418,11 +457,79 @@ static void print_identity(const char *root_path) {
   fputc('\n', stdout);
 }
 
+static bool simple_name(const char *name) {
+  size_t length = strlen(name);
+  return length > 0 && length <= 128 && strcmp(name, ".") != 0 &&
+         strcmp(name, "..") != 0 && strchr(name, '/') == NULL &&
+         valid_utf8((const unsigned char *)name, length);
+}
+
+static void copy_snapshot(const char *source_path, const char *parent_path,
+                          const char *name) {
+  if (!simple_name(name))
+    reject_tree("invalid-destination-name", name);
+  int source =
+      open(source_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (source < 0)
+    fail_io("open root", source_path);
+  int parent =
+      open(parent_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (parent < 0)
+    fail_io("open destination parent", parent_path);
+  if (mkdirat(parent, name, 0700) < 0)
+    fail_io("create destination root", name);
+  int destination =
+      openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (destination < 0)
+    fail_io("open destination root", name);
+
+  WalkContext context = {.hash_fd = -1, .total_bytes = 0, .entries = 0};
+  test_hook("after-root-open");
+  walk_tree(source, destination, "", 0, &context);
+  close(source);
+  if (fsync(destination) < 0)
+    fail_io("sync destination root", name);
+  close(destination);
+  if (fsync(parent) < 0)
+    fail_io("sync destination parent", parent_path);
+  close(parent);
+}
+
+static void publish_snapshot(const char *parent_path, const char *temporary,
+                             const char *completed) {
+  if (!simple_name(temporary) || !simple_name(completed))
+    reject_tree("invalid-destination-name", parent_path);
+  int parent =
+      open(parent_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (parent < 0)
+    fail_io("open publication parent", parent_path);
+  if (syscall(SYS_renameat2, parent, temporary, parent, completed,
+              RENAME_NOREPLACE) < 0) {
+    if (errno == EEXIST)
+      reject_tree("destination-exists", completed);
+    fail_io("publish destination", completed);
+  }
+  if (fsync(parent) < 0)
+    fail_io("sync publication parent", parent_path);
+  close(parent);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && strcmp(argv[1], "identity") == 0) {
     print_identity(argv[2]);
     return 0;
   }
-  fprintf(stderr, "usage: %s identity ROOT\n", argv[0]);
+  if (argc == 5 && strcmp(argv[1], "copy") == 0) {
+    copy_snapshot(argv[2], argv[3], argv[4]);
+    return 0;
+  }
+  if (argc == 5 && strcmp(argv[1], "publish") == 0) {
+    publish_snapshot(argv[2], argv[3], argv[4]);
+    return 0;
+  }
+  fprintf(stderr,
+          "usage: %s identity ROOT | copy SOURCE PARENT NAME | "
+          "publish PARENT TEMPORARY COMPLETED\n",
+          argv[0]);
   return 64;
 }

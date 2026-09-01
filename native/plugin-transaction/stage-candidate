@@ -1,0 +1,113 @@
+#!/bin/bash
+
+set -euo pipefail
+
+fail() {
+  printf 'omarchy-plugin-candidate-stage: %s: %s\n' "$1" "$2" >&2
+  exit 2
+}
+
+[[ $# == 3 ]] || fail usage 'expected OPERATION_ID PLUGIN_ID SOURCE'
+
+operation_id=$1
+requested_plugin_id=$2
+source_path=$3
+[[ $operation_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] ||
+  fail invalid-operation-id "$operation_id"
+
+helper=${OMARCHY_PLUGIN_TREE_HELPER:-/usr/lib/omarchy/plugin-tree}
+validator=${OMARCHY_PLUGIN_VALIDATOR:-omarchy-plugin-validate}
+store=${OMARCHY_PLUGIN_CANDIDATE_STORE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugin-candidates-v1}
+
+[[ -x $helper ]] || fail unavailable-helper "$helper"
+command -v "$validator" >/dev/null 2>&1 || fail unavailable-validator "$validator"
+
+umask 077
+mkdir -p -- "$store"
+[[ -d $store && ! -L $store ]] || fail invalid-store "$store"
+chmod 0700 -- "$store"
+
+completed=$store/$operation_id
+if [[ -d $completed && ! -L $completed ]]; then
+  [[ -f $completed/result.json && ! -L $completed/result.json &&
+     -d $completed/candidate && ! -L $completed/candidate ]] ||
+    fail corrupt-existing-operation "$operation_id"
+  source_tree=$($helper identity "$source_path") || exit $?
+  candidate_tree=$($helper identity "$completed/candidate") ||
+    fail changed-existing-candidate "$operation_id"
+  stored_operation=$(jq -er '.operationId | select(type == "string")' "$completed/result.json") ||
+    fail corrupt-existing-operation "$operation_id"
+  stored_plugin=$(jq -er '.pluginId | select(type == "string")' "$completed/result.json") ||
+    fail corrupt-existing-operation "$operation_id"
+  stored_source=$(jq -er '.sourceTree | select(type == "string")' "$completed/result.json") ||
+    fail corrupt-existing-operation "$operation_id"
+  stored_candidate=$(jq -er '.candidateTree | select(type == "string")' "$completed/result.json") ||
+    fail corrupt-existing-operation "$operation_id"
+  [[ $stored_candidate == "$candidate_tree" ]] ||
+    fail changed-existing-candidate "$operation_id"
+  if [[ $stored_operation != "$operation_id" || $stored_plugin != "$requested_plugin_id" ||
+        $stored_source != "$source_tree" ]]; then
+    fail operation-conflict "$operation_id"
+  fi
+  jq -c . "$completed/result.json"
+  exit 0
+fi
+[[ ! -e $completed && ! -L $completed ]] || fail operation-conflict "$operation_id"
+
+temporary=$(mktemp -d "$store/.import.$operation_id.XXXXXX")
+temporary_name=${temporary##*/}
+cleanup() {
+  if [[ -n ${temporary:-} && -d $temporary && ! -L $temporary ]]; then
+    find "$temporary" -depth -delete
+  fi
+}
+trap cleanup EXIT
+
+$helper copy "$source_path" "$temporary" candidate
+candidate=$temporary/candidate
+candidate_tree=$($helper identity "$candidate")
+
+if ! "$validator" "$candidate"; then
+  fail validation-failed "$requested_plugin_id"
+fi
+manifest_plugin_id=$(jq -er '.id | select(type == "string")' "$candidate/manifest.json") ||
+  fail invalid-manifest-id "$requested_plugin_id"
+[[ $manifest_plugin_id == "$requested_plugin_id" ]] ||
+  fail manifest-id-mismatch "requested $requested_plugin_id, found $manifest_plugin_id"
+
+jq -cn \
+  --arg operationId "$operation_id" \
+  --arg pluginId "$requested_plugin_id" \
+  --arg sourceTree "$candidate_tree" \
+  --arg candidateTree "$candidate_tree" \
+  '{schema:"omarchy-plugin-candidate-stage/v1", operationId:$operationId,
+    pluginId:$pluginId, sourceTree:$sourceTree, candidateTree:$candidateTree}' \
+  >"$temporary/result.json"
+chmod 0600 "$temporary/result.json"
+sync -f "$temporary/result.json"
+sync -f "$temporary"
+
+publish_error=
+if ! publish_error=$($helper publish "$store" "$temporary_name" "$operation_id" 2>&1); then
+  if grep -qF 'omarchy-plugin-tree: destination-exists:' <<<"$publish_error" &&
+     [[ -d $completed ]]; then
+    source_tree=$candidate_tree
+    existing_tree=$($helper identity "$completed/candidate") ||
+      fail changed-existing-candidate "$operation_id"
+    if jq -e --arg operation "$operation_id" --arg plugin "$requested_plugin_id" \
+      --arg source "$source_tree" --arg candidate "$existing_tree" \
+      '.operationId == $operation and .pluginId == $plugin and
+       .sourceTree == $source and .candidateTree == $candidate' \
+      "$completed/result.json" >/dev/null; then
+      jq -c . "$completed/result.json"
+      exit 0
+    fi
+    fail operation-conflict "$operation_id"
+  fi
+  sed 's/^/omarchy-plugin-candidate-stage: publish-failed: /' <<<"$publish_error" >&2
+  exit 2
+fi
+
+temporary=
+trap - EXIT
+jq -c . "$completed/result.json"
