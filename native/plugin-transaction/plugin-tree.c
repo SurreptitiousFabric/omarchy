@@ -92,13 +92,40 @@ static bool valid_utf8(const unsigned char *bytes, size_t length) {
   return true;
 }
 
+#ifdef OMARCHY_PLUGIN_TREE_TEST_HOOKS
+static bool inject_zero_write(void) {
+  static bool consumed = false;
+  if (!consumed && getenv("OMARCHY_PLUGIN_TREE_TEST_ZERO_WRITE")) {
+    consumed = true;
+    return true;
+  }
+  return false;
+}
+
+static bool inject_zero_hash_send(void) {
+  static bool consumed = false;
+  if (!consumed && getenv("OMARCHY_PLUGIN_TREE_TEST_ZERO_HASH_SEND")) {
+    consumed = true;
+    return true;
+  }
+  return false;
+}
+#else
+static bool inject_zero_write(void) { return false; }
+static bool inject_zero_hash_send(void) { return false; }
+#endif
+
 static void fd_write_all(int fd, const void *buffer, size_t length,
-                         const char *path) {
+                         const char *operation, const char *path) {
   const unsigned char *cursor = buffer;
   while (length > 0) {
-    ssize_t written = write(fd, cursor, length);
+    ssize_t written = inject_zero_write() ? 0 : write(fd, cursor, length);
     if (written < 0)
-      fail_io("hash write", path);
+      fail_io(operation, path);
+    if (written == 0) {
+      errno = EIO;
+      fail_io(operation, path);
+    }
     cursor += (size_t)written;
     length -= (size_t)written;
   }
@@ -108,9 +135,14 @@ static void hash_update(int fd, const void *buffer, size_t length,
                         const char *path) {
   const unsigned char *cursor = buffer;
   while (length > 0) {
-    ssize_t written = send(fd, cursor, length, MSG_MORE);
+    ssize_t written =
+        inject_zero_hash_send() ? 0 : send(fd, cursor, length, MSG_MORE);
     if (written < 0)
       fail_io("hash update", path);
+    if (written == 0) {
+      errno = EIO;
+      fail_io("hash update", path);
+    }
     cursor += (size_t)written;
     length -= (size_t)written;
   }
@@ -161,7 +193,7 @@ static void test_hook(const char *name) {
   int ready_fd = open(ready, O_WRONLY | O_CLOEXEC);
   if (ready_fd < 0)
     fail_io("open ready fifo", ready);
-  fd_write_all(ready_fd, name, strlen(name), ready);
+  fd_write_all(ready_fd, name, strlen(name), "write test-hook marker", ready);
   close(ready_fd);
   int resume_fd = open(resume, O_RDONLY | O_CLOEXEC);
   if (resume_fd < 0)
@@ -330,6 +362,8 @@ static void walk_tree(int directory_fd, int destination_fd, const char *prefix,
   for (size_t index = 0; index < count; index++) {
     char path[MAX_PATH_BYTES + 1];
     build_path(path, prefix, prefix_length, &names[index]);
+    if (depth >= MAX_DEPTH)
+      reject_tree("depth-limit", path);
     if (context->entries >= MAX_ENTRIES)
       reject_tree("entry-limit", path);
     context->entries++;
@@ -432,7 +466,8 @@ static void walk_tree(int directory_fd, int destination_fd, const char *prefix,
         if (context->hash_fd >= 0)
           hash_update(context->hash_fd, buffer, (size_t)received, path);
         if (destination_file >= 0)
-          fd_write_all(destination_file, buffer, (size_t)received, path);
+          fd_write_all(destination_file, buffer, (size_t)received,
+                       "write destination file", path);
         remaining -= (uint64_t)received;
       }
       test_hook("before-file-restat");

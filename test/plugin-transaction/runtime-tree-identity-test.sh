@@ -29,6 +29,10 @@ expect_rejection() {
     exit 1
   fi
   grep -qF "omarchy-plugin-tree: $code:" <<<"$output"
+  if grep -qF 'omarchy-runtime-tree-sha256-v1:' <<<"$output"; then
+    printf 'not ok - rejected tree returned an identity\n' >&2
+    exit 1
+  fi
 }
 
 mkdir -p "$TEST_ROOT/golden/sub"
@@ -102,6 +106,24 @@ literal_buffer_digest=$({
 [[ $literal_buffer_digest == "$buffer_digest" ]]
 printf 'ok - exact copy-buffer-boundary content matches a literal canonical stream\n'
 
+mkdir "$TEST_ROOT/multi-buffer"
+{
+  head -c 65536 /dev/zero | tr '\0' x
+  printf y
+} >"$TEST_ROOT/multi-buffer/block"
+multi_buffer_digest=54b11fce6589efbe5afc9dd9ac2ceee59ce30daf280610019df2c572c80033e9
+[[ $(identity "$TEST_ROOT/multi-buffer") == "omarchy-runtime-tree-sha256-v1:$multi_buffer_digest" ]]
+literal_multi_buffer_digest=$({
+  printf 'omarchy-runtime-tree-sha256-v1\0'
+  printf 'F\0\0\0\5block\0\0\1\244\0\0\0\0\0\1\0\1'
+  head -c 65536 /dev/zero | tr '\0' x
+  printf y
+} | sha256sum | cut -d' ' -f1)
+[[ $literal_multi_buffer_digest == "$multi_buffer_digest" ]]
+printf z | dd of="$TEST_ROOT/multi-buffer/block" bs=1 seek=65536 conv=notrunc status=none
+[[ $(identity "$TEST_ROOT/multi-buffer") != "omarchy-runtime-tree-sha256-v1:$multi_buffer_digest" ]]
+printf 'ok - 65537-byte literal vector crosses reads and binds its final byte\n'
+
 mkdir "$TEST_ROOT/invalid-utf8"
 invalid_name=$(printf 'bad\377')
 printf x >"$TEST_ROOT/invalid-utf8/$invalid_name"
@@ -150,14 +172,25 @@ mkfifo "$TEST_ROOT/hostile/fifo"
 expect_rejection special-file "$TEST_ROOT/hostile"
 printf 'ok - links and special files are rejected\n'
 
-mkdir "$TEST_ROOT/depth"
-deep="$TEST_ROOT/depth"
+mkdir "$TEST_ROOT/depth-directory"
+deep="$TEST_ROOT/depth-directory"
 for index in $(seq 1 32); do deep="$deep/d$index"; mkdir "$deep"; done
-identity "$TEST_ROOT/depth" >/dev/null
-deep="$deep/too-deep"
-mkdir "$deep"
-expect_rejection depth-limit "$TEST_ROOT/depth"
-printf 'ok - depth boundary is checked below and above\n'
+identity "$TEST_ROOT/depth-directory" >/dev/null
+mkdir "$deep/d33"
+expect_rejection depth-limit "$TEST_ROOT/depth-directory"
+
+mkdir "$TEST_ROOT/depth-file-32"
+deep="$TEST_ROOT/depth-file-32"
+for index in $(seq 1 31); do deep="$deep/d$index"; mkdir "$deep"; done
+: >"$deep/file"
+identity "$TEST_ROOT/depth-file-32" >/dev/null
+
+mkdir "$TEST_ROOT/depth-file-33"
+deep="$TEST_ROOT/depth-file-33"
+for index in $(seq 1 32); do deep="$deep/d$index"; mkdir "$deep"; done
+: >"$deep/file"
+expect_rejection depth-limit "$TEST_ROOT/depth-file-33"
+printf 'ok - files and directories are accepted at level 32 and rejected at level 33\n'
 
 mkdir "$TEST_ROOT/entries"
 for index in $(seq 1 4096); do : >"$TEST_ROOT/entries/e$index"; done
@@ -240,6 +273,15 @@ if wait "$helper_pid"; then
 fi
 grep -qF 'omarchy-plugin-tree: tree-changed:' "$TEST_ROOT/mutating.err"
 printf 'ok - deterministic barrier detects file mutation\n'
+
+if OMARCHY_PLUGIN_TREE_TEST_ZERO_HASH_SEND=1 identity "$TEST_ROOT/golden" \
+    >"$TEST_ROOT/zero-hash.out" 2>"$TEST_ROOT/zero-hash.err"; then
+  printf 'not ok - zero-progress hash send was accepted\n' >&2
+  exit 1
+fi
+grep -qF 'omarchy-plugin-tree: io: hash update:' "$TEST_ROOT/zero-hash.err"
+grep -qF 'Input/output error' "$TEST_ROOT/zero-hash.err"
+printf 'ok - zero-progress hash send terminates with typed EIO\n'
 
 mkdir "$TEST_ROOT/replaced-by-fifo"
 printf regular >"$TEST_ROOT/replaced-by-fifo/victim"

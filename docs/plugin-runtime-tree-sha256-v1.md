@@ -65,7 +65,10 @@ Identity includes relative path bytes, type, normalized mode, regular-file
 length and regular-file content. It excludes ownership, timestamps, the source
 root mode and the root `.git` entry.
 
-The v1 bounds are inclusive: at most 32 levels below the root, 4,096 emitted
+The v1 bounds are inclusive: every emitted entry has at most 32 path components
+below the unrecorded root. Thus `root/d1/.../d31/file` and
+`root/d1/.../d32` are valid level-32 entries, while any file or directory below
+`root/d1/.../d32` is an invalid level-33 entry. Other bounds are 4,096 emitted
 entries, 1,024 relative-path bytes, 16 MiB per file and 64 MiB total file bytes.
 Invalid UTF-8, symlinks, multiply linked regular files, nested `.git`, devices,
 FIFOs, sockets, unsupported types, overflow and mutation during traversal are

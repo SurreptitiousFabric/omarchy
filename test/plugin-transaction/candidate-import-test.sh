@@ -92,6 +92,20 @@ cmp "$source/Service.qml" "$candidate/Service.qml"
 printf 'ok - completed result binds the transaction-owned snapshot identity\n'
 printf 'ok - independent byte comparison proves copying and excludes a real root .git\n'
 
+multi_source="$TEST_ROOT/multi-source"
+multi_parent="$TEST_ROOT/multi-parent"
+mkdir "$multi_source" "$multi_parent"
+{
+  head -c 65536 /dev/zero | tr '\0' x
+  printf y
+} >"$multi_source/block"
+"$HELPER" copy "$multi_source" "$multi_parent" candidate
+cmp "$multi_source/block" "$multi_parent/candidate/block"
+[[ $(stat -c '%s' "$multi_parent/candidate/block") == 65537 ]]
+[[ $("$HELPER" identity "$multi_parent/candidate") == \
+  omarchy-runtime-tree-sha256-v1:54b11fce6589efbe5afc9dd9ac2ceee59ce30daf280610019df2c572c80033e9 ]]
+printf 'ok - 65537-byte source is copied byte-for-byte with independent expected identity\n'
+
 directory_source="$TEST_ROOT/directory-source"
 make_plugin "$directory_source"
 mkdir "$directory_source/assets"
@@ -182,6 +196,40 @@ if compgen -G "$STORE/.import.77777777-7777-4777-8777-777777777777.*" >/dev/null
   exit 1
 fi
 printf 'ok - deterministic source mutation fails without a complete or partial candidate\n'
+
+depth_operation=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+depth_source="$TEST_ROOT/depth-source"
+make_plugin "$depth_source"
+deep="$depth_source"
+for index in $(seq 1 32); do deep="$deep/d$index"; mkdir "$deep"; done
+: >"$deep/file"
+if stage "$depth_operation" acme.race-marker "$depth_source" \
+    >"$TEST_ROOT/depth.out" 2>"$TEST_ROOT/depth.err"; then
+  printf 'not ok - level-33 file was staged\n' >&2
+  exit 1
+fi
+grep -qF 'omarchy-plugin-tree: depth-limit:' "$TEST_ROOT/depth.err"
+[[ ! -s $TEST_ROOT/depth.out ]]
+[[ ! -e $STORE/$depth_operation ]]
+if compgen -G "$STORE/.import.$depth_operation.*" >/dev/null; then
+  printf 'not ok - depth rejection left temporary content\n' >&2
+  exit 1
+fi
+printf 'ok - candidate import rejects level 33 without publishing or partial content\n'
+
+zero_write_operation=dddddddd-dddd-4ddd-8ddd-dddddddddddd
+zero_write_source="$TEST_ROOT/zero-write-source"
+make_plugin "$zero_write_source"
+if OMARCHY_PLUGIN_TREE_TEST_ZERO_WRITE=1 \
+    stage "$zero_write_operation" acme.race-marker "$zero_write_source" \
+    >"$TEST_ROOT/zero-write.out" 2>"$TEST_ROOT/zero-write.err"; then
+  printf 'not ok - zero-progress destination write was accepted\n' >&2
+  exit 1
+fi
+grep -qF 'omarchy-plugin-tree: io: write destination file:' "$TEST_ROOT/zero-write.err"
+grep -qF 'Input/output error' "$TEST_ROOT/zero-write.err"
+[[ ! -e $STORE/$zero_write_operation ]]
+printf 'ok - zero-progress copied-file write terminates with typed EIO\n'
 
 fsync_operation=99999999-9999-4999-8999-999999999999
 fsync_source="$TEST_ROOT/fsync-source"
