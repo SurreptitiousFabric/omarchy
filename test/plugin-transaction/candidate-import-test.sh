@@ -8,6 +8,7 @@ trap 'find "$TEST_ROOT" -mindepth 1 -delete; rmdir "$TEST_ROOT"' EXIT
 HELPER="$TEST_ROOT/plugin-tree"
 STAGE="$ROOT/native/plugin-transaction/stage-candidate"
 STORE="$TEST_ROOT/state/plugin-candidates-v1"
+TRANSACTION_STATE="$TEST_ROOT/state/plugin-transactions-v1"
 HOME_DIR="$TEST_ROOT/home"
 PLUGIN_DIR="$HOME_DIR/.config/omarchy/plugins"
 CONFIG="$HOME_DIR/.config/omarchy/shell.json"
@@ -42,12 +43,31 @@ make_plugin() {
 }
 
 stage() {
+  local operation=$1 plugin=$2 source=$3 caller_identity
+  caller_identity=$(env -u OMARCHY_PLUGIN_TREE_TEST_HOOK \
+    -u OMARCHY_PLUGIN_TREE_TEST_READY_FIFO -u OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO \
+    "$HELPER" identity "$source" 2>/dev/null || printf invalid)
   HOME="$HOME_DIR" PATH="$TEST_ROOT/bin:$PATH" OMARCHY_PATH="$ROOT" \
     OMARCHY_PLUGIN_RACE_MARKER="$MARKER" SHELL_CALLS="$SHELL_CALLS" \
     OMARCHY_PLUGIN_TREE_HELPER="$HELPER" \
     OMARCHY_PLUGIN_VALIDATOR="$ROOT/bin/omarchy-plugin-validate" \
     OMARCHY_PLUGIN_CANDIDATE_STORE="$STORE" \
-    "$STAGE" "$@"
+    OMARCHY_PLUGIN_TRANSACTION_STATE="$TRANSACTION_STATE" \
+    OMARCHY_PLUGIN_OPERATION_KIND=install \
+    OMARCHY_PLUGIN_CALLER_CANDIDATE_IDENTITY="$caller_identity" \
+    OMARCHY_PLUGIN_EXPECTED_ACTIVE_STATE=absent \
+    OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_KIND=user \
+    OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_IDENTITY=test-user-config-v1 \
+    OMARCHY_PLUGIN_EXPECTED_REFERENCE_PROJECTION=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    OMARCHY_PLUGIN_EXPECTED_REFERENCE_STATE=unreferenced \
+    OMARCHY_PLUGIN_REFERENCE_POLICY=require-unreferenced \
+    OMARCHY_PLUGIN_STAGE_OBSERVATION_SOURCE=test-injected-o4 \
+    OMARCHY_PLUGIN_STAGE_OBSERVATION_RAW_SHA256=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    OMARCHY_PLUGIN_STAGE_OBSERVATION_REFERENCE_PROJECTION=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    OMARCHY_PLUGIN_STAGE_OBSERVATION_REFERENCE_STATE=unreferenced \
+    OMARCHY_PLUGIN_DESTINATION="$PLUGIN_DIR/$plugin" \
+    "$STAGE" "$operation" "$plugin" "$source" \
+    <<<"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 }
 
 expect_stage_failure() {
@@ -242,33 +262,34 @@ if OMARCHY_PLUGIN_TREE_TEST_FAIL_FSYNC=publication-parent \
 fi
 grep -qF 'omarchy-plugin-tree: publication-rolled-back:' "$TEST_ROOT/fsync.err"
 [[ ! -e $STORE/$fsync_operation ]]
-if compgen -G "$STORE/.import.$fsync_operation.*" >/dev/null; then
-  printf 'not ok - rolled-back publication left temporary content\n' >&2
-  exit 1
-fi
-printf 'ok - post-rename parent fsync failure rolls publication back explicitly\n'
+fsync_temporary=$(jq -r .candidate.temporarySlot "$TRANSACTION_STATE/journals/$fsync_operation.journal")
+[[ $(jq -r .state "$TRANSACTION_STATE/journals/$fsync_operation.journal") == PUBLICATION_INTENT ]]
+[[ -d $STORE/$fsync_temporary/candidate ]]
+[[ $($HELPER identity "$STORE/$fsync_temporary/candidate") == \
+   $(jq -r .candidate.observed "$TRANSACTION_STATE/journals/$fsync_operation.journal") ]]
+printf 'ok - compensated publication retains only the exact journal-owned retry candidate\n'
 
 concurrent_operation=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 concurrent_source="$TEST_ROOT/concurrent-source"
 make_plugin "$concurrent_source"
-mkfifo "$TEST_ROOT/ready-a" "$TEST_ROOT/resume-a" \
-  "$TEST_ROOT/ready-b" "$TEST_ROOT/resume-b"
+mkfifo "$TEST_ROOT/ready-a" "$TEST_ROOT/resume-a"
 OMARCHY_PLUGIN_TREE_TEST_HOOK=before-publication \
 OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/ready-a" \
 OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/resume-a" \
   stage "$concurrent_operation" acme.race-marker "$concurrent_source" \
   >"$TEST_ROOT/concurrent-a.out" 2>"$TEST_ROOT/concurrent-a.err" &
 stage_a=$!
-OMARCHY_PLUGIN_TREE_TEST_HOOK=before-publication \
-OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/ready-b" \
-OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/resume-b" \
-  stage "$concurrent_operation" acme.race-marker "$concurrent_source" \
+[[ $(cat "$TEST_ROOT/ready-a") == before-publication ]]
+stage "$concurrent_operation" acme.race-marker "$concurrent_source" \
   >"$TEST_ROOT/concurrent-b.out" 2>"$TEST_ROOT/concurrent-b.err" &
 stage_b=$!
-[[ $(cat "$TEST_ROOT/ready-a") == before-publication ]]
-[[ $(cat "$TEST_ROOT/ready-b") == before-publication ]]
+if flock -n "$TRANSACTION_STATE/locks/operations/$concurrent_operation.lock" true; then
+  printf 'not ok - operation lock was not held across publication\n' >&2
+  exit 1
+fi
+kill -0 "$stage_b"
+[[ ! -s $TEST_ROOT/concurrent-b.out ]]
 printf x >"$TEST_ROOT/resume-a"
-printf x >"$TEST_ROOT/resume-b"
 wait "$stage_a"
 wait "$stage_b"
 [[ $(<"$TEST_ROOT/concurrent-a.out") == "$(<"$TEST_ROOT/concurrent-b.out")" ]]
