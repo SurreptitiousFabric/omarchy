@@ -24,13 +24,13 @@ All JSON strings are UTF-8. All objects reject duplicate keys. Numbers are base-
 | --- | --- |
 | `protocol` | Exact string `legacy-schema-v1-transaction/v1`. |
 | `operationId` | Caller-generated UUIDv4 string. It names one immutable request history and is not authorization. |
-| `operationToken` | At least 256 bits from a cryptographically secure generator, returned once by stage as unpadded base64url. It is required for mutating calls. |
-| `candidateToken` | Omarchy-generated opaque unpadded base64url value with at least 256 bits of entropy. It names the imported snapshot, not a pathname. |
+| `operationToken` | Caller-generated capability with at least 256 bits from a cryptographically secure generator, encoded as unpadded base64url. It is supplied at stage and required for later mutating calls; Omarchy stores only a domain-separated hash. |
 | `pluginId` | Canonical manifest ID accepted by the current schema-v1 validator. It MUST equal the request ID and is compared exactly. |
 | `operation` | `install` or `update`. Removal is not part of v1. |
 | `treeIdentity` | `{ "algorithm": string, "digest": string }`. The algorithm names a complete canonicalization profile, not merely its hash primitive. O-3 MUST register the first supported profile before implementation; a peer MUST reject unsupported profiles. |
 | `configSource` | `{ "kind": "user" | "default" | "absent", "identity": string }`. `identity` is an Omarchy-issued stable source identifier, not a caller-selected filesystem path. |
 | `configSha256` | SHA-256 of the exact raw bytes read from the accepted source, formatted `sha256:<64 lowercase hex>`. The empty byte sequence has its ordinary SHA-256; `null` is used only when `configSource.kind` is `absent`. |
+| `referenceProjection` | Canonical Omarchy-produced record of every schema-v1 reference to the exact plugin ID, including reference kind and stable logical location, sorted by encoded bytes. Its SHA-256 is formatted `sha256:<64 lowercase hex>`. |
 | `referenceState` | `referenced` or `unreferenced`, computed by Omarchy using all current schema-v1 reference sites for the exact plugin ID. |
 | `referencePolicy` | `require-unreferenced` or `preserve-observed`. |
 | `generation` | Non-negative monotonically increasing registry generation scoped to one shell instance, paired with the shell instance ID. It acknowledges discovery, not execution. |
@@ -45,7 +45,7 @@ Capability discovery has no side effects:
 {
   "protocol": "legacy-schema-v1-transaction/v1",
   "capabilities": ["legacy-schema-v1-transaction/v1"],
-  "treeIdentityAlgorithms": ["implementation-selected-in-o-3"],
+  "treeIdentityAlgorithms": ["omarchy-runtime-tree-sha256-v1"],
   "operations": ["install", "update"],
   "referencePolicies": ["require-unreferenced", "preserve-observed"]
 }
@@ -64,30 +64,33 @@ Request schema:
   "protocol": "legacy-schema-v1-transaction/v1",
   "action": "stage",
   "operationId": "018f3f62-4d31-4dd0-8fc8-2ee33eaeba2c",
+  "operationToken": "<caller-generated bearer token>",
   "operation": "update",
   "pluginId": "example.plugin",
   "source": { "kind": "directory", "path": "/caller/private/candidate" },
   "candidateTree": {
-    "algorithm": "implementation-selected-in-o-3",
+    "algorithm": "omarchy-runtime-tree-sha256-v1",
     "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   },
   "expectedActive": {
     "state": "present",
     "tree": {
-      "algorithm": "implementation-selected-in-o-3",
+      "algorithm": "omarchy-runtime-tree-sha256-v1",
       "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     }
   },
   "expectedConfiguration": {
     "source": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
-    "rawSha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "referenceProjectionSha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "referenceState": "referenced",
     "referencePolicy": "preserve-observed"
   }
 }
 ```
 
-For `install`, `expectedActive` MUST be `{ "state": "absent" }` and `referencePolicy` MUST be `require-unreferenced`. For `update`, `expectedActive.state` MUST be `present` with an exact tree identity; either reference policy is allowed. `preserve-observed` means the commit observation MUST equal `expectedConfiguration.referenceState`. `require-unreferenced` means both the staged observation and every commit/postcheck observation MUST be `unreferenced`.
+For `install`, `expectedActive` MUST be `{ "state": "absent" }` and `referencePolicy` MUST be `require-unreferenced`. For `update`, `expectedActive.state` MUST be `present` with an exact tree identity; either reference policy is allowed. `preserve-observed` means the commit projection and reference state MUST exactly equal the staged observation. `require-unreferenced` means the projection is empty and the state is `unreferenced` at stage and every commit/postcheck observation.
+
+The accepted source identity and exact plugin-reference projection are hard preconditions. The raw source SHA-256 and registry generation are observations recorded in responses and receipts, not stage-to-commit equality requirements. This permits an unrelated configuration option to change without weakening protection against a new, removed, or relocated reference to the affected plugin. A malformed source, source switch, projection change, or reference-policy violation still fails closed.
 
 Omarchy independently observes the current active tree and configuration during stage. A mismatch returns a typed stale result and creates no staged operation. A successful response is:
 
@@ -97,28 +100,27 @@ Omarchy independently observes the current active tree and configuration during 
   "operationId": "018f3f62-4d31-4dd0-8fc8-2ee33eaeba2c",
   "pluginId": "example.plugin",
   "state": "STAGED",
-  "operationToken": "<opaque bearer token>",
-  "candidateToken": "<opaque candidate token>",
   "candidateTree": {
-    "algorithm": "implementation-selected-in-o-3",
+    "algorithm": "omarchy-runtime-tree-sha256-v1",
     "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
   },
   "activeObserved": {
     "state": "present",
     "tree": {
-      "algorithm": "implementation-selected-in-o-3",
+      "algorithm": "omarchy-runtime-tree-sha256-v1",
       "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     }
   },
   "configurationObserved": {
     "source": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
     "rawSha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "referenceProjectionSha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "referenceState": "referenced"
   }
 }
 ```
 
-The token-bearing response SHOULD be mode-restricted and MUST NOT be written to ordinary logs. Status and terminal receipts redact `operationToken`.
+The token MUST NOT be written to ordinary logs or returned by status and terminal receipts. A retry supplies the same token; Omarchy compares its hash without persisting recoverable bearer material.
 
 ## Commit, status, abort, and recover
 
@@ -129,8 +131,7 @@ Commit request:
   "protocol": "legacy-schema-v1-transaction/v1",
   "action": "commit",
   "operationId": "018f3f62-4d31-4dd0-8fc8-2ee33eaeba2c",
-  "operationToken": "<opaque bearer token>",
-  "candidateToken": "<opaque candidate token>"
+  "operationToken": "<opaque bearer token>"
 }
 ```
 
@@ -142,6 +143,10 @@ The commit authorizes only the already-recorded immutable operation. No field ca
 
 `recover` requests reconciliation of one nonterminal operation. It never supplies replacement identities or a desired outcome. Recovery uses the durable journal and exact observed identities to complete, roll back, or enter manual attention.
 
+## Minimal shell coordination
+
+The shell-facing contract has three idempotent operation-bound mutations: gate and unload one plugin, rescan that plugin while it remains gated for an expected live tree, and release only the matching gate after the expected rescan generation. A read-only reconciliation call reports the gate on shell startup and recovery. Gate acknowledgement means every schema-v1 loader treats the plugin as ineligible and existing instances have been unloaded. Rescan acknowledgement means discovery completed for the expected tree while ineligible. Release acknowledgement means eligibility was recomputed and published; it does not mean plugin code executed successfully. `plugin-transaction-gate-a-review.md` defines these semantics and the reviewable implementation slices.
+
 ## Durable state machine
 
 Every transition is durably recorded before the side effect named by the destination state can be assumed. The affected plugin is not eligible while any durable state from `LOAD_GATED` through `RELEASE_PENDING`, `ROLLBACK_STARTED`, or `RECOVERY_REQUIRED` exists.
@@ -149,7 +154,7 @@ Every transition is durably recorded before the side effect named by the destina
 | State | Meaning | Permitted next states |
 | --- | --- | --- |
 | `STAGED` | Exact validated candidate is inert; active state is unchanged. | `COMMIT_PREPARED`, `ABORTED` |
-| `COMMIT_PREPARED` | Commit won its plugin-scoped lock; no live mutation yet. | `LOAD_GATED`, `RECOVERY_REQUIRED` |
+| `COMMIT_PREPARED` | Commit won its plugin-scoped lock; no live mutation yet. | `LOAD_GATED`, `REJECTED`, `RECOVERY_REQUIRED` |
 | `LOAD_GATED` | Durable gate exists and shell acknowledged unload/ineligibility. | `LIVE_TREE_EXCHANGED`, `ROLLBACK_STARTED`, `RECOVERY_REQUIRED` |
 | `LIVE_TREE_EXCHANGED` | Exact candidate occupies the live namespace; previous exact tree is retained for update. Gate remains closed. | `GATED_RESCAN_COMPLETED`, `ROLLBACK_STARTED`, `RECOVERY_REQUIRED` |
 | `GATED_RESCAN_COMPLETED` | Exact live-tree postcheck and operation-bound rescan completed while gated. This does not assert execution. | `RELEASE_PENDING`, `ROLLBACK_STARTED`, `RECOVERY_REQUIRED` |
@@ -160,8 +165,9 @@ Every transition is durably recorded before the side effect named by the destina
 | `RECOVERY_REQUIRED` | An interruption left a nonterminal outcome requiring exact reconciliation. The affected plugin remains gated whenever exposure may have occurred. | the provably correct forward state, `ROLLBACK_STARTED`, `MANUAL_ATTENTION` |
 | `MANUAL_ATTENTION` | Exact safe completion or rollback could not be established. The affected plugin remains ineligible. | none in v1; an explicit future administrative repair procedure is required |
 | `ABORTED` | Still-inert operation was cancelled before commit preparation. | none |
+| `REJECTED` | A stale or contradictory precondition was detected before any live namespace or eligibility mutation. Nothing was rolled back. | none |
 
-Before `LIVE_TREE_EXCHANGED`, a stale precondition can end as `ROLLED_BACK` with rollback dimension `not-required`; no namespace restoration occurred. After exposure, any failed tree, configuration, reference, or rescan check MUST enter rollback while the gate remains closed. A crash never implies automatic gate release.
+Before `LOAD_GATED`, a stale precondition ends as `REJECTED` with rollback dimension `not-applicable`. After the shell has acknowledged a gate, a failure must either release the unchanged installation safely or enter rollback/recovery; after `LIVE_TREE_EXCHANGED`, any failed tree, configuration, reference, or rescan check MUST enter rollback while the gate remains closed. `ROLLED_BACK` is used only when prior filesystem or eligibility state was actually restored. A crash never implies automatic gate release.
 
 ## Result schema
 
@@ -174,42 +180,39 @@ Every response has this envelope:
   "pluginId": "example.plugin",
   "state": "COMMITTED",
   "status": "committed",
-  "candidateTree": { "algorithm": "implementation-selected-in-o-3", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-  "previousTree": { "algorithm": "implementation-selected-in-o-3", "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
-  "filesystem": { "state": "candidate-active", "liveTree": { "algorithm": "implementation-selected-in-o-3", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
+  "candidateTree": { "algorithm": "omarchy-runtime-tree-sha256-v1", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+  "previousTree": { "algorithm": "omarchy-runtime-tree-sha256-v1", "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+  "filesystem": { "state": "candidate-active", "liveTree": { "algorithm": "omarchy-runtime-tree-sha256-v1", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
   "configuration": {
     "sourceBefore": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
     "rawSha256Before": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "sourceAfter": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
-    "rawSha256After": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    "rawSha256After": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "referenceProjectionSha256Before": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "referenceProjectionSha256After": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   },
   "reference": { "policy": "preserve-observed", "before": "referenced", "after": "referenced" },
   "registry": { "rescan": "completed", "shellInstance": "<opaque instance ID>", "generation": 42 },
   "loadEligibility": "released",
-  "rollback": { "state": "not-required", "tree": null },
+  "rollback": { "state": "not-applicable", "tree": null },
   "recovery": "not-required",
   "reason": null
 }
 ```
 
-Fields remain separate even on failure. `registry.rescan: completed` means discovery completed for the expected plugin and live tree; it MUST NOT be reported as successful plugin execution. `loadEligibility` is one of `never-granted`, `gated`, `released`, or `blocked-manual-attention`. Rollback state is `not-required`, `started`, `completed`, or `failed`. Recovery is `not-required`, `pending`, `completed-forward`, `completed-rollback`, or `manual-attention`.
+Fields remain separate even on failure. `registry.rescan: completed` means discovery completed for the expected plugin and live tree; it MUST NOT be reported as successful plugin execution. `loadEligibility` is one of `never-granted`, `gated`, `released`, or `blocked-manual-attention`. Rollback state is `not-applicable`, `started`, `completed`, or `failed`. Recovery is `not-required`, `pending`, `completed-forward`, `completed-rollback`, or `manual-attention`.
 
-Terminal `status` values are:
+Terminal `status` values and their typed reasons are:
 
 | Status | Meaning |
 | --- | --- |
 | `committed` | Exact candidate was committed and eligibility release was acknowledged. |
 | `already-current` | At stage time the requested candidate was already the exact active tree; no candidate was exposed and no commit is created. |
-| `stale-candidate` | Supplied or imported candidate identity did not match. |
-| `stale-installed-revision` | Exact active-tree presence or identity precondition failed. |
-| `stale-configuration-source` | Accepted configuration source changed. |
-| `stale-configuration` | Raw configuration bytes changed. |
-| `stale-reference` | Reference policy or expected reference state failed. |
+| `rejected` | No live namespace or eligibility mutation occurred. `reason` is `stale-candidate`, `stale-installed-revision`, `stale-configuration-source`, `stale-configuration`, or `stale-reference`. `stale-configuration` means the plugin-reference projection changed; unrelated raw-byte changes are evidence only. |
 | `aborted` | Still-inert staged operation was explicitly aborted. |
 | `rolled-back` | Commit did not complete and exact prior state was restored. `reason` identifies the triggering failure. |
-| `rollback-failed` | Exact rollback could not be established; affected plugin remains blocked. |
 | `indeterminate` | The service cannot yet establish a terminal outcome; durable state is `RECOVERY_REQUIRED` and the affected plugin remains gated if exposure might have occurred. |
-| `manual-attention` | Automated recovery cannot prove a correct tree/state; affected plugin remains blocked. |
+| `manual-attention` | Automated recovery cannot prove a correct tree/state; affected plugin remains blocked. `reason` includes `rollback-failed` when exact restoration failed. |
 
 Nonterminal status values mirror the lowercase durable states and are never represented as success. Transport failure is not a transaction result; clients query `status` by operation ID instead of assuming failure or retrying with a new ID.
 
@@ -217,7 +220,7 @@ Nonterminal status values mirror the lowercase durable states and are never repr
 
 The first accepted `stage` request durably binds its complete normalized request digest to `operationId`. Repeating byte-equivalent semantic input for that ID returns the same candidate identity and operation state. Reuse of the ID with any different normalized field returns `operation-id-conflict` and does not alter either operation.
 
-An exact repeated `commit` with the matching operation and candidate tokens returns the current state or original terminal receipt. It never repeats an exchange, rescan release, or rollback. A wrong token returns `invalid-operation-token` without revealing whether another candidate token is valid.
+An exact repeated `commit` with the matching operation token returns the current state or original terminal receipt. It never repeats an exchange, rescan release, or rollback. A wrong token returns `invalid-operation-token`. The operation record already binds the exact candidate tree, so a second candidate bearer token enforces no additional property and is deliberately absent.
 
 Only one commit for a plugin ID may hold `COMMIT_PREPARED` or a later nonterminal state. A competing operation returns `plugin-busy` with no secret details. Operations for unrelated plugin IDs may proceed independently unless an implementation documents a bounded global shell-unload section; such an internal limit does not widen the public transaction's authority.
 
@@ -226,13 +229,14 @@ Only one commit for a plugin ID may hold `COMMIT_PREPARED` or a later nontermina
 The implementation order is normative:
 
 1. Acquire the operation and plugin lifecycle lock; persist `COMMIT_PREPARED`.
-2. Establish the durable plugin load gate; obtain the shell's unload/gate acknowledgement; persist `LOAD_GATED`.
-3. Recompute the candidate identity and recheck the exact active state, configuration source, raw bytes, reference state, and policy.
-4. Atomically expose the install candidate or exchange the update candidate while retaining exact rollback identity; persist `LIVE_TREE_EXCHANGED`.
-5. Recompute the identity at the live location and recheck configuration and reference state while still gated.
-6. Request one operation-bound rescan and require acknowledgement for the expected plugin ID and live tree; persist `GATED_RESCAN_COMPLETED`.
-7. Recheck configuration source, raw bytes, and reference policy; persist `RELEASE_PENDING`.
-8. Release eligibility and require shell acknowledgement; persist the terminal `COMMITTED` receipt.
+2. Recompute the candidate identity and recheck the exact active state, configuration source, plugin-reference projection, reference state, and policy. Record the current raw configuration hash as evidence. A failure reaches `REJECTED` without gating or rollback.
+3. Establish the durable plugin load gate; obtain the shell's unload/gate acknowledgement; persist `LOAD_GATED`.
+4. Repeat the exact security-relevant precondition checks. If one changed after preflight, restore the prior eligibility state and report `rolled-back`; do not expose the candidate.
+5. Atomically expose the install candidate or exchange the update candidate while retaining exact rollback identity; persist `LIVE_TREE_EXCHANGED`.
+6. Recompute the identity at the live location and recheck configuration source, plugin-reference projection, and reference state while still gated. Record the raw configuration hash.
+7. Request one operation-bound rescan and require acknowledgement for the expected plugin ID and live tree; persist `GATED_RESCAN_COMPLETED`.
+8. Recheck configuration source, plugin-reference projection, and reference policy; record the raw configuration hash; persist `RELEASE_PENDING`.
+9. Release eligibility and require shell acknowledgement; persist the terminal `COMMITTED` receipt.
 
 There is no valid `expose → ordinary watcher reload → postcheck` path. Watcher events may request work, but the gate prevents evaluation until release. Configuration mutation is either serialized or detected as a typed stale result before release.
 
@@ -240,11 +244,11 @@ There is no valid `expose → ordinary watcher reload → postcheck` path. Watch
 
 ### Fresh unreferenced install that becomes referenced
 
-Stage accepts exact absence, the accepted raw configuration, `unreferenced`, and `require-unreferenced`. If the ID becomes referenced before or during commit, commit returns `stale-reference`. Before exposure, rollback is `not-required`; after exposure, the exact absence is restored while gated and the terminal status is `rolled-back` with reason `stale-reference`. The candidate is never released.
+Stage accepts exact absence, the accepted configuration source and reference projection, `unreferenced`, and `require-unreferenced`. If the ID becomes referenced before gating, commit reaches `REJECTED` with status `rejected`, reason `stale-reference`, and rollback `not-applicable`. If it becomes referenced after exposure, the exact absence is restored while gated and the terminal status is `rolled-back` with reason `stale-reference`. The candidate is never released.
 
 ### Referenced update
 
-Stage binds the exact active tree, exact raw configuration, `referenced`, and `preserve-observed`. Commit exchanges only if those observations still match. The rescan may discover the new revision, but the plugin stays gated until the final configuration check and release acknowledgement. The result separately records the old tree, new tree, reference state, rescan generation, eligibility release, and rollback disposition.
+Stage binds the exact active tree, configuration source, plugin-reference projection, `referenced`, and `preserve-observed`. Commit exchanges only if those security-relevant observations still match. An unrelated bar option may change the raw file hash without rejecting the transaction; both hashes remain in the receipt. The rescan may discover the new revision, but the plugin stays gated until the final reference check and release acknowledgement.
 
 ### Client dies after exchange
 
@@ -258,7 +262,7 @@ The caller repeats `status` or the exact `commit` using the same operation ID. O
 
 PR [omacom/omarchy#8956](https://github.com/omacom/omarchy/pull/8956) is architectural precedent for immutable candidate revisions, inert staging, explicit activation, retained rollback identity, and stale-binding rejection. This protocol does not depend on that PR's branch, code, sandbox, permission broker, worker, providers, or schema-v2 activation service.
 
-A future implementation may advertise `secure-schema-v2-lifecycle/v1` and map candidate tokens to immutable revisions internally. It may reuse the operation and exact-identity envelope, but schema-v2 permission review remains a separate authority decision. A client selects an explicitly advertised capability; release numbers or directory layouts are not capability probes.
+A future implementation may advertise `secure-schema-v2-lifecycle/v1` and map staged operation records to immutable revisions internally. It may reuse the operation and exact-identity envelope, but schema-v2 permission review remains a separate authority decision. A client selects an explicitly advertised capability; release numbers or directory layouts are not capability probes.
 
 ## Decisions deferred to O-3
 

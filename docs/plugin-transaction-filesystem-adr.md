@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed for Gate A review. This is the O-3 decision record and bounded prototype evidence, not production code.
+Proposed with bounded prototype evidence and retained by the O-3A Gate A simplification review. This is a design record, not production code. The public preconditions, token count, result vocabulary, minimal shell contract, and implementation slicing are controlled by `plugin-transaction-gate-a-review.md`.
 
 ## Decision
 
