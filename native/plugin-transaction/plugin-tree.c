@@ -171,9 +171,30 @@ static void test_hook(const char *name) {
     fail_io("read resume fifo", resume);
   close(resume_fd);
 }
+
+static bool test_fsync_failure(const char *name) {
+  static bool consumed = false;
+  const char *selected = getenv("OMARCHY_PLUGIN_TREE_TEST_FAIL_FSYNC");
+  if (!consumed && selected && strcmp(selected, name) == 0) {
+    consumed = true;
+    errno = EIO;
+    return true;
+  }
+  return false;
+}
 #else
 static void test_hook(const char *name) { (void)name; }
+static bool test_fsync_failure(const char *name) {
+  (void)name;
+  return false;
+}
 #endif
+
+static int sync_fd(int fd, const char *point) {
+  if (test_fsync_failure(point))
+    return -1;
+  return fsync(fd);
+}
 
 static int compare_names(const void *left_pointer, const void *right_pointer) {
   const Name *left = left_pointer;
@@ -345,7 +366,7 @@ static void walk_tree(int directory_fd, int destination_fd, const char *prefix,
       }
       walk_tree(child, destination_child, path, depth + 1, context);
       if (destination_child >= 0) {
-        if (fsync(destination_child) < 0)
+        if (sync_fd(destination_child, "destination-directory") < 0)
           fail_io("sync destination directory", path);
         close(destination_child);
       }
@@ -422,7 +443,7 @@ static void walk_tree(int directory_fd, int destination_fd, const char *prefix,
       if (!same_stat(&opened, &after, false))
         reject_tree("tree-changed", path);
       if (destination_file >= 0) {
-        if (fsync(destination_file) < 0)
+        if (sync_fd(destination_file, "destination-file") < 0)
           fail_io("sync destination file", path);
         close(destination_file);
       }
@@ -508,10 +529,10 @@ static void copy_snapshot(const char *source_path, const char *parent_path,
   test_hook("after-root-open");
   walk_tree(source, destination, "", 0, &context);
   close(source);
-  if (fsync(destination) < 0)
+  if (sync_fd(destination, "destination-root") < 0)
     fail_io("sync destination root", name);
   close(destination);
-  if (fsync(parent) < 0)
+  if (sync_fd(parent, "destination-parent") < 0)
     fail_io("sync destination parent", parent_path);
   close(parent);
 }
@@ -524,14 +545,44 @@ static void publish_snapshot(const char *parent_path, const char *temporary,
       open(parent_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (parent < 0)
     fail_io("open publication parent", parent_path);
+  int operation =
+      openat(parent, temporary, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (operation < 0)
+    fail_io("open operation directory", temporary);
+  int record = openat(operation, "result.json", O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (record < 0)
+    fail_io("open completed record", temporary);
+  struct stat record_stat;
+  if (fstat(record, &record_stat) < 0)
+    fail_io("stat completed record", temporary);
+  if (!S_ISREG(record_stat.st_mode) || record_stat.st_nlink != 1)
+    reject_tree("invalid-completed-record", temporary);
+  if (sync_fd(record, "completed-record") < 0)
+    fail_io("sync completed record", temporary);
+  close(record);
+  if (sync_fd(operation, "completed-operation") < 0)
+    fail_io("sync completed operation", temporary);
+  close(operation);
+
+  test_hook("before-publication");
   if (syscall(SYS_renameat2, parent, temporary, parent, completed,
               RENAME_NOREPLACE) < 0) {
     if (errno == EEXIST)
       reject_tree("destination-exists", completed);
     fail_io("publish destination", completed);
   }
-  if (fsync(parent) < 0)
-    fail_io("sync publication parent", parent_path);
+  if (sync_fd(parent, "publication-parent") < 0) {
+    int publication_error = errno;
+    if (syscall(SYS_renameat2, parent, completed, parent, temporary,
+                RENAME_NOREPLACE) == 0) {
+      if (sync_fd(parent, "publication-rollback-parent") == 0) {
+        errno = publication_error;
+        reject_tree("publication-rolled-back", completed);
+      }
+      reject_tree("publication-indeterminate", temporary);
+    }
+    reject_tree("publication-indeterminate", completed);
+  }
   close(parent);
 }
 

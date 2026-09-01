@@ -41,6 +41,12 @@ The spike demonstrates the stream shape, byte-order sorting, content and execute
 
 The inert candidate store retains a transaction-private Git checkout so existing update UX can fetch and display diffs. The runtime identity excludes the root `.git` tree. Commit materializes or exchanges a runtime-only snapshot at `~/.config/omarchy/plugins/<id>` and retains the prior runtime directory as rollback content.
 
+O-4 never hashes an external source path to decide a retry. Every request first
+copies that source into a new private temporary snapshot and computes request
+identity from the snapshot. An exact retry discards this comparison snapshot
+and returns the already completed candidate; it does not publish a second
+candidate.
+
 Git management metadata must not be placed back into the watched live runtime directory. Durable plugin management state records the repository origin and exact fetched commit separately from the runtime tree identity. The runtime digest is authoritative for exposure and rollback; a Git commit ID is informational and cannot substitute for it.
 
 This changes current update assumptions and must be integrated deliberately in O-10. It avoids `.git` writes inside the watched namespace and prevents mutable Git metadata from contaminating the runtime identity.
@@ -54,6 +60,16 @@ This changes current update assumptions and must be integrated deliberately in O
 - A live directory is reopened from its pinned parent with `O_NOFOLLOW`, its exact identity is recomputed, and only then may the gated rescan proceed.
 
 If the filesystem or kernel does not support the required conditional rename semantics and durability, the capability is not advertised. There is no non-atomic compatibility fallback.
+
+For the bounded O-4 stage operation, the native helper synchronizes the result
+record and temporary operation directory before `RENAME_NOREPLACE`. If the
+rename succeeds but synchronizing the candidate-store parent fails, it attempts
+an exact no-replace rename back to the temporary name and synchronizes the
+parent again. A proven compensation returns `publication-rolled-back` and no
+completed operation remains. If compensation or its durability cannot be
+proved, it returns `publication-indeterminate`; the caller must not report a
+completed stage or erase the uncertain namespace. Resolving that latter state
+is deliberately deferred to the O-5 durable journal and recovery design.
 
 ## Fault-injection boundary
 

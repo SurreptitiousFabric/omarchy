@@ -63,6 +63,8 @@ expect_stage_failure() {
 operation=11111111-1111-4111-8111-111111111111
 source="$TEST_ROOT/source"
 make_plugin "$source"
+mkdir "$source/.git"
+printf ignored-management-state >"$source/.git/index"
 config_before=$(sha256sum "$CONFIG")
 catalog_before=$(HOME="$HOME_DIR" OMARCHY_PATH="$ROOT" "$ROOT/bin/omarchy-plugin-catalog")
 
@@ -84,7 +86,11 @@ candidate="$STORE/$operation/candidate"
 candidate_identity=$($HELPER identity "$candidate")
 [[ $(jq -r .candidateTree <<<"$first_result") == "$candidate_identity" ]]
 [[ ! -e $candidate/.git ]]
+cmp "$source/manifest.json" "$candidate/manifest.json"
+cmp "$source/Service.qml" "$candidate/Service.qml"
+[[ $(find "$candidate" -mindepth 1 -printf '%P\n' | sort) == $'Service.qml\nmanifest.json' ]]
 printf 'ok - completed result binds the transaction-owned snapshot identity\n'
+printf 'ok - independent byte comparison proves copying and excludes a real root .git\n'
 
 directory_source="$TEST_ROOT/directory-source"
 make_plugin "$directory_source"
@@ -103,7 +109,7 @@ candidate_inode=$(stat -c '%d:%i' "$candidate")
 retry_result=$(stage "$operation" acme.race-marker "$source")
 [[ $retry_result == "$first_result" ]]
 [[ $(stat -c '%d:%i' "$candidate") == "$candidate_inode" ]]
-printf 'ok - source changes cannot alter a snapshot and exact retry does not copy again\n'
+printf 'ok - retry compares a fresh snapshot without republishing the completed candidate\n'
 
 expect_stage_failure operation-conflict "$operation" other.plugin "$source"
 conflict_source="$TEST_ROOT/conflict-source"
@@ -176,6 +182,61 @@ if compgen -G "$STORE/.import.77777777-7777-4777-8777-777777777777.*" >/dev/null
   exit 1
 fi
 printf 'ok - deterministic source mutation fails without a complete or partial candidate\n'
+
+fsync_operation=99999999-9999-4999-8999-999999999999
+fsync_source="$TEST_ROOT/fsync-source"
+make_plugin "$fsync_source"
+if OMARCHY_PLUGIN_TREE_TEST_FAIL_FSYNC=publication-parent \
+    stage "$fsync_operation" acme.race-marker "$fsync_source" \
+    >"$TEST_ROOT/fsync.out" 2>"$TEST_ROOT/fsync.err"; then
+  printf 'not ok - post-rename fsync failure reported success\n' >&2
+  exit 1
+fi
+grep -qF 'omarchy-plugin-tree: publication-rolled-back:' "$TEST_ROOT/fsync.err"
+[[ ! -e $STORE/$fsync_operation ]]
+if compgen -G "$STORE/.import.$fsync_operation.*" >/dev/null; then
+  printf 'not ok - rolled-back publication left temporary content\n' >&2
+  exit 1
+fi
+printf 'ok - post-rename parent fsync failure rolls publication back explicitly\n'
+
+concurrent_operation=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+concurrent_source="$TEST_ROOT/concurrent-source"
+make_plugin "$concurrent_source"
+mkfifo "$TEST_ROOT/ready-a" "$TEST_ROOT/resume-a" \
+  "$TEST_ROOT/ready-b" "$TEST_ROOT/resume-b"
+OMARCHY_PLUGIN_TREE_TEST_HOOK=before-publication \
+OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/ready-a" \
+OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/resume-a" \
+  stage "$concurrent_operation" acme.race-marker "$concurrent_source" \
+  >"$TEST_ROOT/concurrent-a.out" 2>"$TEST_ROOT/concurrent-a.err" &
+stage_a=$!
+OMARCHY_PLUGIN_TREE_TEST_HOOK=before-publication \
+OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/ready-b" \
+OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/resume-b" \
+  stage "$concurrent_operation" acme.race-marker "$concurrent_source" \
+  >"$TEST_ROOT/concurrent-b.out" 2>"$TEST_ROOT/concurrent-b.err" &
+stage_b=$!
+[[ $(cat "$TEST_ROOT/ready-a") == before-publication ]]
+[[ $(cat "$TEST_ROOT/ready-b") == before-publication ]]
+printf x >"$TEST_ROOT/resume-a"
+printf x >"$TEST_ROOT/resume-b"
+wait "$stage_a"
+wait "$stage_b"
+[[ $(<"$TEST_ROOT/concurrent-a.out") == "$(<"$TEST_ROOT/concurrent-b.out")" ]]
+[[ -d $STORE/$concurrent_operation/candidate ]]
+if compgen -G "$STORE/.import.$concurrent_operation.*" >/dev/null; then
+  printf 'not ok - concurrent publication left temporary content\n' >&2
+  exit 1
+fi
+printf 'ok - synchronized concurrent publication returns one exact completed result\n'
+
+saved_store=$STORE
+STORE="$PLUGIN_DIR/candidates"
+expect_stage_failure store-inside-discovery \
+  bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb acme.race-marker "$concurrent_source"
+STORE=$saved_store
+printf 'ok - candidate store cannot be placed inside plugin discovery\n'
 
 catalog_after=$(HOME="$HOME_DIR" OMARCHY_PATH="$ROOT" "$ROOT/bin/omarchy-plugin-catalog")
 [[ $catalog_after == "$catalog_before" ]]
