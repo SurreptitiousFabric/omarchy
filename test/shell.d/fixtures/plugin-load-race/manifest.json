@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "id": "acme.race-marker",
+  "name": "Plugin load race marker",
+  "version": "2.0.0",
+  "kinds": ["service"],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}
