@@ -90,7 +90,7 @@ Request schema:
 
 For `install`, `expectedActive` MUST be `{ "state": "absent" }` and `referencePolicy` MUST be `require-unreferenced`. For `update`, `expectedActive.state` MUST be `present` with an exact tree identity; either reference policy is allowed. `preserve-observed` means the commit projection and reference state MUST exactly equal the staged observation. `require-unreferenced` means the projection is empty and the state is `unreferenced` at stage and every commit/postcheck observation.
 
-The accepted source identity and exact plugin-reference projection are hard preconditions. The raw source SHA-256 and registry generation are observations recorded in responses and receipts, not stage-to-commit equality requirements. This permits an unrelated configuration option to change without weakening protection against a new, removed, or relocated reference to the affected plugin. A malformed source, source switch, projection change, or reference-policy violation still fails closed.
+The accepted source identity and exact plugin-reference projection are hard preconditions. The projection MUST come from the same authoritative schema-v1 eligibility path consulted by every third-party loader; Bash, the filesystem helper, and external clients MUST NOT reproduce configuration parsing or eligibility rules. The raw source SHA-256 and registry generation are observations recorded in responses and receipts, not stage-to-commit equality requirements. This permits an unrelated configuration option to change without weakening protection against a new, removed, or relocated reference to the affected plugin. A malformed source, source switch, projection change, or reference-policy violation still fails closed.
 
 Omarchy independently observes the current active tree and configuration during stage. A mismatch returns a typed stale result and creates no staged operation. A successful response is:
 
@@ -145,7 +145,9 @@ The commit authorizes only the already-recorded immutable operation. No field ca
 
 ## Minimal shell coordination
 
-The shell-facing contract has three idempotent operation-bound mutations: gate and unload one plugin, rescan that plugin while it remains gated for an expected live tree, and release only the matching gate after the expected rescan generation. A read-only reconciliation call reports the gate on shell startup and recovery. Gate acknowledgement means every schema-v1 loader treats the plugin as ineligible and existing instances have been unloaded. Rescan acknowledgement means discovery completed for the expected tree while ineligible. Release acknowledgement means eligibility was recomputed and published; it does not mean plugin code executed successfully. `plugin-transaction-gate-a-review.md` defines these semantics and the reviewable implementation slices.
+The shell-facing contract has three idempotent operation-bound mutations: gate and unload one plugin, rescan that plugin while it remains gated for an expected live tree, and conditionally release only the matching gate after the expected rescan generation. A read-only reconciliation call reports the gate on shell startup and recovery. Gate acknowledgement means every schema-v1 loader treats the plugin as ineligible and existing instances have been unloaded. Rescan acknowledgement means discovery completed for the expected tree while ineligible.
+
+While the gate remains authoritative, release MUST obtain the current accepted configuration source and plugin-reference projection through that same central eligibility path. As one shell-controlled decision with no intervening configuration processing, it MUST compare those facts with the operation-bound expectations, enforce the reference policy, verify the expected live tree and gated-rescan generation, and only then remove the matching gate. The shell MAY retrieve expectations through `operationId`; they need not be repeated as caller-controlled parameters. On any mismatch it MUST retain the gate and return a typed failure. A transaction-helper check immediately before release is defense-in-depth and evidence, not sufficient authorization to remove the gate. Because the tree may already have been exchanged, a release mismatch leads to rollback or recovery, never `REJECTED`. Release acknowledgement means these comparisons passed and eligibility was recomputed and published; it does not mean plugin code executed successfully. `plugin-transaction-gate-a-review.md` defines these semantics and the reviewable implementation slices.
 
 ## Durable state machine
 
@@ -158,7 +160,7 @@ Every transition is durably recorded before the side effect named by the destina
 | `LOAD_GATED` | Durable gate exists and shell acknowledged unload/ineligibility. | `LIVE_TREE_EXCHANGED`, `ROLLBACK_STARTED`, `RECOVERY_REQUIRED` |
 | `LIVE_TREE_EXCHANGED` | Exact candidate occupies the live namespace; previous exact tree is retained for update. Gate remains closed. | `GATED_RESCAN_COMPLETED`, `ROLLBACK_STARTED`, `RECOVERY_REQUIRED` |
 | `GATED_RESCAN_COMPLETED` | Exact live-tree postcheck and operation-bound rescan completed while gated. This does not assert execution. | `RELEASE_PENDING`, `ROLLBACK_STARTED`, `RECOVERY_REQUIRED` |
-| `RELEASE_PENDING` | All final config/reference checks passed and durable intent to release is recorded. | `COMMITTED`, `RECOVERY_REQUIRED` |
+| `RELEASE_PENDING` | Helper-side final checks passed and durable intent to request conditional shell release is recorded. The gate remains authoritative. | `COMMITTED`, `ROLLBACK_STARTED`, `RECOVERY_REQUIRED` |
 | `COMMITTED` | Shell acknowledged release of load eligibility; terminal receipt is durable. | none |
 | `ROLLBACK_STARTED` | Gate remains closed while exact pre-operation state is restored and checked. | `ROLLED_BACK`, `MANUAL_ATTENTION`, `RECOVERY_REQUIRED` |
 | `ROLLED_BACK` | Exact prior tree or exact absence was restored and acknowledged under the gate; terminal failure receipt is durable. | none |
@@ -235,8 +237,8 @@ The implementation order is normative:
 5. Atomically expose the install candidate or exchange the update candidate while retaining exact rollback identity; persist `LIVE_TREE_EXCHANGED`.
 6. Recompute the identity at the live location and recheck configuration source, plugin-reference projection, and reference state while still gated. Record the raw configuration hash.
 7. Request one operation-bound rescan and require acknowledgement for the expected plugin ID and live tree; persist `GATED_RESCAN_COMPLETED`.
-8. Recheck configuration source, plugin-reference projection, and reference policy; record the raw configuration hash; persist `RELEASE_PENDING`.
-9. Release eligibility and require shell acknowledgement; persist the terminal `COMMITTED` receipt.
+8. Recheck configuration source, plugin-reference projection, and reference policy; record the raw configuration hash; persist `RELEASE_PENDING`. This helper-side check does not authorize gate removal.
+9. Request conditional shell release. While the gate remains authoritative, the shell itself obtains the current source and projection from the central loader eligibility path, compares them with the operation-bound expectations, enforces the reference policy, and verifies the expected live tree and gated-rescan generation. It removes the gate only if every check passes, as one shell-controlled decision without intervening configuration processing. A mismatch retains the gate and enters rollback or recovery. Only an acknowledged release permits the terminal `COMMITTED` receipt.
 
 There is no valid `expose → ordinary watcher reload → postcheck` path. Watcher events may request work, but the gate prevents evaluation until release. Configuration mutation is either serialized or detected as a typed stale result before release.
 
