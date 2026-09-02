@@ -25,12 +25,16 @@ QtObject {
   property var installedPlugins: ({})
   property int registryRevision: 0
   property int registryGeneration: 0
+  property int scanEpoch: 0
+  property int activeScanEpoch: 0
   property var activeScanContext: null
+  property var lastScanOutcome: ({ success: false, status: "not-scanned", exitCode: null,
+    scanEpoch: 0, generation: 0, context: null, thirdPartySources: ({}), invalidThirdPartySources: [] })
   property bool scanning: false
   property string lastEnableError: ""
 
   signal pluginsChanged()
-  signal scanFinished(var context, int generation)
+  signal scanFinished(var context, int generation, var outcome)
   signal pluginLoadFailed(string id, string error)
   signal localPluginChanged(string id)
 
@@ -288,11 +292,12 @@ QtObject {
 
   function moveBarWidget(id, placement) {
     var error = ""
-    shellConfigMutator(function(config) {
+    var persisted = shellConfigMutator(function(config) {
       ensureConfigShape(config)
       error = moveBarEntry(config, id, placement || {})
     })
     if (error) return error
+    if (persisted === false) return "configuration write failed"
     registryRevision++
     pluginsChanged()
     return ""
@@ -323,7 +328,7 @@ QtObject {
 
   function setBarWidget(id, key, value, selector) {
     var error = ""
-    shellConfigMutator(function(config) {
+    var persisted = shellConfigMutator(function(config) {
       ensureConfigShape(config)
       var location
       var requested = selector || {}
@@ -361,6 +366,7 @@ QtObject {
       entry[String(key)] = value
     })
     if (error) return error
+    if (persisted === false) return "configuration write failed"
     registryRevision++
     pluginsChanged()
     return ""
@@ -471,7 +477,7 @@ QtObject {
       && manifest.kinds.some(function(kind) { return kind !== "bar-widget" })
     var metadata = manifest && Util.isPlainObject(manifest.omarchy) ? manifest.omarchy : null
     var clonedFrom = metadata ? Util.canonicalWidgetId(String(metadata.clonedFrom || "")) : ""
-    shellConfigMutator(function(config) {
+    var persisted = shellConfigMutator(function(config) {
       ensureConfigShape(config)
 
       if (value && placement && (placement.before || placement.after)) {
@@ -543,6 +549,10 @@ QtObject {
       if (isFirstParty && !isBarWidget) addDisabled(config, key)
     })
     if (lastEnableError) return false
+    if (persisted === false) {
+      lastEnableError = "configuration write failed"
+      return false
+    }
     registryRevision++
     pluginsChanged()
     return true
@@ -555,10 +565,15 @@ QtObject {
   //   ... raw manifest.json content ...
   //   === EOM ===
   // (repeating for every manifest found)
-  function parseScanOutput(text) {
+  function parseScanOutput(text, exitCode, context, completedScanEpoch) {
+    var statusCode = exitCode === undefined ? 0 : Number(exitCode)
+    var scanContext = context === undefined ? activeScanContext : context
+    var epoch = completedScanEpoch === undefined ? activeScanEpoch : Number(completedScanEpoch)
     var lines = String(text || "").split("\n")
     var firstParty = {}
-    var thirdParty = {}
+    var thirdPartyCandidates = {}
+    var thirdPartySources = {}
+    var invalidThirdPartySources = []
     var currentSource = null
     var currentKind = null
     var currentJson = []
@@ -573,10 +588,18 @@ QtObject {
         var validated = validateManifest(manifest, currentSource + "/manifest.json")
         if (validated) {
           if (currentKind === "firstparty") firstParty[validated.id] = validated
-          else thirdParty[validated.id] = validated
+          else {
+            if (!thirdPartyCandidates[validated.id]) thirdPartyCandidates[validated.id] = []
+            if (!thirdPartySources[validated.id]) thirdPartySources[validated.id] = []
+            thirdPartyCandidates[validated.id].push(validated)
+            thirdPartySources[validated.id].push(currentSource)
+          }
+        } else if (currentKind === "thirdparty") {
+          invalidThirdPartySources.push(currentSource)
         }
       } catch (e) {
         console.warn("PluginRegistry: bad manifest at " + currentSource + ": " + e)
+        if (currentKind === "thirdparty") invalidThirdPartySources.push(currentSource)
       }
       currentSource = null
       currentKind = null
@@ -601,34 +624,114 @@ QtObject {
     }
     flush()
 
+    if (statusCode !== 0) {
+      lastScanOutcome = {
+        success: false,
+        status: "scan-process-failed",
+        exitCode: statusCode,
+        scanEpoch: epoch,
+        generation: registryGeneration,
+        context: scanContext,
+        thirdPartySources: thirdPartySources,
+        invalidThirdPartySources: invalidThirdPartySources
+      }
+      scanning = false
+      activeScanContext = null
+      activeScanEpoch = 0
+      scanFinished(scanContext, registryGeneration, lastScanOutcome)
+      return lastScanOutcome
+    }
+
     var merged = {}
     for (var fk in firstParty) merged[fk] = firstParty[fk]
     // Third-party plugins never shadow first-party ids. The whole
     // `omarchy.*` namespace is reserved for built-ins, including bar widgets
     // registered outside the manifest-based plugin registry.
-    for (var tk in thirdParty) {
+    for (var tk in thirdPartyCandidates) {
+      var candidates = thirdPartyCandidates[tk]
+      if (candidates.length !== 1) {
+        console.warn("PluginRegistry: plugin " + tk
+          + " rejected: duplicate third-party manifest id")
+        continue
+      }
+      var candidate = candidates[0]
       if (firstParty[tk] || String(tk).indexOf("omarchy.") === 0) {
         console.warn("PluginRegistry: plugin " + tk
           + " rejected: id is reserved for first-party Omarchy plugins")
         continue
       }
-      merged[tk] = thirdParty[tk]
+      merged[tk] = candidate
     }
 
     installedPlugins = merged
     registryRevision++
     registryGeneration++
     scanning = false
+    lastScanOutcome = {
+      success: true,
+      status: "completed",
+      exitCode: statusCode,
+      scanEpoch: epoch,
+      generation: registryGeneration,
+      context: scanContext,
+      thirdPartySources: thirdPartySources,
+      invalidThirdPartySources: invalidThirdPartySources
+    }
     pluginsChanged()
-    var completedContext = activeScanContext
     activeScanContext = null
-    scanFinished(completedContext, registryGeneration)
+    activeScanEpoch = 0
+    scanFinished(scanContext, registryGeneration, lastScanOutcome)
+    return lastScanOutcome
+  }
+
+  function gatedScanBinding(operationId, pluginId, expectedDestination, outcome) {
+    var key = String(pluginId || "")
+    var expected = String(expectedDestination || "").replace(/\/$/, "")
+    var result = outcome || lastScanOutcome
+    if (!result || result.success !== true) return { valid: false, status: "scan-process-failed" }
+    var context = result.context
+    if (!context || context.gated !== true || String(context.operationId || "") !== String(operationId)
+        || String(context.pluginId || "") !== key)
+      return { valid: false, status: "scan-context-mismatch" }
+    var sources = result.thirdPartySources && Array.isArray(result.thirdPartySources[key])
+      ? result.thirdPartySources[key] : []
+    if (sources.length === 0) {
+      var invalid = Array.isArray(result.invalidThirdPartySources) ? result.invalidThirdPartySources : []
+      return { valid: false, status: invalid.indexOf(expected) !== -1
+        ? "target-manifest-invalid" : "target-manifest-absent" }
+    }
+    if (sources.length !== 1) return { valid: false, status: "duplicate-plugin-id" }
+    var source = String(sources[0] || "").replace(/\/$/, "")
+    if (source !== expected) return { valid: false, status: "registry-source-mismatch" }
+    var selected = installedPlugins[key]
+    if (!selected || selected.__isFirstParty === true || String(selected.id || "") !== key
+        || String(selected.__sourceDir || "").replace(/\/$/, "") !== source)
+      return { valid: false, status: "registry-selection-mismatch" }
+    return { valid: true, status: "discovered", sourceDirectory: source,
+      scanEpoch: Number(result.scanEpoch), generation: Number(result.generation) }
+  }
+
+  function authoritySnapshot(pluginId) {
+    var key = String(pluginId || "")
+    var selected = installedPlugins[key]
+    var sources = lastScanOutcome && lastScanOutcome.thirdPartySources
+      && Array.isArray(lastScanOutcome.thirdPartySources[key])
+      ? lastScanOutcome.thirdPartySources[key] : []
+    return {
+      scanning: scanning,
+      scanEpoch: scanEpoch,
+      generation: registryGeneration,
+      scanSuccessful: lastScanOutcome && lastScanOutcome.success === true,
+      unique: sources.length === 1,
+      sourceDirectory: selected && selected.__isFirstParty !== true
+        ? String(selected.__sourceDir || "").replace(/\/$/, "") : ""
+    }
   }
 
   property Process scanProcess: Process {
     onExited: function(exitCode) {
       var output = scanStdout.text || ""
-      registry.parseScanOutput(output)
+      registry.parseScanOutput(output, exitCode, registry.activeScanContext, registry.activeScanEpoch)
     }
     stdout: StdioCollector {
       id: scanStdout
@@ -671,6 +774,8 @@ QtObject {
 
   function rescan(context) {
     if (scanning) return false
+    scanEpoch++
+    activeScanEpoch = scanEpoch
     scanning = true
     activeScanContext = context || null
     // $0 = first-party dir, $1 = third-party dir. Some bash versions need the explicit -- separator.
@@ -680,7 +785,7 @@ QtObject {
     // widgets/Clock.manifest.json so multiple widgets can live in one source
     // directory without wrapper folders.
     // Third-party plugins stay at the top level of ~/.config/omarchy/plugins.
-    var script = ""
+    var script = "set -euo pipefail; shopt -s nullglob; "
       + "emit_manifest() { local kind=\"$1\"; local manifest=\"$2\"; local sub; "
       + "  if [[ ${manifest##*/} == \"manifest.json\" ]]; then sub=\"${manifest%/manifest.json}\"; else sub=\"$(dirname -- \"$manifest\")\"; fi; "
       + "  printf '===%s::%s===\\n' \"$kind\" \"$sub\"; "
@@ -689,7 +794,8 @@ QtObject {
       + "}; "
       + "scan_firstparty() { local dir=\"$1\"; "
       + "  [[ -d \"$dir\" ]] || return 0; "
-      + "  while IFS= read -r manifest; do emit_manifest firstparty \"$manifest\"; done < <(find \"$dir\" -mindepth 2 -maxdepth 3 -type f \\( -name manifest.json -o -name '*.manifest.json' \\) | sort); "
+      + "  find \"$dir\" -mindepth 2 -maxdepth 3 -type f \\( -name manifest.json -o -name '*.manifest.json' \\) -print "
+      + "    | sort | while IFS= read -r manifest; do emit_manifest firstparty \"$manifest\"; done; "
       + "}; "
       + "scan_thirdparty() { local dir=\"$1\"; "
       + "  [[ -d \"$dir\" ]] || return 0; "

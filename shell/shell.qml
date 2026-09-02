@@ -55,7 +55,8 @@ ShellRoot {
 
   property var defaultsConfig: builtinShellConfig
   property string defaultsRaw: JSON.stringify(builtinShellConfig)
-  property var shellConfig: builtinShellConfig
+  readonly property var shellConfig: pluginEligibility.acceptedConfig || builtinShellConfig
+  property string configWriteOutcome: "idle"
   property bool pluginReloading: false
   property bool pluginReloadPending: false
 
@@ -86,11 +87,14 @@ ShellRoot {
         console.warn("shell.json parse failed, using defaults:", e)
       }
     }
-    shellConfig = user || defaults
-    pluginEligibility.acceptSnapshot(shellConfig,
+    publishAcceptedShellConfig(user || defaults,
       user ? "user" : "default",
       user ? shell.userConfigPath : (defaults === builtinShellConfig ? "builtin:shell-config-v1" : shell.defaultsPath),
       user ? userText : shell.defaultsRaw)
+  }
+
+  function publishAcceptedShellConfig(config, sourceKind, sourceIdentity, rawText) {
+    return pluginEligibility.acceptSnapshot(config, sourceKind, sourceIdentity, rawText)
   }
 
   function loadDefaults(raw) {
@@ -121,8 +125,21 @@ ShellRoot {
   function persistShellConfig(nextConfig) {
     var payload = JSON.parse(JSON.stringify(nextConfig))
     payload.version = 1
-    shellConfig = payload
-    userConfigFile.setText(JSON.stringify(payload, null, 2) + "\n")
+    var raw = JSON.stringify(payload, null, 2) + "\n"
+    if (userConfigFile.text() === raw) {
+      publishAcceptedShellConfig(payload, "user", shell.userConfigPath, raw)
+      return true
+    }
+    configWriteOutcome = "pending"
+    userConfigFile.setText(raw)
+    if (configWriteOutcome !== "saved") {
+      console.warn("shell.json write failed; retaining the previously accepted configuration")
+      configWriteOutcome = "idle"
+      return false
+    }
+    configWriteOutcome = "idle"
+    publishAcceptedShellConfig(payload, "user", shell.userConfigPath, raw)
+    return true
   }
 
   readonly property var barConfig: shellConfig && Util.isPlainObject(shellConfig.bar) ? shellConfig.bar : builtinShellConfig.bar
@@ -145,10 +162,15 @@ ShellRoot {
     path: shell.userConfigPath
     watchChanges: true
     atomicWrites: true
+    blockWrites: true
     printErrors: false
     onLoaded: shell.applyShellConfig()
     onLoadFailed: function(error) { shell.applyShellConfig() }
     onFileChanged: reload()
+    onSaved: if (shell.configWriteOutcome === "pending") shell.configWriteOutcome = "saved"
+    onSaveFailed: function(error) {
+      if (shell.configWriteOutcome === "pending") shell.configWriteOutcome = "failed"
+    }
   }
 
   Component.onCompleted: {
@@ -160,14 +182,16 @@ ShellRoot {
       "userConfigPath=" + shell.userConfigPath)
     pluginRegistry.firstPartyDir = shell.firstPartyPluginsDir
     pluginRegistry.shellConfigProvider = function() { return shell.shellConfig }
-    pluginRegistry.shellConfigMutator = function(mutate) { shell.mutateShellConfig(mutate) }
+    pluginRegistry.shellConfigMutator = function(mutate) { return shell.mutateShellConfig(mutate) }
     pluginRegistry.eligibilityAuthority = shell.pluginEligibility
     pluginEligibility.unloadCallback = function(pluginId) { shell.unloadExactPlugin(pluginId) }
     pluginEligibility.unloadVerifiedCallback = function(pluginId) { return shell.isExactPluginUnloaded(pluginId) }
     pluginEligibility.rescanCallback = function(operationId, pluginId) {
       return shell.pluginRegistry.rescan({ operationId: operationId, pluginId: pluginId, gated: true })
     }
-    pluginEligibility.registryGenerationProvider = function() { return shell.pluginRegistry.registryGeneration }
+    pluginEligibility.registryAuthorityProvider = function(pluginId) {
+      return shell.pluginRegistry.authoritySnapshot(pluginId)
+    }
     shell.pluginEligibility.initialize()
     // PluginRegistry.ensureUserDir() runs in its own Component.onCompleted and
     // chains rescan() once the directory exists. We also kick a scan here in
@@ -189,7 +213,7 @@ ShellRoot {
   function mutateShellConfig(mutator) {
     var copy = JSON.parse(JSON.stringify(shellConfig || builtinShellConfig))
     mutator(copy)
-    persistShellConfig(copy)
+    return persistShellConfig(copy)
   }
 
   // Exposed as a property so child plugins (notifications, future panels)
@@ -604,8 +628,7 @@ ShellRoot {
       }
     }
     if (!dirty) return false
-    persistShellConfig(copy)
-    return true
+    return persistShellConfig(copy)
   }
 
   // ---------------------------------------------------------- on-demand panels
@@ -980,7 +1003,7 @@ ShellRoot {
       console.log("Local plugin changed, reloading:", pluginId)
       localPluginReloadTimer.restart()
     }
-    function onScanFinished(context, generation) {
+    function onScanFinished(context, generation, outcome) {
       if (shell.pluginReloadPending) {
         shell.pluginReloadPending = false
         shell.pluginReloading = false
@@ -991,8 +1014,14 @@ ShellRoot {
       shell._syncServices()
       shell.refreshPanelEntries()
       shell.syncPluginWidgets()
-      if (context && context.gated === true)
-        shell.pluginEligibility.acknowledgeRescan(context.operationId, context.pluginId, generation)
+      if (context && context.gated === true) {
+        var gateRecord = shell.pluginEligibility.gates[String(context.pluginId)]
+        var binding = gateRecord && gateRecord.valid === true
+          ? shell.pluginRegistry.gatedScanBinding(context.operationId, context.pluginId,
+            gateRecord.expectedDestination, outcome)
+          : { valid: false, status: "gate-state-invalid" }
+        shell.pluginEligibility.acknowledgeRescan(context.operationId, context.pluginId, binding)
+      }
     }
   }
 

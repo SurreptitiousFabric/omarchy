@@ -29,9 +29,11 @@ and (if .expected.referencePolicy == "require-unreferenced" then
        and .expected.referenceProjection == "sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432"
      else true end)
 and (.unload == "pending" or .unload == "acknowledged")
-and (.rescan | exact_keys(["expectedTree", "generation", "observedTree", "outcome", "shellInstance"]))
+and (.rescan | exact_keys(["expectedTree", "generation", "observedTree", "outcome", "scanEpoch", "shellInstance", "sourceDirectory"]))
 and (.rescan.shellInstance | nullable_string)
 and (.rescan.generation | nullable_nonnegative_integer)
+and (.rescan.scanEpoch | nullable_nonnegative_integer)
+and (.rescan.sourceDirectory | nullable_string)
 and (.rescan.expectedTree | nullable_string)
 and (.rescan.observedTree | nullable_string)
 and (.rescan.outcome == "not-requested" or .rescan.outcome == "completed")
@@ -43,23 +45,27 @@ and (.release.outcome == "not-requested" or .release.outcome == "authorized")
 and (
   if .state == "GATED" then
     .unload == "pending"
-    and .rescan == {expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",shellInstance:null}
+    and .rescan == {expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null}
     and .release == {configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}
   elif .state == "UNLOAD_ACKNOWLEDGED" then
     .unload == "acknowledged"
-    and .rescan == {expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",shellInstance:null}
+    and .rescan == {expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null}
     and .release == {configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}
   elif .state == "RESCAN_ACKNOWLEDGED" then
     .unload == "acknowledged"
     and .rescan.outcome == "completed"
     and (.rescan.shellInstance | string) and (.rescan.shellInstance | length > 0)
     and (.rescan.generation | type == "number")
+    and (.rescan.scanEpoch | type == "number")
+    and .rescan.sourceDirectory == .expected.destination
     and .rescan.expectedTree == .expected.tree
     and .rescan.observedTree == .expected.tree
     and .release == {configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}
   elif .state == "RELEASE_AUTHORIZED" then
     .unload == "acknowledged"
     and .rescan.outcome == "completed"
+    and (.rescan.scanEpoch | type == "number")
+    and .rescan.sourceDirectory == .expected.destination
     and .rescan.expectedTree == .expected.tree
     and .rescan.observedTree == .expected.tree
     and .release.outcome == "authorized"

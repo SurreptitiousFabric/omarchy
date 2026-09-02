@@ -112,9 +112,22 @@ static bool inject_zero_hash_send(void) {
   }
   return false;
 }
+
+static ssize_t read_lock_input(int fd, void *buffer, size_t length) {
+  static bool consumed = false;
+  if (!consumed && getenv("OMARCHY_PLUGIN_TREE_TEST_EINTR_LOCK_READ")) {
+    consumed = true;
+    errno = EINTR;
+    return -1;
+  }
+  return read(fd, buffer, length);
+}
 #else
 static bool inject_zero_write(void) { return false; }
 static bool inject_zero_hash_send(void) { return false; }
+static ssize_t read_lock_input(int fd, void *buffer, size_t length) {
+  return read(fd, buffer, length);
+}
 #endif
 
 static void fd_write_all(int fd, const void *buffer, size_t length,
@@ -221,9 +234,24 @@ static bool test_fsync_failure(const char *name) {
   }
   return false;
 }
+
+static bool test_rename_failure(const char *name) {
+  static bool consumed = false;
+  const char *selected = getenv("OMARCHY_PLUGIN_TREE_TEST_FAIL_RENAME");
+  if (!consumed && selected && strcmp(selected, name) == 0) {
+    consumed = true;
+    errno = EIO;
+    return true;
+  }
+  return false;
+}
 #else
 static void test_hook(const char *name) { (void)name; }
 static bool test_fsync_failure(const char *name) {
+  (void)name;
+  return false;
+}
+static bool test_rename_failure(const char *name) {
   (void)name;
   return false;
 }
@@ -886,7 +914,13 @@ static void replace_gate(const char *state_path, const char *plugin_id,
     fail_io("sync gate file", temporary_name);
   transition_hook("after-gate-file-sync", transition);
   close(temporary);
-  if (renameat(gates, temporary_name, gates, final_name) < 0)
+  char rename_point[192];
+  int rename_length = snprintf(rename_point, sizeof(rename_point),
+                               "gate-rename:%s", transition);
+  if (rename_length < 0 || (size_t)rename_length >= sizeof(rename_point))
+    reject_tree("transition-name-limit", transition);
+  if (test_rename_failure(rename_point) ||
+      renameat(gates, temporary_name, gates, final_name) < 0)
     fail_io("replace gate", final_name);
   transition_hook("after-gate-rename", transition);
   if (transition_sync_fd(gates, "gate-parent", transition) < 0)
@@ -1087,9 +1121,29 @@ static void sync_journal_authority(const char *state_path,
   close(state);
 }
 
-static void hold_plugin_lock(const char *state_path, const char *lock_name) {
-  if (!simple_name(lock_name))
-    reject_tree("invalid-plugin-lock-name", lock_name);
+static void derive_plugin_lock_name(const char *plugin_id, char output[65]) {
+  if (!third_party_plugin_id(plugin_id))
+    reject_tree("invalid-plugin-id", plugin_id);
+  static const char lock_domain[] = "omarchy-plugin-transaction-plugin-lock/v1";
+  int hash = open_hash();
+  hash_update(hash, lock_domain, sizeof(lock_domain) - 1, "plugin lock domain");
+  const unsigned char separator = 0;
+  hash_update(hash, &separator, 1, "plugin lock domain");
+  hash_update(hash, plugin_id, strlen(plugin_id), "plugin lock id");
+  if (send(hash, NULL, 0, 0) < 0)
+    fail_io("finalize plugin lock hash", "AF_ALG");
+  unsigned char digest[32];
+  ssize_t received = read(hash, digest, sizeof(digest));
+  close(hash);
+  if (received != (ssize_t)sizeof(digest))
+    fail_io("read plugin lock hash", "AF_ALG");
+  for (size_t index = 0; index < sizeof(digest); index++)
+    snprintf(output + index * 2, 3, "%02x", digest[index]);
+}
+
+static void hold_plugin_lock(const char *state_path, const char *plugin_id) {
+  char derived_name[65];
+  derive_plugin_lock_name(plugin_id, derived_name);
   int state = open_private_state_root(state_path);
   int locks = openat(state, "locks",
                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -1099,23 +1153,31 @@ static void hold_plugin_lock(const char *state_path, const char *lock_name) {
                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (plugins < 0)
     fail_io("open plugin lock directory", state_path);
-  int lock = openat(plugins, lock_name,
+  int lock = openat(plugins, derived_name,
                     O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
   if (lock < 0)
-    fail_io("open plugin lifecycle lock", lock_name);
+    fail_io("open plugin lifecycle lock", derived_name);
   if (fchmod(lock, 0600) < 0)
-    fail_io("set plugin lock mode", lock_name);
+    fail_io("set plugin lock mode", derived_name);
   if (flock(lock, LOCK_EX | LOCK_NB) < 0) {
     if (errno == EWOULDBLOCK) {
       fputs("plugin-busy\n", stderr);
       exit(3);
     }
-    fail_io("acquire plugin lifecycle lock", lock_name);
+    fail_io("acquire plugin lifecycle lock", derived_name);
   }
   fputs("locked\n", stdout);
   fflush(stdout);
   unsigned char buffer[256];
-  while (read(STDIN_FILENO, buffer, sizeof(buffer)) > 0) {
+  for (;;) {
+    ssize_t count = read_lock_input(STDIN_FILENO, buffer, sizeof(buffer));
+    if (count > 0)
+      continue;
+    if (count == 0)
+      break;
+    if (errno == EINTR)
+      continue;
+    fail_io("hold plugin lifecycle lock", derived_name);
   }
   close(lock);
   close(plugins);
@@ -1139,7 +1201,9 @@ static int open_lock_file(int directory, const char *name,
 /* O-5's proof seam for the universal operation-before-plugin lock order. */
 static void hold_ordered_locks(const char *state_path,
                                const char *operation_id,
-                               const char *plugin_lock_name) {
+                               const char *plugin_id) {
+  char plugin_lock_name[65];
+  derive_plugin_lock_name(plugin_id, plugin_lock_name);
   int state = open_private_state_root(state_path);
   int locks = openat(state, "locks",
                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -1173,7 +1237,15 @@ static void hold_ordered_locks(const char *state_path,
   fputs("locked-operation-then-plugin\n", stdout);
   fflush(stdout);
   unsigned char buffer[256];
-  while (read(STDIN_FILENO, buffer, sizeof(buffer)) > 0) {
+  for (;;) {
+    ssize_t count = read_lock_input(STDIN_FILENO, buffer, sizeof(buffer));
+    if (count > 0)
+      continue;
+    if (count == 0)
+      break;
+    if (errno == EINTR)
+      continue;
+    fail_io("hold ordered locks", plugin_lock_name);
   }
   close(plugin);
   close(operation);
@@ -1272,7 +1344,8 @@ int main(int argc, char **argv) {
           "gate-replace STATE PLUGIN INPUT TRANSITION | gate-sync STATE | "
           "domain-hash DOMAIN | sync-directory PATH POINT | "
           "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "
-          "plugin-lock STATE LOCK-NAME | ordered-lock STATE OPERATION LOCK-NAME | hash-equal EXPECTED\n",
+          "plugin-lock STATE PLUGIN-ID | ordered-lock STATE OPERATION PLUGIN-ID | "
+          "hash-equal EXPECTED\n",
           argv[0]);
   return 64;
 }

@@ -32,7 +32,7 @@ Only `STAGED` is a successful stage result. A journal claiming `STAGED` without 
 
 ## Locks
 
-The operation lock is `locks/operations/<operation-id>.lock`. It is acquired in blocking mode for stage and exact replay and is held from journal read/create through the response generated from the durable record. The plugin lifecycle lock is `locks/plugins/<sha256(plugin-id-domain || plugin-id)>.lock`; it is acquired nonblocking and returns `plugin-busy` on conflict. When both are required, the universal order is operation lock then plugin lifecycle lock. O-5 does not acquire the plugin lock during inert stage, but provides and tests the primitive for later commit work.
+The operation lock is `locks/operations/<operation-id>.lock`. It is acquired in blocking mode for stage and exact replay and is held from journal read/create through the response generated from the durable record. The plugin lifecycle lock is `locks/plugins/<sha256("omarchy-plugin-transaction-plugin-lock/v1" || NUL || plugin-id)>`; package-owned native code derives that filename from the canonical plugin ID, so callers never select it. It is acquired nonblocking and returns `plugin-busy` on conflict. When both are required, the universal order is operation lock then plugin lifecycle lock. O-5 does not acquire the plugin lock during inert stage, but provides and tests the primitive for later commit work.
 
 Locks are advisory and disappear when the holding process exits. Lock-file existence, PID values, timestamps, and deletion are never transaction evidence. The journal plus exact candidate identities determines reconciliation.
 

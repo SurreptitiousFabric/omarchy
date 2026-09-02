@@ -12,11 +12,18 @@ QtObject {
     ? Quickshell.env("XDG_STATE_HOME") + "/omarchy/plugin-transactions-v1"
     : Quickshell.env("HOME") + "/.local/state/omarchy/plugin-transactions-v1"
   property string helperPath: omarchyPath + "/native/plugin-transaction/shell-gate"
-  property var acceptedConfig: null
-  property string acceptedSourceKind: "absent"
-  property string acceptedSourceIdentity: ""
-  property string acceptedRawText: ""
-  property int configurationEpoch: 0
+  property var acceptedSnapshot: ({
+    config: null,
+    sourceKind: "absent",
+    sourceIdentity: "",
+    rawText: "",
+    epoch: 0
+  })
+  readonly property var acceptedConfig: acceptedSnapshot.config
+  readonly property string acceptedSourceKind: acceptedSnapshot.sourceKind
+  readonly property string acceptedSourceIdentity: acceptedSnapshot.sourceIdentity
+  readonly property string acceptedRawText: acceptedSnapshot.rawText
+  readonly property int configurationEpoch: acceptedSnapshot.epoch
   property bool inventoryReady: false
   property bool inventoryBlocksAll: true
   property var gates: ({})
@@ -27,19 +34,29 @@ QtObject {
   property var unloadCallback: null
   property var unloadVerifiedCallback: null
   property var rescanCallback: null
-  property var registryGenerationProvider: null
+  property var registryAuthorityProvider: null
   property string shellInstanceId: "shell-" + Date.now().toString(16) + "-" + Math.random().toString(16).slice(2)
 
   signal eligibilityChanged()
   signal inventoryFinished(bool usable)
 
   function acceptSnapshot(config, sourceKind, sourceIdentity, rawText) {
-    acceptedConfig = config
-    acceptedSourceKind = String(sourceKind || "absent")
-    acceptedSourceIdentity = String(sourceIdentity || "")
-    acceptedRawText = String(rawText || "")
-    configurationEpoch++
+    var kind = String(sourceKind || "absent")
+    var identity = String(sourceIdentity || "")
+    var text = String(rawText || "")
+    if (acceptedConfig !== null && acceptedSourceKind === kind
+        && acceptedSourceIdentity === identity && acceptedRawText === text) return false
+    var copied = config === null || config === undefined
+      ? null : JSON.parse(JSON.stringify(config))
+    acceptedSnapshot = {
+      config: copied,
+      sourceKind: kind,
+      sourceIdentity: identity,
+      rawText: text,
+      epoch: configurationEpoch + 1
+    }
     eligibilityChanged()
+    return true
   }
 
   function referenceSnapshot(pluginId) {
@@ -72,6 +89,39 @@ QtObject {
     next[String(pluginId)] = record || { valid: false }
     gates = next
     eligibilityChanged()
+  }
+
+  function memoryGate(record, operationId, pluginId) {
+    if (!record || typeof record !== "object"
+        || record.operationId !== operationId || record.pluginId !== pluginId
+        || !record.expected || !record.rescan || !record.release
+        || !/^[0-9a-f]{64}$/.test(String(record.operationJournalSha256 || ""))
+        || ["GATED", "UNLOAD_ACKNOWLEDGED", "RESCAN_ACKNOWLEDGED", "RELEASE_AUTHORIZED"].indexOf(record.state) === -1)
+      return null
+    return {
+      valid: true,
+      operationId: record.operationId,
+      state: record.state,
+      operationJournalSha256: String(record.operationJournalSha256),
+      expectedDestination: String(record.expected.destination || ""),
+      expectedTree: String(record.expected.tree || ""),
+      generation: record.rescan.generation,
+      scanEpoch: record.rescan.scanEpoch,
+      sourceDirectory: String(record.rescan.sourceDirectory || ""),
+      shellInstance: String(record.rescan.shellInstance || ""),
+      releaseShellInstance: String(record.release.shellInstance || ""),
+      releaseGeneration: record.release.generation
+    }
+  }
+
+  function registryBindingCurrent(pluginId, generation, scanEpoch, sourceDirectory) {
+    if (!registryAuthorityProvider) return false
+    var current = registryAuthorityProvider(pluginId)
+    return current && current.scanning !== true && current.scanSuccessful === true
+      && current.unique === true
+      && Number(current.generation) === Number(generation)
+      && Number(current.scanEpoch) === Number(scanEpoch)
+      && String(current.sourceDirectory || "") === String(sourceDirectory || "")
   }
 
   function initialize() {
@@ -127,8 +177,14 @@ QtObject {
 
   function gatePlugin(operationId, pluginId) {
     if (!validOperation(operationId) || !validPlugin(pluginId)) return "invalid-identity"
+    var existing = gates[String(pluginId)]
+    if (existing && existing.operationId && existing.operationId !== operationId) {
+      setResult(operationId, pluginId, "plugin-gated-by-another-operation", "")
+      return "conflict"
+    }
+    if (!existing) setGateRecord(pluginId, { operationId: operationId, valid: false, state: "AUTHORITY_PENDING" })
     setResult(operationId, pluginId, "gate-pending", "")
-    enqueue({ type: "install", operationId: operationId, pluginId: pluginId,
+    enqueue({ type: "install", operationId: operationId, pluginId: pluginId, priorGate: existing || null,
       command: [helperPath, "install", operationId, pluginId] })
     return "pending"
   }
@@ -171,6 +227,9 @@ QtObject {
 
   function rescanGated(operationId, pluginId) {
     if (!validOperation(operationId) || !validPlugin(pluginId) || !isGated(pluginId)) return "gate-missing"
+    var gateRecord = gates[String(pluginId)]
+    if (!gateRecord || gateRecord.valid !== true || gateRecord.operationId !== operationId
+        || gateRecord.state !== "UNLOAD_ACKNOWLEDGED") return "unload-incomplete"
     setResult(operationId, pluginId, "gated-rescan-pending", "")
     if (!rescanCallback || rescanCallback(operationId, pluginId) !== true) {
       setResult(operationId, pluginId, "gated-rescan-busy", "ordinary-or-other scan active")
@@ -179,17 +238,27 @@ QtObject {
     return "pending"
   }
 
-  function acknowledgeRescan(operationId, pluginId, generation) {
+  function acknowledgeRescan(operationId, pluginId, binding) {
+    if (!binding || binding.valid !== true) {
+      setResult(operationId, pluginId, "gated-rescan-failed", binding ? binding.status : "invalid scan result")
+      return
+    }
     enqueue({ type: "rescan", operationId: operationId, pluginId: pluginId,
-      command: [helperPath, "acknowledge-rescan", operationId, pluginId, shellInstanceId, String(generation)] })
+      generation: Number(binding.generation), scanEpoch: Number(binding.scanEpoch),
+      sourceDirectory: String(binding.sourceDirectory || ""),
+      command: [helperPath, "acknowledge-rescan", operationId, pluginId, shellInstanceId,
+        String(binding.generation), String(binding.scanEpoch), String(binding.sourceDirectory || "")] })
   }
 
   function releasePlugin(operationId, pluginId) {
     if (!validOperation(operationId) || !validPlugin(pluginId) || !isGated(pluginId)) return "gate-missing"
     var gateRecord = gates[String(pluginId)]
     if (!gateRecord || gateRecord.operationId !== operationId || gateRecord.state !== "RESCAN_ACKNOWLEDGED") return "gated-rescan-missing"
-    if (!registryGenerationProvider || Number(registryGenerationProvider()) !== Number(gateRecord.generation)) {
-      setResult(operationId, pluginId, "release-retained", "stale rescan generation")
+    if (!registryBindingCurrent(pluginId, gateRecord.generation, gateRecord.scanEpoch, gateRecord.sourceDirectory)) {
+      retainAuthorizedRelease({ operationId: operationId, pluginId: pluginId,
+        generation: gateRecord.generation, shellInstance: gateRecord.shellInstance,
+        scanEpoch: gateRecord.scanEpoch, sourceDirectory: gateRecord.sourceDirectory,
+        operationJournalSha256: gateRecord.operationJournalSha256 }, "stale rescan generation")
       return "stale-rescan-generation"
     }
     var snapshot = referenceSnapshot(pluginId)
@@ -197,6 +266,7 @@ QtObject {
     setResult(operationId, pluginId, "release-comparison-pending", "")
     enqueue({ type: "projection", operationId: operationId, pluginId: pluginId,
       generation: Number(gateRecord.generation), shellInstance: String(gateRecord.shellInstance || ""),
+      scanEpoch: Number(gateRecord.scanEpoch), sourceDirectory: String(gateRecord.sourceDirectory || ""),
       operationJournalSha256: String(gateRecord.operationJournalSha256 || ""), snapshot: snapshot,
       command: [helperPath, "projection-digest", snapshot.canonicalBase64] })
     return "pending"
@@ -209,11 +279,12 @@ QtObject {
       && gateRecord.state === "RESCAN_ACKNOWLEDGED"
       && Number(gateRecord.generation) === Number(command.generation)
       && gateRecord.shellInstance === command.shellInstance
+      && Number(gateRecord.scanEpoch) === Number(command.scanEpoch)
+      && gateRecord.sourceDirectory === command.sourceDirectory
       && command.shellInstance === shellInstanceId
       && gateRecord.operationJournalSha256 === command.operationJournalSha256
       && command.snapshot.epoch === configurationEpoch
-      && registryGenerationProvider
-      && Number(registryGenerationProvider()) === Number(command.generation)
+      && registryBindingCurrent(command.pluginId, command.generation, command.scanEpoch, command.sourceDirectory)
       && isGated(command.pluginId)
   }
 
@@ -221,6 +292,7 @@ QtObject {
     setResult(command.operationId, command.pluginId, "release-retaining", detail)
     enqueue({ type: "retain-release", operationId: command.operationId, pluginId: command.pluginId,
       generation: command.generation, shellInstance: command.shellInstance,
+      scanEpoch: command.scanEpoch, sourceDirectory: command.sourceDirectory,
       operationJournalSha256: command.operationJournalSha256, detail: detail,
       command: [helperPath, "retain-release", command.operationId, command.pluginId,
         command.shellInstance, String(command.generation)] })
@@ -228,20 +300,58 @@ QtObject {
 
   function refreshGateFromResult(command, payload) {
     if (command.type === "install") {
-      setGateRecord(command.pluginId, { operationId: command.operationId, valid: true, state: "GATED",
-        operationJournalSha256: String(payload.operationJournalSha256 || "") })
-      setPendingUnload(command.operationId, command.pluginId, false)
-      if (unloadCallback) unloadCallback(command.pluginId)
-      verifyPendingUnload(command.pluginId)
+      var installedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!installedGate) {
+        setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
+        setResult(command.operationId, command.pluginId, "gate-state-invalid", "invalid helper result")
+        return
+      }
+      setGateRecord(command.pluginId, installedGate)
+      if (installedGate.state === "GATED") {
+        setPendingUnload(command.operationId, command.pluginId, false)
+        if (unloadCallback) unloadCallback(command.pluginId)
+        verifyPendingUnload(command.pluginId)
+      } else if (installedGate.state === "UNLOAD_ACKNOWLEDGED") {
+        clearPendingUnload(command.pluginId)
+        setResult(command.operationId, command.pluginId, "gate-installed-unload-acknowledged", "exact durable replay")
+      } else if (installedGate.state === "RESCAN_ACKNOWLEDGED"
+          && installedGate.shellInstance === shellInstanceId
+          && registryBindingCurrent(command.pluginId, installedGate.generation,
+            installedGate.scanEpoch, installedGate.sourceDirectory)) {
+        clearPendingUnload(command.pluginId)
+        setResult(command.operationId, command.pluginId, "gated-rescan-complete", "exact durable replay")
+      } else {
+        clearPendingUnload(command.pluginId)
+        retainAuthorizedRelease({ operationId: command.operationId, pluginId: command.pluginId,
+          generation: installedGate.state === "RELEASE_AUTHORIZED"
+            ? installedGate.releaseGeneration : installedGate.generation,
+          shellInstance: installedGate.state === "RELEASE_AUTHORIZED"
+            ? installedGate.releaseShellInstance : installedGate.shellInstance,
+          scanEpoch: installedGate.scanEpoch, sourceDirectory: installedGate.sourceDirectory,
+          operationJournalSha256: installedGate.operationJournalSha256 },
+          "replayed gate authority requires a fresh gated rescan")
+      }
     } else if (command.type === "unload") {
+      var unloadedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!unloadedGate) {
+        setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
+        setResult(command.operationId, command.pluginId, "gate-state-invalid", "invalid helper result")
+        return
+      }
       clearPendingUnload(command.pluginId)
-      setGateRecord(command.pluginId, { operationId: command.operationId, valid: true, state: "UNLOAD_ACKNOWLEDGED",
-        operationJournalSha256: String(payload.operationJournalSha256 || "") })
-      setResult(command.operationId, command.pluginId, payload.status || "gate-installed-unload-acknowledged", "")
+      setGateRecord(command.pluginId, unloadedGate)
+      if (unloadedGate.state === "UNLOAD_ACKNOWLEDGED")
+        setResult(command.operationId, command.pluginId, payload.status || "gate-installed-unload-acknowledged", "")
+      else
+        setResult(command.operationId, command.pluginId, "gate-state-replayed", unloadedGate.state)
     } else if (command.type === "rescan") {
-      setGateRecord(command.pluginId, { operationId: command.operationId, valid: true, state: "RESCAN_ACKNOWLEDGED",
-        generation: payload.generation, shellInstance: String(payload.shellInstance || ""),
-        operationJournalSha256: String(payload.operationJournalSha256 || "") })
+      var rescannedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!rescannedGate || rescannedGate.state !== "RESCAN_ACKNOWLEDGED") {
+        setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
+        setResult(command.operationId, command.pluginId, "gate-state-invalid", "invalid helper result")
+        return
+      }
+      setGateRecord(command.pluginId, rescannedGate)
       setResult(command.operationId, command.pluginId, payload.status || "gated-rescan-complete", JSON.stringify(payload))
     } else if (command.type === "projection") {
       var digest = String(actionStdout.text || "").trim()
@@ -250,13 +360,19 @@ QtObject {
       } else {
         enqueue({ type: "release", operationId: command.operationId, pluginId: command.pluginId,
           generation: command.generation, epoch: command.snapshot.epoch, snapshot: command.snapshot,
+          scanEpoch: command.scanEpoch, sourceDirectory: command.sourceDirectory,
           shellInstance: command.shellInstance, operationJournalSha256: command.operationJournalSha256,
           command: [helperPath, "authorize-release", command.operationId, command.pluginId,
             command.shellInstance, String(command.generation), String(command.snapshot.epoch),
             command.snapshot.sourceKind, command.snapshot.sourceIdentity, digest, command.snapshot.state] })
       }
     } else if (command.type === "release") {
-      if (!releaseBindingCurrent(command)) {
+      var authorizedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!authorizedGate || authorizedGate.state !== "RELEASE_AUTHORIZED") {
+        setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
+        setResult(command.operationId, command.pluginId, "release-retained", "invalid helper result")
+      } else if (!releaseBindingCurrent(command)) {
+        setGateRecord(command.pluginId, authorizedGate)
         retainAuthorizedRelease(command, "configuration epoch, registry generation, shell instance, or gate changed")
       } else {
         var next = ({})
@@ -266,8 +382,13 @@ QtObject {
         setResult(command.operationId, command.pluginId, "released", "discovery only; execution not observed")
       }
     } else if (command.type === "retain-release") {
-      setGateRecord(command.pluginId, { operationId: command.operationId, valid: true, state: "UNLOAD_ACKNOWLEDGED",
-        operationJournalSha256: String(payload.operationJournalSha256 || command.operationJournalSha256 || "") })
+      var retainedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!retainedGate || retainedGate.state !== "UNLOAD_ACKNOWLEDGED") {
+        setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
+        setResult(command.operationId, command.pluginId, "release-retained", "invalid helper result")
+        return
+      }
+      setGateRecord(command.pluginId, retainedGate)
       setResult(command.operationId, command.pluginId, "release-retained", command.detail || "release authority changed")
     }
   }
@@ -284,6 +405,8 @@ QtObject {
       if (exitCode === 0) authority.refreshGateFromResult(command, payload)
       else {
         if (command.type === "unload") authority.setPendingUnload(command.operationId, command.pluginId, false)
+        if (command.type === "install" && !command.priorGate)
+          authority.setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
         if (command.type === "retain-release")
           authority.setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
         authority.setResult(command.operationId, command.pluginId,
@@ -311,16 +434,8 @@ QtObject {
               if (item && item.pluginId) {
                 if (item.valid) {
                   var record = item.record
-                  next[String(item.pluginId)] = {
-                    valid: true,
-                    operationId: record.operationId,
-                    state: record.state,
-                    generation: record.rescan ? record.rescan.generation : null,
-                    shellInstance: record.rescan ? String(record.rescan.shellInstance || "") : "",
-                    operationJournalSha256: String(record.operationJournalSha256 || ""),
-                    releaseShellInstance: record.release ? String(record.release.shellInstance || "") : "",
-                    releaseGeneration: record.release ? record.release.generation : null
-                  }
+                  var restored = authority.memoryGate(record, record.operationId, String(item.pluginId))
+                  next[String(item.pluginId)] = restored || { valid: false }
                 } else next[String(item.pluginId)] = { valid: false }
               }
             }
@@ -340,6 +455,7 @@ QtObject {
           if (gateRecord.valid === true && gateRecord.state === "RELEASE_AUTHORIZED")
             authority.retainAuthorizedRelease({ operationId: gateRecord.operationId, pluginId: pluginId,
               generation: gateRecord.releaseGeneration, shellInstance: gateRecord.releaseShellInstance,
+              scanEpoch: gateRecord.scanEpoch, sourceDirectory: gateRecord.sourceDirectory,
               operationJournalSha256: gateRecord.operationJournalSha256 }, "shell restarted before release completion")
         }
       }
