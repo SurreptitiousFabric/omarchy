@@ -32,4 +32,18 @@ assert(digest(api.api.canonicalBytes(moved, 'acme.plugin')) !== digest(api.api.c
 assert(api.api.canonicalBytes(null, 'acme.plugin') === null, 'malformed snapshot is not an empty projection')
 JS
 
+eligibility=$(<"$ROOT/shell/services/PluginEligibility.qml")
+[[ $(grep -c '!releaseBindingCurrent(' <<<"$eligibility") == 3 ]] ||
+  fail "release rechecks the complete binding before and after asynchronous phases"
+[[ $(grep -c 'Number(registryGenerationProvider()) === Number(command.generation)' <<<"$eligibility") == 1 ]] ||
+  fail "the shared release binding compares current registry generation"
+grep -F 'Number(registryGenerationProvider()) !== Number(gateRecord.generation)' <<<"$eligibility" >/dev/null ||
+  fail "release rejects a stale gated-rescan generation before projection"
+
+without_generation=${eligibility//Number(registryGenerationProvider()) !== Number(command.generation)/false}
+[[ $(grep -c 'registryGenerationProvider()) !== Number(command.generation)' <<<"$without_generation" || true) == 0 ]] ||
+  fail "generation negative control removes the release guard"
+
+pass "release remains bound to the current registry generation"
+
 pass "schema-v1 reference projection matches independent fixed vectors"

@@ -13,7 +13,12 @@ synchronizes it, renames it over the authoritative name, and synchronizes the
 Every record state is blocking at startup. In particular,
 `RELEASE_AUTHORIZED` records are not proof that a new shell instance published
 eligibility. A restart restores the gate and requires a fresh operation-bound
-rescan and conditional release. Unknown inventory entries or an unreadable
+rescan and conditional release. Before that rescan, the shell atomically
+returns the exact `RELEASE_AUTHORIZED` record to `UNLOAD_ACKNOWLEDGED` and
+clears its old rescan and release evidence. The same transition is used when
+configuration, registry-generation, shell-instance, or gate authority changes
+after native authorization but before in-memory eligibility publication.
+Unknown inventory entries or an unreadable
 inventory block all third-party plugins. A malformed record whose valid
 filename identifies a plugin blocks that plugin and is retained.
 

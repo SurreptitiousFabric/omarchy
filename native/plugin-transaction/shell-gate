@@ -132,7 +132,8 @@ case $action in
       validate_canonical "$gate" "$gate_validator" plugin_id "$plugin_id" || fail gate-state-invalid "$plugin_id"
       [[ $(jq -r .operationId "$gate") == "$operation_id" ]] || fail plugin-gated-by-another-operation "$plugin_id"
       [[ $(jq -r .operationJournalSha256 "$gate") == "$journal_sha" ]] || fail operation-journal-changed "$operation_id"
-      jq -cn --arg state "$(jq -r .state "$gate")" '{status:"already-gated",state:$state}'
+      jq -cn --arg state "$(jq -r .state "$gate")" --arg journalSha "$journal_sha" \
+        '{status:"already-gated",state:$state,operationJournalSha256:$journalSha}'
       exit 0
     fi
     input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
@@ -149,7 +150,8 @@ case $action in
        release:{configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}}' "$journal" >"$input"
     replace_gate "$plugin_id" "$input" gate-install
     rm -f -- "$input"
-    jq -cn '{status:"gate-installed",state:"GATED"}'
+    jq -cn --arg journalSha "$journal_sha" \
+      '{status:"gate-installed",state:"GATED",operationJournalSha256:$journalSha}'
     ;;
   acknowledge-unload)
     [[ $# == 3 ]] || fail usage 'acknowledge-unload OPERATION_ID PLUGIN_ID SHELL_INSTANCE'
@@ -165,7 +167,8 @@ case $action in
     jq -cS '.state="UNLOAD_ACKNOWLEDGED" | .unload="acknowledged"' "$gate" >"$input"
     replace_gate "$plugin_id" "$input" gate-unload-acknowledged
     rm -f -- "$input"
-    jq -cn '{status:"gate-installed-unload-acknowledged",state:"UNLOAD_ACKNOWLEDGED"}'
+    jq -cn --arg journalSha "$journal_sha" \
+      '{status:"gate-installed-unload-acknowledged",state:"UNLOAD_ACKNOWLEDGED",operationJournalSha256:$journalSha}'
     ;;
   acknowledge-rescan)
     [[ $# == 4 ]] || fail usage 'acknowledge-rescan OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION'
@@ -183,8 +186,8 @@ case $action in
       '.state="RESCAN_ACKNOWLEDGED" | .rescan={expectedTree:$tree,generation:$generation,observedTree:$tree,outcome:"completed",shellInstance:$instance}' "$gate" >"$input"
     replace_gate "$plugin_id" "$input" gate-rescan-acknowledged
     rm -f -- "$input"
-    jq -cn --arg instance "$shell_instance" --argjson generation "$generation" --arg tree "$expected" \
-      '{status:"gated-rescan-complete",shellInstance:$instance,generation:$generation,tree:$tree,execution:"not-observed"}'
+    jq -cn --arg instance "$shell_instance" --argjson generation "$generation" --arg tree "$expected" --arg journalSha "$journal_sha" \
+      '{status:"gated-rescan-complete",shellInstance:$instance,generation:$generation,tree:$tree,operationJournalSha256:$journalSha,execution:"not-observed"}'
     ;;
   authorize-release)
     [[ $# == 9 ]] || fail usage 'authorize-release OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION EPOCH SOURCE_KIND SOURCE_IDENTITY PROJECTION REFERENCE_STATE'
@@ -211,7 +214,31 @@ case $action in
       '.state="RELEASE_AUTHORIZED" | .release={configurationEpoch:$epoch,generation:$generation,outcome:"authorized",shellInstance:$instance}' "$gate" >"$input"
     replace_gate "$plugin_id" "$input" gate-release-authorized
     rm -f -- "$input"
-    jq -cn --argjson epoch "$epoch" '{status:"release-authorized",configurationEpoch:$epoch,execution:"not-observed"}'
+    jq -cn --argjson epoch "$epoch" --arg journalSha "$journal_sha" \
+      '{status:"release-authorized",configurationEpoch:$epoch,operationJournalSha256:$journalSha,execution:"not-observed"}'
+    ;;
+  retain-release)
+    [[ $# == 4 ]] || fail usage 'retain-release OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION'
+    operation_id=$1; plugin_id=$2; shell_instance=$3; generation=$4
+    [[ $generation =~ ^[0-9]+$ && -n $shell_instance && ${#shell_instance} -le 128 ]] || fail invalid-release-binding "$plugin_id"
+    load_gate "$operation_id" "$plugin_id"
+    state=$(jq -r .state "$gate")
+    if [[ $state == UNLOAD_ACKNOWLEDGED ]]; then
+      jq -cn --arg journalSha "$journal_sha" \
+        '{status:"release-retained",state:"UNLOAD_ACKNOWLEDGED",operationJournalSha256:$journalSha}'
+      exit 0
+    fi
+    [[ $state == RELEASE_AUTHORIZED ]] || fail release-not-authorized "$plugin_id"
+    [[ $(jq -r .release.shellInstance "$gate") == "$shell_instance"
+      && $(jq -r .release.generation "$gate") == "$generation" ]] || fail stale-release-binding "$plugin_id"
+    input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
+    jq -cS '.state="UNLOAD_ACKNOWLEDGED"
+      | .rescan={expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",shellInstance:null}
+      | .release={configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}' "$gate" >"$input"
+    replace_gate "$plugin_id" "$input" gate-release-retained
+    rm -f -- "$input"
+    jq -cn --arg journalSha "$journal_sha" \
+      '{status:"release-retained",state:"UNLOAD_ACKNOWLEDGED",operationJournalSha256:$journalSha}'
     ;;
   *) fail usage "$action" ;;
 esac

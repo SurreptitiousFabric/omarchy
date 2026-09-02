@@ -99,6 +99,13 @@ fi
 [[ $(sha256sum "$gate_file") == "$baseline" ]]
 printf 'ok - conflicting transition preserves authoritative gate\n'
 
+retained=$(gate retain-release "$operation" "$plugin" shell-one 1)
+[[ $(jq -r '.status + ":" + .state' <<<"$retained") == release-retained:UNLOAD_ACKNOWLEDGED ]]
+[[ $(jq -r '.state + ":" + .rescan.outcome + ":" + .release.outcome' "$gate_file") == UNLOAD_ACKNOWLEDGED:not-requested:not-requested ]]
+retained_again=$(gate retain-release "$operation" "$plugin" shell-one 1)
+[[ $(jq -r '.status + ":" + .state' <<<"$retained_again") == release-retained:UNLOAD_ACKNOWLEDGED ]]
+printf 'ok - interrupted release returns durably and idempotently to a blocking rescan state\n'
+
 chmod 0644 "$gate_file"
 invalid_inventory=$(gate inventory)
 [[ $(jq -r '.status + ":" + (.gates[0].valid|tostring)' <<<"$invalid_inventory") == ok:false ]]

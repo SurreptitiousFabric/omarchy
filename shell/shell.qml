@@ -167,6 +167,7 @@ ShellRoot {
     pluginEligibility.rescanCallback = function(operationId, pluginId) {
       return shell.pluginRegistry.rescan({ operationId: operationId, pluginId: pluginId, gated: true })
     }
+    pluginEligibility.registryGenerationProvider = function() { return shell.pluginRegistry.registryGeneration }
     shell.pluginEligibility.initialize()
     // PluginRegistry.ensureUserDir() runs in its own Component.onCompleted and
     // chains rescan() once the directory exists. We also kick a scan here in
