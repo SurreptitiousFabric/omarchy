@@ -535,6 +535,7 @@ static void print_identity(const char *root_path) {
   close(hash);
   if (received != (ssize_t)sizeof(digest))
     fail_io("read sha256", "AF_ALG");
+  test_hook("after-identity");
   fputs("omarchy-runtime-tree-sha256-v1:", stdout);
   for (size_t index = 0; index < sizeof(digest); index++)
     printf("%02x", digest[index]);
@@ -560,8 +561,10 @@ static void copy_snapshot(const char *source_path, const char *parent_path,
       open(parent_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (parent < 0)
     fail_io("open destination parent", parent_path);
+  test_hook("before-import-temporary-create");
   if (mkdirat(parent, name, 0700) < 0)
     fail_io("create destination root", name);
+  test_hook("after-import-temporary-create");
   int destination =
       openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (destination < 0)
@@ -577,6 +580,34 @@ static void copy_snapshot(const char *source_path, const char *parent_path,
   if (sync_fd(parent, "destination-parent") < 0)
     fail_io("sync destination parent", parent_path);
   close(parent);
+}
+
+static void prepare_import(const char *source_path, const char *store_path,
+                           const char *temporary) {
+  if (!simple_name(temporary))
+    reject_tree("invalid-destination-name", temporary);
+  int store =
+      open(store_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (store < 0)
+    fail_io("open candidate store", store_path);
+  test_hook("before-import-directory-create");
+  if (mkdirat(store, temporary, 0700) < 0)
+    fail_io("create import directory", temporary);
+  test_hook("after-import-directory-create");
+  if (sync_fd(store, "import-directory-parent") < 0)
+    fail_io("sync import directory parent", store_path);
+  close(store);
+  size_t required = strlen(store_path) + 1 + strlen(temporary) + 1;
+  char *operation_path = malloc(required);
+  if (!operation_path)
+    fail_io("allocate import path", temporary);
+  int length = snprintf(operation_path, required, "%s/%s", store_path,
+                        temporary);
+  if (length < 0 || (size_t)length >= required)
+    reject_tree("path-limit", temporary);
+  copy_snapshot(source_path, operation_path, "candidate");
+  test_hook("after-import-copy");
+  free(operation_path);
 }
 
 static void publish_snapshot(const char *parent_path, const char *temporary,
@@ -630,8 +661,13 @@ static void publish_snapshot(const char *parent_path, const char *temporary,
 }
 
 static void ensure_private_directory_at(int parent, const char *name) {
-  if (mkdirat(parent, name, 0700) < 0 && errno != EEXIST)
-    fail_io("create state directory", name);
+  bool created = false;
+  if (mkdirat(parent, name, 0700) < 0) {
+    if (errno != EEXIST)
+      fail_io("create state directory", name);
+  } else {
+    created = true;
+  }
   int directory =
       openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (directory < 0)
@@ -643,12 +679,19 @@ static void ensure_private_directory_at(int parent, const char *name) {
     reject_tree("invalid-state-directory", name);
   if (fchmod(directory, 0700) < 0)
     fail_io("set state directory mode", name);
+  if (created && sync_fd(parent, "state-directory-parent") < 0)
+    fail_io("sync state directory parent", name);
   close(directory);
 }
 
 static int open_private_state_root(const char *path) {
-  if (mkdir(path, 0700) < 0 && errno != EEXIST)
-    fail_io("create state root", path);
+  bool created = false;
+  if (mkdir(path, 0700) < 0) {
+    if (errno != EEXIST)
+      fail_io("create state root", path);
+  } else {
+    created = true;
+  }
   int root = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (root < 0)
     fail_io("open state root", path);
@@ -659,6 +702,28 @@ static int open_private_state_root(const char *path) {
     reject_tree("invalid-state-root", path);
   if (fchmod(root, 0700) < 0)
     fail_io("set state root mode", path);
+  if (created) {
+    char *copy = strdup(path);
+    if (!copy)
+      fail_io("copy state root path", path);
+    char *slash = strrchr(copy, '/');
+    const char *parent_path = ".";
+    if (slash) {
+      if (slash == copy)
+        slash[1] = '\0';
+      else
+        *slash = '\0';
+      parent_path = copy;
+    }
+    int parent =
+        open(parent_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (parent < 0)
+      fail_io("open state-root parent", parent_path);
+    if (sync_fd(parent, "state-root-parent") < 0)
+      fail_io("sync state-root parent", parent_path);
+    close(parent);
+    free(copy);
+  }
   ensure_private_directory_at(root, "journals");
   ensure_private_directory_at(root, "locks");
   int locks = openat(root, "locks",
@@ -689,8 +754,25 @@ static void copy_bounded_file(int source, int destination, const char *path) {
     reject_tree("empty-journal", path);
 }
 
+static void transition_hook(const char *point, const char *transition) {
+  char name[192];
+  int length = snprintf(name, sizeof(name), "%s:%s", point, transition);
+  if (length < 0 || (size_t)length >= sizeof(name))
+    reject_tree("transition-name-limit", transition);
+  test_hook(name);
+}
+
+static int transition_sync_fd(int fd, const char *point,
+                              const char *transition) {
+  char name[192];
+  int length = snprintf(name, sizeof(name), "%s:%s", point, transition);
+  if (length < 0 || (size_t)length >= sizeof(name))
+    reject_tree("transition-name-limit", transition);
+  return sync_fd(fd, name);
+}
+
 static void replace_journal(const char *state_path, const char *operation_id,
-                            const char *input_path) {
+                            const char *input_path, const char *transition) {
   if (!simple_name(operation_id))
     reject_tree("invalid-operation-id", operation_id);
   int state = open_private_state_root(state_path);
@@ -726,19 +808,19 @@ static void replace_journal(const char *state_path, const char *operation_id,
     fail_io("create temporary journal", temporary_name);
   if (fchmod(temporary, 0600) < 0)
     fail_io("set journal mode", temporary_name);
-  test_hook("before-journal-write");
+  transition_hook("before-journal-write", transition);
   copy_bounded_file(input, temporary, input_path);
   close(input);
-  test_hook("after-journal-write");
-  if (sync_fd(temporary, "journal-file") < 0)
+  transition_hook("after-journal-write", transition);
+  if (transition_sync_fd(temporary, "journal-file", transition) < 0)
     fail_io("sync journal file", temporary_name);
-  test_hook("after-journal-file-sync");
+  transition_hook("after-journal-file-sync", transition);
   close(temporary);
   if (renameat(journals, temporary_name, journals, final_name) < 0)
     fail_io("replace journal", final_name);
-  test_hook("after-journal-rename");
-  if (sync_fd(journals, "journal-parent") < 0)
-    fail_io("sync journal parent", state_path);
+  transition_hook("after-journal-rename", transition);
+  if (transition_sync_fd(journals, "journal-parent", transition) < 0)
+    reject_tree("journal-indeterminate", transition);
   close(journals);
   close(state);
 }
@@ -785,8 +867,28 @@ static void sync_directory_path(const char *path, const char *point) {
   close(directory);
 }
 
-static void quarantine_journal(const char *state_path, const char *operation_id,
-                               const char *digest) {
+static bool equal_file_bytes(int left, int right) {
+  unsigned char left_buffer[4096];
+  unsigned char right_buffer[4096];
+  for (;;) {
+    ssize_t left_count = read(left, left_buffer, sizeof(left_buffer));
+    if (left_count < 0)
+      fail_io("read corrupt journal", "authoritative");
+    ssize_t right_count = read(right, right_buffer, sizeof(right_buffer));
+    if (right_count < 0)
+      fail_io("read corrupt evidence", "evidence");
+    if (left_count != right_count)
+      return false;
+    if (left_count == 0)
+      return true;
+    if (memcmp(left_buffer, right_buffer, (size_t)left_count) != 0)
+      return false;
+  }
+}
+
+static void preserve_corrupt_journal(const char *state_path,
+                                     const char *operation_id,
+                                     const char *digest) {
   if (!simple_name(operation_id) || strlen(digest) != 64)
     reject_tree("invalid-quarantine-name", operation_id);
   for (size_t index = 0; index < 64; index++)
@@ -800,18 +902,105 @@ static void quarantine_journal(const char *state_path, const char *operation_id,
     fail_io("open journals", state_path);
   char current[160];
   char evidence[240];
+  char evidence_temporary[256];
   int current_length =
       snprintf(current, sizeof(current), "%s.journal", operation_id);
   int evidence_length = snprintf(evidence, sizeof(evidence), "%s.corrupt.%s",
                                  operation_id, digest);
+  int temporary_length =
+      snprintf(evidence_temporary, sizeof(evidence_temporary),
+               ".%s.corrupt.tmp.%ld", operation_id, (long)getpid());
   if (current_length < 0 || (size_t)current_length >= sizeof(current) ||
-      evidence_length < 0 || (size_t)evidence_length >= sizeof(evidence))
+      evidence_length < 0 || (size_t)evidence_length >= sizeof(evidence) ||
+      temporary_length < 0 ||
+      (size_t)temporary_length >= sizeof(evidence_temporary))
     reject_tree("journal-name-limit", operation_id);
-  if (syscall(SYS_renameat2, journals, current, journals, evidence,
-              RENAME_NOREPLACE) < 0)
-    fail_io("preserve corrupt journal", current);
+  int authoritative =
+      openat(journals, current, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (authoritative < 0)
+    fail_io("open corrupt journal", current);
+  struct stat authoritative_status;
+  if (fstat(authoritative, &authoritative_status) < 0)
+    fail_io("stat corrupt journal", current);
+  if (!S_ISREG(authoritative_status.st_mode) ||
+      authoritative_status.st_nlink != 1)
+    reject_tree("invalid-corrupt-journal", current);
+  int existing =
+      openat(journals, evidence, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (existing >= 0) {
+    if (!equal_file_bytes(authoritative, existing))
+      reject_tree("corrupt-evidence-conflict", evidence);
+    if (sync_fd(existing, "corrupt-evidence-existing-file") < 0)
+      fail_io("sync existing corrupt evidence", evidence);
+    if (sync_fd(journals, "journal-quarantine-parent") < 0)
+      fail_io("sync existing corrupt evidence parent", state_path);
+    close(existing);
+    close(authoritative);
+    close(journals);
+    close(state);
+    return;
+  }
+  if (errno != ENOENT)
+    fail_io("open corrupt evidence", evidence);
+  int evidence_fd =
+      openat(journals, evidence_temporary,
+             O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (evidence_fd < 0)
+    fail_io("create corrupt evidence", evidence_temporary);
+  transition_hook("after-corrupt-evidence-create", "corruption-manual-attention");
+  copy_bounded_file(authoritative, evidence_fd, current);
+  if (sync_fd(evidence_fd, "corrupt-evidence-file") < 0)
+    fail_io("sync corrupt evidence", evidence);
+  transition_hook("after-corrupt-evidence-sync", "corruption-manual-attention");
+  close(evidence_fd);
+  if (syscall(SYS_renameat2, journals, evidence_temporary, journals, evidence,
+              RENAME_NOREPLACE) < 0) {
+    if (errno != EEXIST)
+      fail_io("publish corrupt evidence", evidence);
+    int competing =
+        openat(journals, evidence, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (competing < 0)
+      fail_io("open competing corrupt evidence", evidence);
+    if (lseek(authoritative, 0, SEEK_SET) < 0)
+      fail_io("rewind corrupt journal", current);
+    if (!equal_file_bytes(authoritative, competing))
+      reject_tree("corrupt-evidence-conflict", evidence);
+    close(competing);
+  }
+  close(authoritative);
   if (sync_fd(journals, "journal-quarantine-parent") < 0)
     fail_io("sync corrupt journal evidence", state_path);
+  close(journals);
+  close(state);
+}
+
+static void sync_journal_authority(const char *state_path,
+                                   const char *operation_id) {
+  if (!simple_name(operation_id))
+    reject_tree("invalid-operation-id", operation_id);
+  int state = open_private_state_root(state_path);
+  int journals = openat(state, "journals",
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (journals < 0)
+    fail_io("open journals", state_path);
+  if (sync_fd(journals, "journal-reconciliation-parent") < 0)
+    fail_io("sync journal authority", state_path);
+  char name[160];
+  int length = snprintf(name, sizeof(name), "%s.journal", operation_id);
+  if (length < 0 || (size_t)length >= sizeof(name))
+    reject_tree("journal-name-limit", operation_id);
+  int journal = openat(journals, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (journal >= 0) {
+    struct stat status;
+    if (fstat(journal, &status) < 0)
+      fail_io("stat authoritative journal", name);
+    if (!S_ISREG(status.st_mode) || status.st_nlink != 1 ||
+        (status.st_mode & 0777) != 0600)
+      reject_tree("invalid-authoritative-journal", name);
+    close(journal);
+  } else if (errno != ENOENT) {
+    fail_io("open authoritative journal", name);
+  }
   close(journals);
   close(state);
 }
@@ -852,6 +1041,66 @@ static void hold_plugin_lock(const char *state_path, const char *lock_name) {
   close(state);
 }
 
+static int open_lock_file(int directory, const char *name,
+                          const char *description) {
+  if (!simple_name(name))
+    reject_tree("invalid-lock-name", name);
+  int lock = openat(directory, name,
+                    O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (lock < 0)
+    fail_io(description, name);
+  if (fchmod(lock, 0600) < 0)
+    fail_io("set lock mode", name);
+  return lock;
+}
+
+/* O-5's proof seam for the universal operation-before-plugin lock order. */
+static void hold_ordered_locks(const char *state_path,
+                               const char *operation_id,
+                               const char *plugin_lock_name) {
+  int state = open_private_state_root(state_path);
+  int locks = openat(state, "locks",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (locks < 0)
+    fail_io("open lock directory", state_path);
+  int operations = openat(locks, "operations",
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  int plugins = openat(locks, "plugins",
+                       O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (operations < 0 || plugins < 0)
+    fail_io("open ordered lock directories", state_path);
+  char operation_name[160];
+  int length = snprintf(operation_name, sizeof(operation_name), "%s.lock",
+                        operation_id);
+  if (length < 0 || (size_t)length >= sizeof(operation_name))
+    reject_tree("operation-lock-name-limit", operation_id);
+  int operation = open_lock_file(operations, operation_name,
+                                 "open operation lock");
+  if (flock(operation, LOCK_EX) < 0)
+    fail_io("acquire operation lock", operation_name);
+  test_hook("after-ordered-operation-lock");
+  int plugin = open_lock_file(plugins, plugin_lock_name,
+                              "open plugin lifecycle lock");
+  if (flock(plugin, LOCK_EX | LOCK_NB) < 0) {
+    if (errno == EWOULDBLOCK) {
+      fputs("plugin-busy\n", stderr);
+      exit(3);
+    }
+    fail_io("acquire plugin lifecycle lock", plugin_lock_name);
+  }
+  fputs("locked-operation-then-plugin\n", stdout);
+  fflush(stdout);
+  unsigned char buffer[256];
+  while (read(STDIN_FILENO, buffer, sizeof(buffer)) > 0) {
+  }
+  close(plugin);
+  close(operation);
+  close(plugins);
+  close(operations);
+  close(locks);
+  close(state);
+}
+
 static int constant_time_hash_equal(const char *expected) {
   if (strlen(expected) != 64)
     return 1;
@@ -888,12 +1137,16 @@ int main(int argc, char **argv) {
     copy_snapshot(argv[2], argv[3], argv[4]);
     return 0;
   }
+  if (argc == 5 && strcmp(argv[1], "prepare-import") == 0) {
+    prepare_import(argv[2], argv[3], argv[4]);
+    return 0;
+  }
   if (argc == 5 && strcmp(argv[1], "publish") == 0) {
     publish_snapshot(argv[2], argv[3], argv[4]);
     return 0;
   }
-  if (argc == 5 && strcmp(argv[1], "journal-replace") == 0) {
-    replace_journal(argv[2], argv[3], argv[4]);
+  if (argc == 6 && strcmp(argv[1], "journal-replace") == 0) {
+    replace_journal(argv[2], argv[3], argv[4], argv[5]);
     return 0;
   }
   if (argc == 3 && strcmp(argv[1], "domain-hash") == 0) {
@@ -904,23 +1157,31 @@ int main(int argc, char **argv) {
     sync_directory_path(argv[2], argv[3]);
     return 0;
   }
-  if (argc == 5 && strcmp(argv[1], "journal-quarantine") == 0) {
-    quarantine_journal(argv[2], argv[3], argv[4]);
+  if (argc == 5 && strcmp(argv[1], "journal-preserve") == 0) {
+    preserve_corrupt_journal(argv[2], argv[3], argv[4]);
+    return 0;
+  }
+  if (argc == 4 && strcmp(argv[1], "journal-sync") == 0) {
+    sync_journal_authority(argv[2], argv[3]);
     return 0;
   }
   if (argc == 4 && strcmp(argv[1], "plugin-lock") == 0) {
     hold_plugin_lock(argv[2], argv[3]);
     return 0;
   }
+  if (argc == 5 && strcmp(argv[1], "ordered-lock") == 0) {
+    hold_ordered_locks(argv[2], argv[3], argv[4]);
+    return 0;
+  }
   if (argc == 3 && strcmp(argv[1], "hash-equal") == 0)
     return constant_time_hash_equal(argv[2]);
   fprintf(stderr,
-          "usage: %s identity ROOT | copy SOURCE PARENT NAME | "
+          "usage: %s identity ROOT | copy SOURCE PARENT NAME | prepare-import SOURCE STORE TEMPORARY | "
           "publish PARENT TEMPORARY COMPLETED | "
-          "state-init STATE | journal-replace STATE OPERATION INPUT | "
+          "state-init STATE | journal-replace STATE OPERATION INPUT TRANSITION | "
           "domain-hash DOMAIN | sync-directory PATH POINT | "
-          "journal-quarantine STATE OPERATION DIGEST | "
-          "plugin-lock STATE LOCK-NAME | hash-equal EXPECTED\n",
+          "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "
+          "plugin-lock STATE LOCK-NAME | ordered-lock STATE OPERATION LOCK-NAME | hash-equal EXPECTED\n",
           argv[0]);
   return 64;
 }
