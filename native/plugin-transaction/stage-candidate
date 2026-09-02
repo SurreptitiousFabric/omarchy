@@ -1,20 +1,29 @@
 #!/bin/bash
 set -euo pipefail
 
-fail() { printf 'omarchy-plugin-candidate-stage: %s: %s\n' "$1" "$2" >&2; exit 2; }
+fail() {
+  printf 'omarchy-plugin-candidate-stage: %s: %s\n' "$1" "$2" >&2
+  exit 2
+}
+
 [[ $# == 3 ]] || fail usage 'expected OPERATION_ID PLUGIN_ID SOURCE'
-operation_id=$1 requested_plugin_id=$2 source_path=$3
+operation_id=$1
+requested_plugin_id=$2
+source_path=$3
 [[ $operation_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || fail invalid-operation-id "$operation_id"
 
 helper=${OMARCHY_PLUGIN_TREE_HELPER:-/usr/lib/omarchy/plugin-tree}
 validator=${OMARCHY_PLUGIN_VALIDATOR:-omarchy-plugin-validate}
+journal_validator=${OMARCHY_PLUGIN_JOURNAL_VALIDATOR:-${OMARCHY_PATH:?missing OMARCHY_PATH}/native/plugin-transaction/validate-journal.jq}
 store=${OMARCHY_PLUGIN_CANDIDATE_STORE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugin-candidates-v1}
 state_root=${OMARCHY_PLUGIN_TRANSACTION_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugin-transactions-v1}
 discovery_dir=${OMARCHY_PLUGIN_DISCOVERY_DIR:-$HOME/.config/omarchy/plugins}
 [[ -x $helper ]] || fail unavailable-helper "$helper"
+[[ -f $journal_validator ]] || fail unavailable-journal-validator "$journal_validator"
 command -v "$validator" >/dev/null 2>&1 || fail unavailable-validator "$validator"
 
 operation_kind=${OMARCHY_PLUGIN_OPERATION_KIND:?missing operation kind}
+source_kind=${OMARCHY_PLUGIN_SOURCE_KIND:-directory}
 caller_candidate=${OMARCHY_PLUGIN_CALLER_CANDIDATE_IDENTITY:?missing caller candidate identity}
 expected_active_state=${OMARCHY_PLUGIN_EXPECTED_ACTIVE_STATE:?missing expected active state}
 expected_active_identity=${OMARCHY_PLUGIN_EXPECTED_ACTIVE_IDENTITY:-}
@@ -28,21 +37,13 @@ observation_raw=${OMARCHY_PLUGIN_STAGE_OBSERVATION_RAW_SHA256:?missing raw obser
 observation_projection=${OMARCHY_PLUGIN_STAGE_OBSERVATION_REFERENCE_PROJECTION:?missing observed projection}
 observation_reference_state=${OMARCHY_PLUGIN_STAGE_OBSERVATION_REFERENCE_STATE:?missing observed reference state}
 destination=${OMARCHY_PLUGIN_DESTINATION:?missing destination}
-[[ $operation_kind == install || $operation_kind == update ]] || fail invalid-operation-kind "$operation_kind"
-[[ $expected_active_state == absent || $expected_active_state == present ]] || fail invalid-active-state "$expected_active_state"
-[[ $expected_reference_state == referenced || $expected_reference_state == unreferenced ]] || fail invalid-reference-state "$expected_reference_state"
-[[ $reference_policy == require-unreferenced || $reference_policy == preserve-observed ]] || fail invalid-reference-policy "$reference_policy"
-if [[ $operation_kind == install ]]; then
-  [[ $expected_active_state == absent && -z $expected_active_identity && $reference_policy == require-unreferenced ]] || fail invalid-install-precondition "$operation_id"
-else
-  [[ $expected_active_state == present && -n $expected_active_identity ]] || fail invalid-update-precondition "$operation_id"
-fi
 
 operation_token=
 IFS= read -r operation_token || [[ -n $operation_token ]] || fail invalid-operation-token empty
 [[ $operation_token =~ ^[A-Za-z0-9_-]{43,}$ ]] || fail invalid-operation-token encoding
 padding=$(( (4 - ${#operation_token} % 4) % 4 ))
-padded_token=${operation_token//-/+}; padded_token=${padded_token//_/\/}
+padded_token=${operation_token//-/+}
+padded_token=${padded_token//_/\/}
 padded_token+=$(printf '%*s' "$padding" '' | tr ' ' '=')
 decoded_length=$(printf '%s' "$padded_token" | base64 -d 2>/dev/null | wc -c) || fail invalid-operation-token encoding
 (( decoded_length >= 32 )) || fail invalid-operation-token length
@@ -50,14 +51,16 @@ capability_hash=$(printf '%s' "$operation_token" | "$helper" domain-hash omarchy
 unset operation_token padded_token
 
 umask 077
-source_normalized=$(realpath -e -- "$source_path") || fail invalid-source "$source_path"
-[[ -d $source_normalized && ! -L $source_path ]] || fail invalid-source "$source_path"
+source_normalized=$(realpath -m -- "$source_path") || fail invalid-source "$source_path"
+destination=$(realpath -m -- "$destination") || fail invalid-destination "$destination"
 store_intended=$(realpath -m -- "$store") || fail invalid-store "$store"
 state_intended=$(realpath -m -- "$state_root") || fail invalid-state-root "$state_root"
 discovery_real=$(realpath -m -- "$discovery_dir") || fail invalid-discovery-directory "$discovery_dir"
 case "$store_intended/" in "$discovery_real/"*) fail store-inside-discovery "$store" ;; esac
 case "$state_intended/" in "$discovery_real/"*) fail state-inside-discovery "$state_root" ;; esac
-mkdir -p -- "$store"; [[ -d $store && ! -L $store ]] || fail invalid-store "$store"; chmod 0700 -- "$store"
+mkdir -p -- "$store"
+[[ -d $store && ! -L $store ]] || fail invalid-store "$store"
+chmod 0700 -- "$store"
 store_real=$(realpath -e -- "$store") || fail invalid-store "$store"
 case "$store_real/" in "$discovery_real/"*) fail store-inside-discovery "$store" ;; esac
 "$helper" state-init "$state_root"
@@ -69,76 +72,106 @@ chmod 0600 "$state_root/locks/operations/$operation_id.lock"
 flock "$operation_lock_fd"
 
 journal="$state_root/journals/$operation_id.journal"
-request_file=$(mktemp) journal_input=$(mktemp) temporary=
-cleanup() { rm -f -- "$request_file" "$journal_input"; if [[ -n ${temporary:-} && -d $temporary && ! -L $temporary ]]; then find "$temporary" -depth -delete; fi; }
+request_file=$(mktemp)
+journal_input=$(mktemp)
+cleanup() {
+  rm -f -- "$request_file" "$journal_input"
+}
 trap cleanup EXIT
+temporary_name=.import.$operation_id
+completed_slot=$operation_id
 
 jq -cnS --arg operationId "$operation_id" --arg pluginId "$requested_plugin_id" --arg operation "$operation_kind" \
-  --arg sourcePath "$source_normalized" --arg callerCandidate "$caller_candidate" --arg activeState "$expected_active_state" \
+  --arg sourceKind "$source_kind" --arg sourcePath "$source_normalized" --arg callerCandidate "$caller_candidate" --arg activeState "$expected_active_state" \
   --arg activeIdentity "$expected_active_identity" --arg configKind "$expected_config_source_kind" --arg configIdentity "$expected_config_source_identity" \
   --arg projection "$expected_projection" --arg referenceState "$expected_reference_state" --arg policy "$reference_policy" \
   --arg observationSource "$observation_source" --arg observationRaw "$observation_raw" --arg observationProjection "$observation_projection" \
   --arg observationReferenceState "$observation_reference_state" --arg destination "$destination" \
   '{protocol:"legacy-schema-v1-transaction/v1",operationId:$operationId,pluginId:$pluginId,operation:$operation,
-    source:{kind:"directory",path:$sourcePath},callerCandidateIdentity:$callerCandidate,
+    source:{kind:$sourceKind,path:$sourcePath},callerCandidateIdentity:$callerCandidate,
     expectedActive:{state:$activeState,identity:$activeIdentity},
     expectedConfiguration:{source:{kind:$configKind,identity:$configIdentity},referenceProjection:$projection,referenceState:$referenceState,referencePolicy:$policy},
     stageObservation:{provenance:$observationSource,rawSha256:$observationRaw,referenceProjection:$observationProjection,referenceState:$observationReferenceState},destination:$destination}' >"$request_file"
 request_digest=$("$helper" domain-hash omarchy-plugin-transaction-request/v1 <"$request_file")
 
-write_journal() {
-  local state=$1 reason=$2 candidate_identity=$3 temporary_slot=$4 completed_slot=$5 publication=$6 corrupt_digest=${7:-}
+write_normal_journal() {
+  local state=$1 reason=$2 candidate_identity=$3 publication=$4 transition=$5
   jq -cnS --slurpfile request "$request_file" --arg operationId "$operation_id" --arg pluginId "$requested_plugin_id" \
     --arg requestDigest "$request_digest" --arg capabilityHash "$capability_hash" --arg candidateIdentity "$candidate_identity" \
-    --arg temporarySlot "$temporary_slot" --arg completedSlot "$completed_slot" --arg publication "$publication" --arg state "$state" --arg reason "$reason" --arg corruptDigest "$corrupt_digest" \
+    --arg temporarySlot "$temporary_name" --arg completedSlot "$completed_slot" --arg publication "$publication" --arg state "$state" --arg reason "$reason" \
     '{schema:"omarchy-plugin-transaction-journal/v1",operationId:$operationId,pluginId:$pluginId,
       normalizedRequest:{digest:$requestDigest,facts:$request[0]},capabilityHash:$capabilityHash,
-      candidate:{expected:$request[0].callerCandidateIdentity,observed:$candidateIdentity,temporarySlot:$temporarySlot,completedSlot:$completedSlot},
+      candidate:{expected:$request[0].callerCandidateIdentity,observed:(if $candidateIdentity=="" then null else $candidateIdentity end),temporarySlot:$temporarySlot,completedSlot:$completedSlot},
       publication:{state:$publication},gate:"not-established",registry:"not-requested",rollback:"not-applicable",
-      retainedPrior:{state:"not-captured",identity:null},state:$state,reason:(if $reason=="" then null else $reason end),
-      corruptEvidenceSha256:(if $corruptDigest=="" then null else $corruptDigest end)}' >"$journal_input"
-  "$helper" journal-replace "$state_root" "$operation_id" "$journal_input"
+      retainedPrior:{state:"not-captured",identity:null},state:$state,reason:(if $reason=="" then null else $reason end),corruptEvidenceSha256:null}' >"$journal_input"
+  [[ $(jq -er --arg operation_id "$operation_id" -f "$journal_validator" "$journal_input") == true ]] || fail invalid-generated-journal "$transition"
+  if ! journal_error=$("$helper" journal-replace "$state_root" "$operation_id" "$journal_input" "$transition" 2>&1); then
+    if grep -qF 'omarchy-plugin-tree: journal-indeterminate:' <<<"$journal_error"; then
+      fail journal-indeterminate "$transition"
+    fi
+    printf '%s\n' "$journal_error" >&2
+    fail journal-io "$transition"
+  fi
 }
 
-verify_journal() {
-  local canonical
-  canonical=$(jq -ceS --arg operationId "$operation_id" '
-    select(keys == ["candidate","capabilityHash","corruptEvidenceSha256","gate","normalizedRequest","operationId","pluginId","publication","reason","registry","retainedPrior","rollback","schema","state"])
-    | select(.schema=="omarchy-plugin-transaction-journal/v1")
-    | select(.operationId==$operationId and (.pluginId|type)=="string")
-    | select((.normalizedRequest|keys)==["digest","facts"] and (.normalizedRequest.digest|test("^[0-9a-f]{64}$")))
-    | select((.normalizedRequest.facts|keys)==["callerCandidateIdentity","destination","expectedActive","expectedConfiguration","operation","operationId","pluginId","protocol","source","stageObservation"])
-    | select(.normalizedRequest.facts.operationId==$operationId and .normalizedRequest.facts.pluginId==.pluginId)
-    | select((.normalizedRequest.facts.source|keys)==["kind","path"] and (.normalizedRequest.facts.expectedActive|keys)==["identity","state"])
-    | select((.normalizedRequest.facts.expectedConfiguration|keys)==["referencePolicy","referenceProjection","referenceState","source"])
-    | select((.normalizedRequest.facts.expectedConfiguration.source|keys)==["identity","kind"])
-    | select((.normalizedRequest.facts.stageObservation|keys)==["provenance","rawSha256","referenceProjection","referenceState"])
-    | select((.capabilityHash|test("^[0-9a-f]{64}$")))
-    | select((.candidate|keys)==["completedSlot","expected","observed","temporarySlot"] and (.publication|keys)==["state"])
-    | select(.candidate.expected==.normalizedRequest.facts.callerCandidateIdentity)
-    | select((.candidate.observed|type)=="string" and (.candidate.temporarySlot|type)=="string" and (.candidate.completedSlot|type)=="string")
-    | select(.gate=="not-established" and .registry=="not-requested" and .rollback=="not-applicable")
-    | select(.retainedPrior=={"identity":null,"state":"not-captured"})
-    | select((.corruptEvidenceSha256==null) or (.corruptEvidenceSha256|type)=="string")
-    | select(.state=="REQUEST_BOUND" or .state=="PUBLICATION_INTENT" or .state=="STAGED" or .state=="RECOVERY_REQUIRED" or .state=="MANUAL_ATTENTION")' "$journal") || return 1
-  cmp -s -- "$journal" <(printf '%s\n' "$canonical")
+write_corruption_tombstone() {
+  local reason=$1 corrupt_digest=$2
+  jq -cnS --arg operationId "$operation_id" --arg reason "$reason" --arg corruptDigest "$corrupt_digest" \
+    '{schema:"omarchy-plugin-transaction-journal/v1",operationId:$operationId,pluginId:null,normalizedRequest:null,capabilityHash:null,
+      candidate:{expected:null,observed:null,temporarySlot:null,completedSlot:null},publication:{state:"corrupt-unavailable"},
+      gate:"not-established",registry:"not-requested",rollback:"not-applicable",retainedPrior:{state:"not-captured",identity:null},
+      state:"MANUAL_ATTENTION",reason:$reason,corruptEvidenceSha256:$corruptDigest}' >"$journal_input"
+  [[ $(jq -er --arg operation_id "$operation_id" -f "$journal_validator" "$journal_input") == true ]] || fail invalid-generated-journal corruption-manual-attention
+  if ! journal_error=$("$helper" journal-replace "$state_root" "$operation_id" "$journal_input" corruption-manual-attention 2>&1); then
+    if grep -qF 'omarchy-plugin-tree: journal-indeterminate:' <<<"$journal_error"; then
+      fail journal-indeterminate corruption-manual-attention
+    fi
+    printf '%s\n' "$journal_error" >&2
+    fail journal-io corruption-manual-attention
+  fi
+}
+
+validate_journal() {
+  local size canonical
+  [[ -f $journal && ! -L $journal ]] || return 1
+  [[ $(stat -c %h "$journal") == 1 && $(stat -c %a "$journal") == 600 ]] || return 1
+  size=$(stat -c %s "$journal") || return 1
+  (( size > 0 && size <= 1048576 )) || return 1
+  canonical=$(jq -ceS --arg operation_id "$operation_id" -f "$journal_validator" "$journal") || return 1
+  [[ $canonical == true ]] || return 1
+  cmp -s -- "$journal" <(jq -cS . "$journal")
 }
 
 mark_corrupt() {
   local reason=$1 corrupt_digest
+  [[ -f $journal && ! -L $journal && $(stat -c %h "$journal") == 1 ]] || fail manual-attention "$operation_id"
   corrupt_digest=$(sha256sum "$journal" | cut -d' ' -f1)
-  "$helper" journal-quarantine "$state_root" "$operation_id" "$corrupt_digest" || fail journal-io "$operation_id"
-  write_journal MANUAL_ATTENTION "$reason" '' '' "$operation_id" contradictory "$corrupt_digest"
+  "$helper" journal-preserve "$state_root" "$operation_id" "$corrupt_digest" || fail journal-evidence-io "$operation_id"
+  write_corruption_tombstone "$reason" "$corrupt_digest"
   fail manual-attention "$operation_id"
 }
 
-result_from_journal() { jq -cS '{schema:"omarchy-plugin-candidate-stage/v1",operationId,pluginId,state,candidateTree:.candidate.observed,sourceTree:.candidate.observed,normalizedRequestDigest:.normalizedRequest.digest}' "$journal"; }
+result_from_journal() {
+  jq -cS '{schema:"omarchy-plugin-candidate-stage/v1",operationId,pluginId,state,candidateTree:.candidate.observed,sourceTree:.candidate.observed,normalizedRequestDigest:.normalizedRequest.digest}' "$journal"
+}
 
-resume_request_bound=false
+remove_incomplete_import() {
+  local path=$store/$temporary_name
+  if [[ -e $path || -L $path ]]; then
+    [[ -d $path && ! -L $path ]] || mark_corrupt invalid-temporary
+    find "$path" -depth -delete
+    "$helper" sync-directory "$store" incomplete-import-removal-parent
+  fi
+}
+
+journal_exists=false
 if [[ -e $journal || -L $journal ]]; then
-  if [[ ! -f $journal || -L $journal ]] || ! verify_journal; then
-    [[ -f $journal && ! -L $journal ]] || fail manual-attention "$operation_id"
-    mark_corrupt corrupt-journal
+  journal_exists=true
+  "$helper" journal-sync "$state_root" "$operation_id" || fail manual-attention "$operation_id"
+  [[ -e $journal || -L $journal ]] || fail journal-indeterminate "$operation_id"
+  validate_journal || mark_corrupt corrupt-journal
+  if [[ $(jq -r .state "$journal") == MANUAL_ATTENTION && $(jq -r .corruptEvidenceSha256 "$journal") != null ]]; then
+    fail manual-attention "$operation_id"
   fi
   jq -cS .normalizedRequest.facts "$journal" >"$journal_input"
   recorded_request_digest=$("$helper" domain-hash omarchy-plugin-transaction-request/v1 <"$journal_input")
@@ -146,101 +179,120 @@ if [[ -e $journal || -L $journal ]]; then
   stored_capability=$(jq -r .capabilityHash "$journal")
   printf '%s' "$capability_hash" | "$helper" hash-equal "$stored_capability" || fail invalid-operation-token "$operation_id"
   [[ $(jq -r .normalizedRequest.digest "$journal") == "$request_digest" ]] || fail operation-conflict "$operation_id"
-  stored_state=$(jq -r .state "$journal")
-  if [[ $stored_state == STAGED ]]; then
-    completed_slot=$(jq -r .candidate.completedSlot "$journal"); stored_identity=$(jq -r .candidate.observed "$journal")
-    if [[ $completed_slot != "$operation_id" || ! -d $store/$completed_slot || -L $store/$completed_slot ]]; then
-      write_journal MANUAL_ATTENTION missing-or-invalid-completed "$stored_identity" '' "$completed_slot" contradictory
-      fail manual-attention "$operation_id"
-    fi
-    if [[ $("$helper" identity "$store/$completed_slot/candidate") != "$stored_identity" ]]; then
-      write_journal MANUAL_ATTENTION candidate-identity-mismatch "$stored_identity" '' "$completed_slot" contradictory
-      fail manual-attention "$operation_id"
-    fi
-    result_from_journal; exit 0
-  fi
-  if [[ $stored_state == MANUAL_ATTENTION ]]; then fail manual-attention "$operation_id"; fi
-  if [[ $stored_state == REQUEST_BOUND ]]; then
-    resume_request_bound=true
+fi
+
+if ! $journal_exists; then
+  [[ $operation_kind == install || $operation_kind == update ]] || fail invalid-operation-kind "$operation_kind"
+  [[ $source_kind == directory ]] || fail invalid-source-kind "$source_kind"
+  [[ $expected_reference_state == referenced || $expected_reference_state == unreferenced ]] || fail invalid-reference-state "$expected_reference_state"
+  [[ $reference_policy == require-unreferenced || $reference_policy == preserve-observed ]] || fail invalid-reference-policy "$reference_policy"
+  if [[ $operation_kind == install ]]; then
+    [[ $expected_active_state == absent && -z $expected_active_identity && $reference_policy == require-unreferenced ]] || fail invalid-install-precondition "$operation_id"
   else
-    temporary_name=$(jq -r .candidate.temporarySlot "$journal")
-    completed_slot=$(jq -r .candidate.completedSlot "$journal")
-    stored_identity=$(jq -r .candidate.observed "$journal")
-    [[ $temporary_name == .import."$operation_id".* && $completed_slot == "$operation_id" && -n $stored_identity ]] || {
-      write_journal MANUAL_ATTENTION contradictory-publication "$stored_identity" "$temporary_name" "$completed_slot" contradictory
-      fail manual-attention "$operation_id"
-    }
-    temporary_path=$store/$temporary_name completed_path=$store/$completed_slot
-    temporary_present=false completed_present=false
-    if [[ -e $temporary_path || -L $temporary_path ]]; then
-      [[ -d $temporary_path && ! -L $temporary_path ]] || {
-        write_journal MANUAL_ATTENTION invalid-temporary "$stored_identity" "$temporary_name" "$completed_slot" contradictory
-        fail manual-attention "$operation_id"
-      }
-      [[ $("$helper" identity "$temporary_path/candidate") == "$stored_identity" ]] || {
-        write_journal MANUAL_ATTENTION candidate-identity-mismatch "$stored_identity" "$temporary_name" "$completed_slot" contradictory
-        fail manual-attention "$operation_id"
-      }
-      temporary_present=true
-    fi
-    if [[ -e $completed_path || -L $completed_path ]]; then
-      [[ -d $completed_path && ! -L $completed_path ]] || {
-        write_journal MANUAL_ATTENTION invalid-completed "$stored_identity" "$temporary_name" "$completed_slot" contradictory
-        fail manual-attention "$operation_id"
-      }
-      [[ $("$helper" identity "$completed_path/candidate") == "$stored_identity" ]] || {
-        write_journal MANUAL_ATTENTION candidate-identity-mismatch "$stored_identity" "$temporary_name" "$completed_slot" contradictory
-        fail manual-attention "$operation_id"
-      }
-      completed_present=true
-    fi
-    if $temporary_present && $completed_present; then
-      write_journal MANUAL_ATTENTION contradictory-publication "$stored_identity" "$temporary_name" "$completed_slot" contradictory
-      fail manual-attention "$operation_id"
-    elif $completed_present; then
-      "$helper" sync-directory "$store" reconciliation-candidate-parent || fail recovery-required "$operation_id"
-      write_journal STAGED '' "$stored_identity" "$temporary_name" "$completed_slot" completed-durable
-      result_from_journal; exit 0
-    elif $temporary_present; then
-      if ! "$helper" publish "$store" "$temporary_name" "$completed_slot"; then
-        write_journal RECOVERY_REQUIRED publication-indeterminate "$stored_identity" "$temporary_name" "$completed_slot" indeterminate
-        fail recovery-required "$operation_id"
-      fi
-      "$helper" sync-directory "$store" reconciliation-candidate-parent || fail recovery-required "$operation_id"
-      write_journal STAGED '' "$stored_identity" "$temporary_name" "$completed_slot" completed-durable
-      result_from_journal; exit 0
-    else
-      write_journal MANUAL_ATTENTION missing-candidate "$stored_identity" "$temporary_name" "$completed_slot" absent
-      fail manual-attention "$operation_id"
-    fi
+    [[ $expected_active_state == present && -n $expected_active_identity ]] || fail invalid-update-precondition "$operation_id"
   fi
+  write_normal_journal REQUEST_BOUND '' '' not-started request-bound
 fi
 
-if ! $resume_request_bound; then write_journal REQUEST_BOUND '' '' '' "$operation_id" not-started; fi
-temporary=$(mktemp -d "$store/.import.$operation_id.XXXXXX"); temporary_name=${temporary##*/}
-"$helper" copy "$source_normalized" "$temporary" candidate
-candidate=$temporary/candidate; candidate_tree=$("$helper" identity "$candidate")
-[[ $candidate_tree == "$caller_candidate" ]] || fail stale-candidate "$requested_plugin_id"
-"$validator" "$candidate" || fail validation-failed "$requested_plugin_id"
-manifest_plugin_id=$(jq -er '.id | select(type == "string")' "$candidate/manifest.json") || fail invalid-manifest-id "$requested_plugin_id"
-[[ $manifest_plugin_id == "$requested_plugin_id" ]] || fail manifest-id-mismatch "requested $requested_plugin_id, found $manifest_plugin_id"
-jq -cnS --arg operationId "$operation_id" --arg pluginId "$requested_plugin_id" --arg candidateTree "$candidate_tree" --arg requestDigest "$request_digest" \
-  '{schema:"omarchy-plugin-candidate-stage/v1",operationId:$operationId,pluginId:$pluginId,state:"STAGED",sourceTree:$candidateTree,candidateTree:$candidateTree,normalizedRequestDigest:$requestDigest}' >"$temporary/result.json"
-chmod 0600 "$temporary/result.json"
-write_journal PUBLICATION_INTENT '' "$candidate_tree" "$temporary_name" "$operation_id" intended
-
-publish_error=
-if ! publish_error=$("$helper" publish "$store" "$temporary_name" "$operation_id" 2>&1); then
-  if grep -qF 'omarchy-plugin-tree: publication-indeterminate:' <<<"$publish_error"; then
-    write_journal RECOVERY_REQUIRED publication-indeterminate "$candidate_tree" "$temporary_name" "$operation_id" indeterminate
-    temporary=; fail recovery-required "$operation_id"
-  fi
-  if grep -qF 'omarchy-plugin-tree: publication-rolled-back:' <<<"$publish_error"; then
-    write_journal PUBLICATION_INTENT publication-compensated "$candidate_tree" "$temporary_name" "$operation_id" temporary
-    temporary=
-  fi
-  sed 's/^/omarchy-plugin-candidate-stage: publish-failed: /' <<<"$publish_error" >&2; exit 2
+stored_state=$(jq -r .state "$journal")
+if [[ $stored_state == STAGED ]]; then
+  [[ -d $store/$completed_slot && ! -L $store/$completed_slot ]] || {
+    write_normal_journal MANUAL_ATTENTION missing-or-invalid-completed "$(jq -r .candidate.observed "$journal")" contradictory staged-to-manual
+    fail manual-attention "$operation_id"
+  }
+  stored_identity=$(jq -r .candidate.observed "$journal")
+  [[ $("$helper" identity "$store/$completed_slot/candidate") == "$stored_identity" ]] || {
+    write_normal_journal MANUAL_ATTENTION candidate-identity-mismatch "$stored_identity" contradictory staged-to-manual
+    fail manual-attention "$operation_id"
+  }
+  result_from_journal
+  exit 0
 fi
-temporary=
-write_journal STAGED '' "$candidate_tree" "$temporary_name" "$operation_id" completed-durable
-result_from_journal
+if [[ $stored_state == MANUAL_ATTENTION ]]; then
+  fail manual-attention "$operation_id"
+fi
+
+if [[ $stored_state == REQUEST_BOUND ]]; then
+  remove_incomplete_import
+  source_existing=$(realpath -e -- "$source_path") || fail invalid-source "$source_path"
+  [[ $source_existing == "$source_normalized" && -d $source_existing && ! -L $source_path ]] || fail invalid-source "$source_path"
+  "$helper" prepare-import "$source_existing" "$store" "$temporary_name"
+  candidate=$store/$temporary_name/candidate
+  candidate_tree=$("$helper" identity "$candidate")
+  [[ $candidate_tree == "$caller_candidate" ]] || fail stale-candidate "$requested_plugin_id"
+  "$validator" "$candidate" || fail validation-failed "$requested_plugin_id"
+  manifest_plugin_id=$(jq -er '.id | select(type == "string")' "$candidate/manifest.json") || fail invalid-manifest-id "$requested_plugin_id"
+  [[ $manifest_plugin_id == "$requested_plugin_id" ]] || fail manifest-id-mismatch "requested $requested_plugin_id, found $manifest_plugin_id"
+  jq -cnS --arg operationId "$operation_id" --arg pluginId "$requested_plugin_id" --arg candidateTree "$candidate_tree" --arg requestDigest "$request_digest" \
+    '{schema:"omarchy-plugin-candidate-stage/v1",operationId:$operationId,pluginId:$pluginId,state:"STAGED",sourceTree:$candidateTree,candidateTree:$candidateTree,normalizedRequestDigest:$requestDigest}' >"$store/$temporary_name/result.json"
+  chmod 0600 "$store/$temporary_name/result.json"
+  write_normal_journal PUBLICATION_INTENT '' "$candidate_tree" intended request-bound-to-publication-intent
+  stored_state=PUBLICATION_INTENT
+fi
+
+temporary_path=$store/$temporary_name
+completed_path=$store/$completed_slot
+stored_identity=$(jq -r .candidate.observed "$journal")
+temporary_present=false
+completed_present=false
+if [[ -e $temporary_path || -L $temporary_path ]]; then
+  [[ -d $temporary_path && ! -L $temporary_path ]] || {
+    write_normal_journal MANUAL_ATTENTION invalid-temporary "$stored_identity" contradictory publication-to-manual
+    fail manual-attention "$operation_id"
+  }
+  [[ $("$helper" identity "$temporary_path/candidate") == "$stored_identity" ]] || {
+    write_normal_journal MANUAL_ATTENTION candidate-identity-mismatch "$stored_identity" contradictory publication-to-manual
+    fail manual-attention "$operation_id"
+  }
+  temporary_present=true
+fi
+if [[ -e $completed_path || -L $completed_path ]]; then
+  [[ -d $completed_path && ! -L $completed_path ]] || {
+    write_normal_journal MANUAL_ATTENTION invalid-completed "$stored_identity" contradictory publication-to-manual
+    fail manual-attention "$operation_id"
+  }
+  [[ $("$helper" identity "$completed_path/candidate") == "$stored_identity" ]] || {
+    write_normal_journal MANUAL_ATTENTION candidate-identity-mismatch "$stored_identity" contradictory publication-to-manual
+    fail manual-attention "$operation_id"
+  }
+  completed_present=true
+fi
+
+if $temporary_present && $completed_present; then
+  write_normal_journal MANUAL_ATTENTION contradictory-publication "$stored_identity" contradictory publication-to-manual
+  fail manual-attention "$operation_id"
+elif $completed_present; then
+  "$helper" sync-directory "$store" reconciliation-candidate-parent || fail recovery-required "$operation_id"
+  if [[ $stored_state == RECOVERY_REQUIRED ]]; then
+    staged_transition=recovery-to-staged
+  else
+    staged_transition=publication-intent-to-staged
+  fi
+  write_normal_journal STAGED '' "$stored_identity" completed-durable "$staged_transition"
+  result_from_journal
+  exit 0
+elif $temporary_present; then
+  publish_error=
+  if ! publish_error=$("$helper" publish "$store" "$temporary_name" "$completed_slot" 2>&1); then
+    if grep -qF 'omarchy-plugin-tree: publication-indeterminate:' <<<"$publish_error"; then
+      write_normal_journal RECOVERY_REQUIRED publication-indeterminate "$stored_identity" indeterminate publication-intent-to-recovery
+      fail recovery-required "$operation_id"
+    fi
+    if grep -qF 'omarchy-plugin-tree: publication-rolled-back:' <<<"$publish_error"; then
+      write_normal_journal PUBLICATION_INTENT publication-compensated "$stored_identity" temporary publication-intent-compensated
+    fi
+    printf '%s\n' "$publish_error" >&2
+    fail publish-failed "$operation_id"
+  fi
+  if [[ $stored_state == RECOVERY_REQUIRED ]]; then
+    staged_transition=recovery-to-staged
+  else
+    staged_transition=publication-intent-to-staged
+  fi
+  write_normal_journal STAGED '' "$stored_identity" completed-durable "$staged_transition"
+  result_from_journal
+  exit 0
+else
+  write_normal_journal MANUAL_ATTENTION missing-candidate "$stored_identity" contradictory publication-to-manual
+  fail manual-attention "$operation_id"
+fi

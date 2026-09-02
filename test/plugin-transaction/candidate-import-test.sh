@@ -46,7 +46,8 @@ stage() {
   local operation=$1 plugin=$2 source=$3 caller_identity
   caller_identity=$(env -u OMARCHY_PLUGIN_TREE_TEST_HOOK \
     -u OMARCHY_PLUGIN_TREE_TEST_READY_FIFO -u OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO \
-    "$HELPER" identity "$source" 2>/dev/null || printf invalid)
+    "$HELPER" identity "$source" 2>/dev/null ||
+      printf 'omarchy-runtime-tree-sha256-v1:%064d' 0)
   HOME="$HOME_DIR" PATH="$TEST_ROOT/bin:$PATH" OMARCHY_PATH="$ROOT" \
     OMARCHY_PLUGIN_RACE_MARKER="$MARKER" SHELL_CALLS="$SHELL_CALLS" \
     OMARCHY_PLUGIN_TREE_HELPER="$HELPER" \
