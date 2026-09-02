@@ -18,6 +18,7 @@ ShellRoot {
   property PluginRegistry pluginRegistry: PluginRegistry { }
   property BarWidgetRegistry barWidgetRegistry: BarWidgetRegistry { }
   property AppLibrary appLibrary: AppLibrary { }
+  property PluginEligibility pluginEligibility: PluginEligibility { omarchyPath: shell.omarchyPath }
 
   property string home: Quickshell.env("HOME")
 
@@ -53,6 +54,7 @@ ShellRoot {
   })
 
   property var defaultsConfig: builtinShellConfig
+  property string defaultsRaw: JSON.stringify(builtinShellConfig)
   property var shellConfig: builtinShellConfig
   property bool pluginReloading: false
   property bool pluginReloadPending: false
@@ -85,22 +87,33 @@ ShellRoot {
       }
     }
     shellConfig = user || defaults
+    pluginEligibility.acceptSnapshot(shellConfig,
+      user ? "user" : "default",
+      user ? shell.userConfigPath : (defaults === builtinShellConfig ? "builtin:shell-config-v1" : shell.defaultsPath),
+      user ? userText : shell.defaultsRaw)
   }
 
   function loadDefaults(raw) {
     var text = String(raw || "").trim()
     if (!text) {
       defaultsConfig = builtinShellConfig
+      defaultsRaw = JSON.stringify(builtinShellConfig)
       applyShellConfig()
       return
     }
     try {
       var parsed = JSON.parse(text)
-      if (Util.isPlainObject(parsed) && parsed.version === 1) defaultsConfig = parsed
-      else defaultsConfig = builtinShellConfig
+      if (Util.isPlainObject(parsed) && parsed.version === 1) {
+        defaultsConfig = parsed
+        defaultsRaw = String(raw || "")
+      } else {
+        defaultsConfig = builtinShellConfig
+        defaultsRaw = JSON.stringify(builtinShellConfig)
+      }
     } catch (e) {
       console.warn("default shell.json parse failed, using builtin:", e)
       defaultsConfig = builtinShellConfig
+      defaultsRaw = JSON.stringify(builtinShellConfig)
     }
     applyShellConfig()
   }
@@ -148,11 +161,28 @@ ShellRoot {
     pluginRegistry.firstPartyDir = shell.firstPartyPluginsDir
     pluginRegistry.shellConfigProvider = function() { return shell.shellConfig }
     pluginRegistry.shellConfigMutator = function(mutate) { shell.mutateShellConfig(mutate) }
+    pluginRegistry.eligibilityAuthority = shell.pluginEligibility
+    pluginEligibility.unloadCallback = function(pluginId) { shell.unloadExactPlugin(pluginId) }
+    pluginEligibility.unloadVerifiedCallback = function(pluginId) { return shell.isExactPluginUnloaded(pluginId) }
+    pluginEligibility.rescanCallback = function(operationId, pluginId) {
+      return shell.pluginRegistry.rescan({ operationId: operationId, pluginId: pluginId, gated: true })
+    }
+    shell.pluginEligibility.initialize()
     // PluginRegistry.ensureUserDir() runs in its own Component.onCompleted and
     // chains rescan() once the directory exists. We also kick a scan here in
     // case the user dir already existed at startup.
     pluginRegistry.rescan()
     shell._syncServices()
+  }
+
+  Connections {
+    target: shell.pluginEligibility
+    function onEligibilityChanged() {
+      shell.pluginRegistry.registryRevision++
+      shell._syncServices()
+      shell.refreshPanelEntries()
+      shell.syncPluginWidgets()
+    }
   }
 
   function mutateShellConfig(mutator) {
@@ -293,6 +323,11 @@ ShellRoot {
 
     var comp = Qt.createComponent(url, Component.PreferSynchronous)
     function finalize() {
+      if (!pluginRegistry.isEnabled(key)
+          || pluginRegistry.entryPointUrl(manifest, "service") !== url) {
+        if (typeof comp.destroy === "function") comp.destroy()
+        return
+      }
       if (comp.status !== Component.Ready) {
         console.warn("service plugin load failed for " + key + ": " + comp.errorString())
         return
@@ -351,6 +386,44 @@ ShellRoot {
       if (inst && typeof inst.destroy === "function") inst.destroy()
     }
     _services = ({})
+  }
+
+  function unloadExactPlugin(pluginId) {
+    var key = String(pluginId)
+    var service = _services[key]
+    if (service && typeof service.destroy === "function") service.destroy()
+    if (_services[key]) {
+      var services = ({})
+      for (var serviceId in _services) if (serviceId !== key) services[serviceId] = _services[serviceId]
+      _services = services
+    }
+
+    if (openPanelIds[key]) hide(key)
+    var open = ({})
+    for (var openId in openPanelIds) if (openId !== key) open[openId] = openPanelIds[openId]
+    openPanelIds = open
+    var pending = ({})
+    for (var pendingId in pendingPayloads) if (pendingId !== key) pending[pendingId] = pendingPayloads[pendingId]
+    pendingPayloads = pending
+    panelEntries = computePanelEntries()
+
+    barWidgetRegistry.unregister(key)
+    setPluginWidgetComponent(key, null)
+    pluginRegistry.registryRevision++
+    pluginRegistry.pluginsChanged()
+  }
+
+  function isExactPluginUnloaded(pluginId) {
+    var key = String(pluginId)
+    var selectedPluginBarRetained = activeBarManifest && String(activeBarManifest.id || "") === key
+      && pluginBarLoader.item !== null
+    var panel = panelLoaders[key]
+    var panelRetained = panel && (panel.item !== null || panel.status === Loader.Loading)
+    return !selectedPluginBarRetained
+      && !_services[key]
+      && !panelRetained
+      && !barWidgetRegistry.has(key)
+      && !pluginWidgetComponents[key]
   }
 
   Connections {
@@ -602,9 +675,14 @@ ShellRoot {
     return out
   }
 
+  function refreshPanelEntries() {
+    var next = computePanelEntries()
+    if (JSON.stringify(next) !== JSON.stringify(panelEntries)) panelEntries = next
+  }
+
   Connections {
     target: shell.pluginRegistry
-    function onPluginsChanged() { if (!shell.pluginReloading) shell.panelEntries = shell.computePanelEntries() }
+    function onPluginsChanged() { if (!shell.pluginReloading) shell.refreshPanelEntries() }
   }
 
   Instantiator {
@@ -710,7 +788,9 @@ ShellRoot {
       // change schema, defaults, or sourceDir between rescans, and the
       // settings panel reads metadata from the registry.
       if (existing && existing.url === url && shell.barWidgetRegistry.has(registryKey)) {
+        if (JSON.stringify(existing.metadata || {}) === JSON.stringify(meta)) continue
         shell.barWidgetRegistry.register(registryKey, existing.component, meta)
+        shell.setPluginWidgetComponent(registryKey, { url: url, component: existing.component, metadata: meta })
         continue
       }
 
@@ -764,7 +844,7 @@ ShellRoot {
       console.log("Local plugin changed, reloading:", pluginId)
       localPluginReloadTimer.restart()
     }
-    function onScanFinished() {
+    function onScanFinished(context, generation) {
       if (shell.pluginReloadPending) {
         shell.pluginReloadPending = false
         shell.pluginReloading = false
@@ -773,8 +853,10 @@ ShellRoot {
       }
       shell.pluginReloading = false
       shell._syncServices()
-      shell.panelEntries = shell.computePanelEntries()
+      shell.refreshPanelEntries()
       shell.syncPluginWidgets()
+      if (context && context.gated === true)
+        shell.pluginEligibility.acknowledgeRescan(context.operationId, context.pluginId, generation)
     }
   }
 
@@ -794,9 +876,16 @@ ShellRoot {
 
     var comp = Qt.createComponent(url, Component.Asynchronous)
     function finalize() {
+      var currentManifest = shell.pluginRegistry.installedPlugins[registryKey]
+      if (!shell.pluginRegistry.isEnabled(registryKey)
+          || shell.pluginRegistry.entryPointUrl(currentManifest, "barWidget") !== url) {
+        shell.setPluginWidgetComponent(registryKey, null)
+        if (typeof comp.destroy === "function") comp.destroy()
+        return
+      }
       if (comp.status === Component.Ready) {
         shell.barWidgetRegistry.register(registryKey, comp, meta)
-        shell.setPluginWidgetComponent(registryKey, { url: url, component: comp })
+        shell.setPluginWidgetComponent(registryKey, { url: url, component: comp, metadata: meta })
       } else if (comp.status === Component.Error) {
         console.warn("Plugin widget " + registryKey + " failed: " + comp.errorString())
         // Drop the claim so a later rescan can retry.
@@ -889,6 +978,22 @@ ShellRoot {
 
     function rescanPlugins(): void {
       shell.reloadPlugins()
+    }
+
+    function gateTransactionPlugin(operationId: string, pluginId: string): string {
+      return shell.pluginEligibility.gatePlugin(operationId, pluginId)
+    }
+
+    function rescanGatedPlugin(operationId: string, pluginId: string): string {
+      return shell.pluginEligibility.rescanGated(operationId, pluginId)
+    }
+
+    function releaseTransactionPlugin(operationId: string, pluginId: string): string {
+      return shell.pluginEligibility.releasePlugin(operationId, pluginId)
+    }
+
+    function transactionPluginState(operationId: string): string {
+      return shell.pluginEligibility.transactionState(operationId)
     }
 
     function reloadConfig(): string {

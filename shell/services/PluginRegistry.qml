@@ -19,15 +19,18 @@ QtObject {
   // a deep-cloned config it can mutate in place and persists the result.
   property var shellConfigProvider: null
   property var shellConfigMutator: null
+  property var eligibilityAuthority: null
 
   // { pluginId: manifest } — manifests have __sourceDir and __isFirstParty stamped in.
   property var installedPlugins: ({})
   property int registryRevision: 0
+  property int registryGeneration: 0
+  property var activeScanContext: null
   property bool scanning: false
   property string lastEnableError: ""
 
   signal pluginsChanged()
-  signal scanFinished()
+  signal scanFinished(var context, int generation)
   signal pluginLoadFailed(string id, string error)
   signal localPluginChanged(string id)
 
@@ -92,6 +95,8 @@ QtObject {
 
   function entryPointUrl(manifest, kind) {
     if (!Util.isPlainObject(manifest)) return ""
+    if (eligibilityAuthority
+        && !eligibilityAuthority.allows(String(manifest.id || ""), manifest.__isFirstParty === true)) return ""
     var ep = manifest.entryPoints ? manifest.entryPoints[kind] : null
     if (!ep) return ""
     var dir = manifest.__sourceDir || ""
@@ -123,6 +128,8 @@ QtObject {
   function isEnabled(id) {
     var key = String(id)
     var manifest = installedPlugins[key]
+    if (manifest && eligibilityAuthority
+        && !eligibilityAuthority.allows(key, manifest.__isFirstParty === true)) return false
     var config = shellConfigProvider ? shellConfigProvider() : null
     if (manifest) {
       if (Array.isArray(manifest.kinds) && manifest.kinds.indexOf("bar") !== -1) {
@@ -610,9 +617,12 @@ QtObject {
 
     installedPlugins = merged
     registryRevision++
+    registryGeneration++
     scanning = false
     pluginsChanged()
-    scanFinished()
+    var completedContext = activeScanContext
+    activeScanContext = null
+    scanFinished(completedContext, registryGeneration)
   }
 
   property Process scanProcess: Process {
@@ -659,9 +669,10 @@ QtObject {
     onTriggered: localPluginWatcher.running = true
   }
 
-  function rescan() {
-    if (scanning) return
+  function rescan(context) {
+    if (scanning) return false
     scanning = true
+    activeScanContext = context || null
     // $0 = first-party dir, $1 = third-party dir. Some bash versions need the explicit -- separator.
     // First-party plugins may be grouped one level deeper, e.g. panels/audio
     // or services/battery.
@@ -691,6 +702,7 @@ QtObject {
       + "scan_thirdparty \"$1\""
     scanProcess.command = ["bash", "-c", script, registry.firstPartyDir, registry.pluginsDir]
     scanProcess.running = true
+    return true
   }
 
   function ensureUserDir() {
