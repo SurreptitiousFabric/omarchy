@@ -40,6 +40,30 @@ fail_with_log() {
   fail "$description"
 }
 
+ipc_log_line=0
+
+max_ipc_collisions_since() {
+  local first_line=$((ipc_log_line + 1))
+  sed -n "${first_line},\$p" "$1" |
+    grep -oE "another handler is registered for target [a-z.-]+" |
+    sort | uniq -c | sort -rn | head -1 | awk '{print $1}' || true
+}
+
+assert_widget_ipc_generation() {
+  local description="$1"
+  local worst
+  worst=$(max_ipc_collisions_since "$log")
+  worst=${worst:-0}
+  if (( worst > screens - 1 )); then
+    local first_line=$((ipc_log_line + 1))
+    sed -n "${first_line},\$p" "$log" |
+      grep "another handler is registered for target" |
+      sed 's/^/  /' | head -20 >&2 || true
+    fail_with_log "$description (saw $worst for $screens screen(s) in one lifecycle generation)"
+  fi
+  ipc_log_line=$(wc -l <"$log")
+}
+
 TMPDIR=$(mktemp -d)
 test_root="$TMPDIR/omarchy"
 test_home="$TMPDIR/home"
@@ -49,6 +73,10 @@ mkdir -p "$test_root" "$test_home" "$stub_bin"
 cp -a "$ROOT/shell" "$test_root/shell"
 ln -s "$ROOT/config" "$test_root/config"
 ln -s "$ROOT/bin" "$test_root/bin"
+ln -s "$ROOT/native" "$test_root/native"
+plugin_tree_helper="$TMPDIR/plugin-tree"
+mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
+  "$ROOT/native/plugin-transaction/plugin-tree.c" -o "$plugin_tree_helper"
 
 # Every plugin under ~/.config/omarchy/plugins hot-reloads, whoever wrote it.
 hot_reload_id="acme.hot-reload"
@@ -103,6 +131,7 @@ HOME="$test_home" \
 XDG_CONFIG_HOME="$test_home/.config" \
 XDG_CACHE_HOME="$test_home/.cache" \
 XDG_STATE_HOME="$test_home/.local/state" \
+OMARCHY_PLUGIN_TREE_HELPER="$plugin_tree_helper" \
 PATH="$stub_bin:$ROOT/bin:$PATH" \
   quickshell -p "$test_root/shell" --no-color >"$log" 2>&1 &
 QS_PID=$!
@@ -140,6 +169,23 @@ jq -e '
 }
 pass "shell IPC lists plugin metadata"
 
+screens=$(hyprctl -j monitors 2>/dev/null | jq 'length' 2>/dev/null || true)
+[[ $screens =~ ^[0-9]+$ ]] && (( screens > 0 )) || screens=1
+
+# Prove the generation-local assertion still rejects an actual duplicate on
+# one screen. Historical warnings from intentionally replaced generations are
+# not concurrent ownership and are checked in their own segments below.
+duplicate_probe="$TMPDIR/duplicate-ipc-generation.log"
+printf '%s\n' \
+  'another handler is registered for target omarchy.fixture' \
+  'another handler is registered for target omarchy.fixture' >"$duplicate_probe"
+probe_worst=$(max_ipc_collisions_since "$duplicate_probe")
+(( probe_worst > screens - 1 )) || fail "IPC lifecycle assertion detects a same-generation duplicate"
+pass "IPC lifecycle assertion detects a same-generation duplicate"
+
+assert_widget_ipc_generation "startup creates one widget IPC owner per screen"
+pass "startup creates one widget IPC owner per screen"
+
 jq '.name = "After Hot Reload"' "$hot_reload_dir/manifest.json" >"$hot_reload_dir/manifest.json.tmp"
 mv "$hot_reload_dir/manifest.json.tmp" "$hot_reload_dir/manifest.json"
 
@@ -156,6 +202,9 @@ done
 [[ $hot_reload_name == "After Hot Reload" ]] ||
   fail_with_log "installed plugin changes reload without an explicit rescan"
 pass "installed plugin changes reload without an explicit rescan"
+
+assert_widget_ipc_generation "hot reload creates one replacement widget IPC owner per screen"
+pass "hot reload creates one replacement widget IPC owner per screen"
 
 [[ $(shell_ipc shell setPluginEnabled "$hot_reload_id" true) == "ok" ]] ||
   fail_with_log "installed plugin could not be enabled"
@@ -280,23 +329,12 @@ for panel_id in omarchy.audio omarchy.bluetooth omarchy.monitor omarchy.network 
 done
 pass "direct panel IPC opens and closes default panels"
 
-# Each widget registers its IPC handler once per bar, and the bar is
-# instantiated once per screen, so Quickshell reports one collision per screen
-# past the first. Anything beyond that is two instances on the same screen —
-# the shape duplicate component loads produced, where a sync pass that ran
-# while a widget's asynchronous load was still in flight started a second one.
-# Checked before the reload below, which rebuilds widgets by design.
-screens=$(hyprctl -j monitors 2>/dev/null | jq 'length' 2>/dev/null || true)
-[[ $screens =~ ^[0-9]+$ ]] && (( screens > 0 )) || screens=1
-# No matches is the good case, and pipefail would otherwise abort the run.
-worst=$(grep -oE "another handler is registered for target [a-z.-]+" "$log" |
-  sort | uniq -c | sort -rn | head -1 | awk '{print $1}' || true)
-worst=${worst:-0}
-if (( worst > screens - 1 )); then
-  grep "another handler is registered for target" "$log" | sed 's/^/  /' | head -20 >&2
-  fail_with_log "each widget registers its IPC handler once per screen (saw $worst for $screens screen(s))"
-fi
-pass "each widget registers its IPC handler once per screen"
+# Each intentional registry reload is a new widget lifecycle generation. A
+# target may therefore occur again later in the log after its former owner was
+# destroyed. Within one generation, however, Quickshell reports exactly one
+# collision per screen past the first; more still proves same-screen overlap.
+assert_widget_ipc_generation "plugin rescan creates one replacement widget IPC owner per screen"
+pass "plugin rescan creates one replacement widget IPC owner per screen"
 
 HOME="$test_home" OMARCHY_PATH="$test_root" PATH="$ROOT/bin:$PATH" "$ROOT/bin/omarchy-plugin-disable" omarchy.audio
 
