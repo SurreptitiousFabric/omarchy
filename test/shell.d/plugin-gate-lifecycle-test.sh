@@ -26,6 +26,7 @@ trap cleanup EXIT
 require_command jq
 require_command quickshell
 require_command node
+NODE_BIN=$(mise which node)
 
 TMPDIR=$(mktemp -d)
 chmod 0700 "$TMPDIR"
@@ -64,6 +65,7 @@ else
   mise exec -- node "$FIXTURE_ROOT/instrument-copy.mjs" "$test_root/shell/shell.qml"
 fi
 mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
+  -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
   "$SOURCE_ROOT/native/plugin-transaction/plugin-tree.c" -o "$helper"
 
 service_id=acme.lifecycle-service
@@ -71,7 +73,8 @@ active_service_id=acme.lifecycle-active-service
 widget_id=acme.lifecycle-widget
 active_widget_id=acme.lifecycle-active-widget
 selected_bar_id=acme.lifecycle-selected-bar
-for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id" "$selected_bar_id"; do
+indeterminate_id=acme.lifecycle-indeterminate
+for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id" "$selected_bar_id" "$indeterminate_id"; do
   live="$plugin_dir/$plugin"
   candidate="$TMPDIR/candidate-$plugin"
   mkdir -p "$live" "$candidate"
@@ -79,7 +82,7 @@ for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id
     cp "$FIXTURE_ROOT/ActiveService.qml" "$live/Service.qml"
     jq --arg id "$plugin" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
       "$FIXTURE_ROOT/manifest.json" >"$live/manifest.json"
-  elif [[ $plugin == "$service_id" ]]; then
+  elif [[ $plugin == "$service_id" || $plugin == "$indeterminate_id" ]]; then
     cp "$FIXTURE_ROOT/Service.qml" "$live/Service.qml"
     jq --arg id "$plugin" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
       "$FIXTURE_ROOT/manifest.json" >"$live/manifest.json"
@@ -108,10 +111,14 @@ jq --arg plugin "$active_service_id" '.plugins += [{id:$plugin}]' "$config_file"
 mv "$config_file.next" "$config_file"
 jq --arg plugin "$active_widget_id" '.bar.layout.center += [{id:$plugin}]' "$config_file" >"$config_file.next"
 mv "$config_file.next" "$config_file"
+initial_config="$TMPDIR/initial-shell.json"
+cp "$config_file" "$initial_config"
+unrelated_config="$TMPDIR/unrelated-shell.json"
+jq '.bar.floating = true' "$initial_config" >"$unrelated_config"
 
 projection_digest() {
   local plugin=$1
-  ROOT="$SOURCE_ROOT" CONFIG="$config_file" PLUGIN="$plugin" mise exec -- node <<'JS'
+  ROOT="$SOURCE_ROOT" CONFIG="$config_file" PLUGIN="$plugin" "$NODE_BIN" <<'JS'
 const crypto = require('crypto')
 const fs = require('fs')
 const vm = require('vm')
@@ -152,11 +159,14 @@ widget_operation=61000000-0000-4000-8000-000000000002
 active_service_operation=61000000-0000-4000-8000-000000000003
 selected_bar_operation=61000000-0000-4000-8000-000000000004
 active_widget_operation=61000000-0000-4000-8000-000000000005
+indeterminate_operation=61000000-0000-4000-8000-000000000006
 stage_operation "$service_operation" "$service_id"
 stage_operation "$widget_operation" "$widget_id"
 stage_operation "$active_service_operation" "$active_service_id"
 stage_operation "$selected_bar_operation" "$selected_bar_id"
 stage_operation "$active_widget_operation" "$active_widget_id"
+stage_operation "$indeterminate_operation" "$indeterminate_id"
+initial_service_projection=$(projection_digest "$service_id")
 
 selected_bar_source="$plugin_dir/$selected_bar_id/SelectedBar.qml"
 {
@@ -185,7 +195,13 @@ export OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME="$TMPDIR/authorize-before-resum
 export OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER="$TMPDIR/hold-authorize-after"
 export OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY="$TMPDIR/authorize-after-ready"
 export OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME="$TMPDIR/authorize-after-resume"
-mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME"
+export OMARCHY_LIFECYCLE_HOLD_SCAN="$TMPDIR/hold-scan"
+export OMARCHY_LIFECYCLE_SCAN_READY="$TMPDIR/scan-ready"
+export OMARCHY_LIFECYCLE_SCAN_RESUME="$TMPDIR/scan-resume"
+export OMARCHY_LIFECYCLE_INDETERMINATE_OPERATION="$indeterminate_operation"
+export OMARCHY_LIFECYCLE_INJECT_INSTALL_PARENT_FSYNC="$TMPDIR/inject-install-parent-fsync"
+mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME" \
+  "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME" "$OMARCHY_LIFECYCLE_SCAN_RESUME"
 export QT_QPA_PLATFORM=offscreen
 export WAYLAND_DISPLAY=
 export HYPRLAND_INSTANCE_SIGNATURE=
@@ -226,6 +242,29 @@ wait_for "real service completion reaches deterministic barrier" '(( $(state "$s
 wait_for "real widget completion reaches deterministic barrier" '(( $(state "$widget_id" 2>/dev/null | jq -r .deferredWidget || echo 0) >= 1 ))'
 wait_for "active-service completion reaches deterministic barrier" '(( $(state "$active_service_id" 2>/dev/null | jq -r .deferredService || echo 0) >= 1 ))'
 wait_for "active-widget completion reaches deterministic barrier" '(( $(state "$active_widget_id" 2>/dev/null | jq -r .deferredWidget || echo 0) >= 1 ))'
+if [[ $EXPECTATION != reviewed-authority-vulnerable ]]; then
+  initial_epoch=$(state "$service_id" | jq -r .configurationEpoch)
+  initial_config_sha=$(sha256sum "$config_file")
+  unrelated_config_b64=$(base64 -w0 "$unrelated_config")
+  chmod 0500 "$(dirname "$config_file")"
+  [[ $(shell_ipc shell testPersistConfigBase64 "$unrelated_config_b64") == failed ]] || fail "isolated configuration write failure was not reported"
+  chmod 0700 "$(dirname "$config_file")"
+  [[ $(state "$service_id" | jq -r .configurationEpoch) == "$initial_epoch" ]] || fail "failed write advanced configuration authority"
+  [[ $(sha256sum "$config_file") == "$initial_config_sha" ]] || fail "failed atomic write changed shell.json"
+  jq -e '.shellConfig == .acceptedConfig and (.shellConfig.bar.floating == null)' <<<"$(state "$service_id")" >/dev/null ||
+    fail "failed write split loader and release authority"
+  pass "failed programmatic write retains one prior accepted snapshot"
+
+  wait_for "indeterminate fixture is initially resolvable" '[[ $(state "$indeterminate_id" 2>/dev/null | jq -r .directUrl || true) == file:* ]]'
+  : >"$OMARCHY_LIFECYCLE_INJECT_INSTALL_PARENT_FSYNC"
+  shell_ipc shell gateTransactionPlugin "$indeterminate_operation" "$indeterminate_id" >/dev/null
+  wait_for "install parent-fsync ambiguity blocks the affected plugin in memory" '[[ $(transaction_status "$indeterminate_operation" 2>/dev/null || true) == gate-operation-failed && $(state "$indeterminate_id" 2>/dev/null | jq -r .directUrl) == "" ]]'
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$indeterminate_id.gate") == GATED ]] ||
+    fail "indeterminate install did not retain its visible durable gate evidence"
+  shell_ipc shell gateTransactionPlugin "$indeterminate_operation" "$indeterminate_id" >/dev/null
+  wait_for "same-shell retry synchronizes and reconstructs indeterminate gate" '[[ $(transaction_status "$indeterminate_operation" 2>/dev/null || true) == gate-installed-unload-acknowledged && $(state "$indeterminate_id" 2>/dev/null | jq -r ".gate.valid == true and .gate.state == \"UNLOAD_ACKNOWLEDGED\" and .directUrl == \"\"") == true ]]'
+  pass "same-shell gate-indeterminate result remains blocked through exact reconciliation"
+fi
 shell_ipc shell testResumeDeferredService "$active_service_id" 0 >/dev/null
 wait_for "active-service object is created" '[[ $(state "$active_service_id" 2>/dev/null | jq -r .serviceActive || true) == true ]]'
 shell_ipc shell testResumeDeferredWidget "$active_widget_id" 0 >/dev/null
@@ -241,51 +280,129 @@ else
   wait_for "corrected service pending load withholds acknowledgement" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == unload-incomplete ]]'
   [[ $(state "$service_id" | jq -r .pendingService) == true ]] || fail "corrected shell records pending service ownership"
   pass "pending service ownership withholds unload acknowledgement"
+  if [[ $EXPECTATION != reviewed-authority-vulnerable ]]; then
+    shell_ipc shell gateTransactionPlugin "$service_operation" "$service_id" >/dev/null
+    wait_for "GATED replay remains blocked on pending service ownership" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == unload-incomplete && $(state "$service_id" 2>/dev/null | jq -r .gate.state) == GATED ]]'
+    pass "GATED replay reconstructs durable authority without guessing"
+  fi
 fi
 
 shell_ipc shell testReleaseUnload "$service_id" >/dev/null
 wait_for "service unload eventually acknowledges after invalidation" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gate-installed-unload-acknowledged ]]'
+if [[ $EXPECTATION != reviewed-authority-vulnerable ]]; then
+  shell_ipc shell gateTransactionPlugin "$service_operation" "$service_id" >/dev/null
+  wait_for "UNLOAD_ACKNOWLEDGED replay remains exact" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gate-installed-unload-acknowledged && $(state "$service_id" 2>/dev/null | jq -r .gate.state) == UNLOAD_ACKNOWLEDGED ]]'
+
+  duplicate_source="$plugin_dir/acme.lifecycle-duplicate-source"
+  before_duplicate_generation=$(state "$service_id" | jq -r .registryGeneration)
+  [[ $(shell_ipc shell testStopLocalPluginWatcher) == stopping ]] || fail "test-copy plugin watcher stop was not requested"
+  wait_for "test-copy plugin watcher stops" '[[ $(state "$service_id" 2>/dev/null | jq -r .pluginWatcherRunning || true) == false ]]'
+  cp -a "$plugin_dir/$service_id" "$duplicate_source"
+  [[ $(shell_ipc shell testOrdinaryRescan) == started ]] || fail "duplicate-source ordinary scan did not start"
+  wait_for "duplicate-source ordinary scan completes" '(( $(state "$service_id" 2>/dev/null | jq -r .registryGeneration || echo 0) > before_duplicate_generation )) && [[ $(state "$service_id" 2>/dev/null | jq -r .registryScanning || true) == false ]]'
+  shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
+  wait_for "duplicate source fails operation-bound discovery" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-failed ]]'
+  [[ $(state "$service_id" | jq -r '.gate.state + ":" + .directUrl') == UNLOAD_ACKNOWLEDGED: ]] ||
+    fail "duplicate manifest source changed gate or exposed a Loader URL"
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$service_id.gate") == UNLOAD_ACKNOWLEDGED ]] ||
+    fail "duplicate manifest source changed the durable gate"
+  before_duplicate_removal_generation=$(state "$service_id" | jq -r .registryGeneration)
+  find "$duplicate_source" -mindepth 1 -delete
+  rmdir "$duplicate_source"
+  [[ $(shell_ipc shell testOrdinaryRescan) == started ]] || fail "duplicate-removal ordinary scan did not start"
+  wait_for "duplicate-removal ordinary scan completes" '(( $(state "$service_id" 2>/dev/null | jq -r .registryGeneration || echo 0) > before_duplicate_removal_generation )) && [[ $(state "$service_id" 2>/dev/null | jq -r .registryScanning || true) == false ]]'
+  pass "duplicate registry source remains non-loadable and cannot acknowledge gated discovery"
+fi
 
 shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
 wait_for "service gated rescan completes" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-complete ]]'
-if [[ $EXPECTATION == published-vulnerable ]]; then
+if [[ $EXPECTATION == reviewed-authority-vulnerable ]]; then
+  : >"$OMARCHY_LIFECYCLE_HOLD_PROJECTION"
+  before_mutation_epoch=$(state "$service_id" | jq -r .configurationEpoch)
+  shell_ipc shell releaseTransactionPlugin "$service_operation" "$service_id" >/dev/null
+  wait_for "reviewed projection reaches deterministic barrier" '[[ -e $OMARCHY_LIFECYCLE_PROJECTION_READY ]]'
+  [[ $(shell_ipc shell setPluginEnabled "$service_id" false) == ok ]] || fail "reviewed-head configuration mutation failed"
+  mutation_state=$(state "$service_id")
+  printf 'resume\n' >"$OMARCHY_LIFECYCLE_PROJECTION_RESUME"
+  [[ $(jq -r .splitSnapshotObserved <<<"$mutation_state") == true ]] ||
+    fail "reviewed head did not reproduce the split configuration snapshot"
+  [[ $(jq -r .splitSnapshotEpoch <<<"$mutation_state") == "$before_mutation_epoch" ]] ||
+    fail "reviewed split window was not observed at the old release epoch"
+  pass "reviewed head reproduces the programmatic split-snapshot window"
+  exit 0
+elif [[ $EXPECTATION == published-vulnerable ]]; then
   shell_ipc shell releaseTransactionPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "service conditional release completes" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == released ]]'
 else
   gated_generation=$(state "$service_id" | jq -r .gate.generation)
+  gated_scan_epoch=$(state "$service_id" | jq -r .gate.scanEpoch)
+  shell_ipc shell gateTransactionPlugin "$service_operation" "$service_id" >/dev/null
+  wait_for "RESCAN_ACKNOWLEDGED replay preserves exact authority" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-complete && $(state "$service_id" 2>/dev/null | jq -r ".gate.state == \"RESCAN_ACKNOWLEDGED\" and .gate.generation == $gated_generation and .gate.scanEpoch == $gated_scan_epoch") == true ]]'
+  : >"$OMARCHY_LIFECYCLE_HOLD_SCAN"
   [[ $(shell_ipc shell testOrdinaryRescan) == started ]] || fail "ordinary generation-advance scan did not start"
-  wait_for "ordinary rescan advances current registry generation" '(( $(state "$service_id" 2>/dev/null | jq -r .registryGeneration || echo 0) > gated_generation ))'
+  wait_for "ordinary scan reaches deterministic in-progress barrier" '[[ -e $OMARCHY_LIFECYCLE_SCAN_READY ]]'
+  scan_pending_state=$(state "$service_id")
+  [[ $(jq -r .registryScanning <<<"$scan_pending_state") == true ]] || fail "held ordinary scan was not authoritative in-progress state"
+  [[ $(jq -r .registryGeneration <<<"$scan_pending_state") == "$gated_generation" ]] || fail "held scan unexpectedly completed"
+  (( $(jq -r .scanEpoch <<<"$scan_pending_state") > gated_scan_epoch )) || fail "scan start did not invalidate the gated scan epoch"
   shell_ipc shell releaseTransactionPlugin "$service_operation" "$service_id" >/dev/null
   if [[ $EXPECTATION == broken-current-generation ]]; then
     wait_for "negative control releases against a stale registry generation" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == released ]]'
     pass "generation-guard negative control reproduces stale release"
     exit 0
   fi
-  wait_for "stale generation retains service gate before projection" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == release-retained ]]'
-  [[ $(state "$service_id" | jq -r .gate.state) == RESCAN_ACKNOWLEDGED ]] || fail "stale pre-projection generation removed the gate"
-  pass "current registry generation is required before release comparison"
+  wait_for "stale generation retains service gate before projection" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == release-retained && $(state "$service_id" 2>/dev/null | jq -r .gate.state) == UNLOAD_ACKNOWLEDGED ]]'
+  printf 'resume\n' >"$OMARCHY_LIFECYCLE_SCAN_RESUME"
+  rm -f "$OMARCHY_LIFECYCLE_HOLD_SCAN" "$OMARCHY_LIFECYCLE_SCAN_READY"
+  wait_for "ordinary rescan advances current registry generation" '(( $(state "$service_id" 2>/dev/null | jq -r .registryGeneration || echo 0) > gated_generation ))'
+  pass "scan-in-progress state and current generation are required before release comparison"
 
   shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "fresh service gated rescan replaces stale generation" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-complete && $(state "$service_id" 2>/dev/null | jq -r ".gate.generation == .registryGeneration") == true ]]'
 
   : >"$OMARCHY_LIFECYCLE_HOLD_PROJECTION"
+  before_mutation_epoch=$(state "$service_id" | jq -r .configurationEpoch)
   shell_ipc shell releaseTransactionPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "projection completion reaches deterministic barrier" '[[ -e $OMARCHY_LIFECYCLE_PROJECTION_READY ]]'
-  shell_ipc shell testBumpConfigurationEpoch >/dev/null
+  [[ $(shell_ipc shell setPluginEnabled "$service_id" false) == ok ]] || fail "real plugin configuration mutation failed"
+  mutation_state=$(state "$service_id")
   printf 'resume\n' >"$OMARCHY_LIFECYCLE_PROJECTION_RESUME"
   rm -f "$OMARCHY_LIFECYCLE_HOLD_PROJECTION" "$OMARCHY_LIFECYCLE_PROJECTION_READY"
+  [[ $(jq -r .splitSnapshotObserved <<<"$mutation_state") == false ]] ||
+    fail "programmatic mutation exposed split loader/release snapshots"
+  jq -e '.shellConfig == .acceptedConfig' <<<"$mutation_state" >/dev/null ||
+    fail "programmatic mutation did not publish one accepted configuration"
+  (( $(jq -r .configurationEpoch <<<"$mutation_state") > before_mutation_epoch )) ||
+    fail "programmatic mutation did not advance the accepted epoch synchronously"
+  [[ $(jq -r .acceptedSourceIdentity <<<"$mutation_state") == "$config_file" ]] ||
+    fail "programmatic mutation published the wrong source identity"
+  [[ $(jq -r .acceptedRawText <<<"$mutation_state") == "$(<"$config_file")" ]] ||
+    fail "written shell.json and accepted raw snapshot differ"
   wait_for "configuration epoch change during projection retains gate" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == release-precondition-mismatch ]]'
   [[ $(state "$service_id" | jq -r .gate.state) == RESCAN_ACKNOWLEDGED ]] || fail "projection-epoch mismatch removed the gate"
-  pass "configuration epoch remains bound through projection completion"
+  pass "real programmatic mutation atomically advances loader and release authority"
+
+  initial_config_b64=$(base64 -w0 "$initial_config")
+  unrelated_config_b64=$(base64 -w0 "$unrelated_config")
+  [[ $(shell_ipc shell testPersistConfigBase64 "$initial_config_b64") == ok ]] || fail "initial configuration restoration failed"
+  wait_for "restored configuration is accepted" '[[ $(state "$service_id" 2>/dev/null | jq -r ".shellConfig == .acceptedConfig and (.shellConfig.plugins[0].id == \"$service_id\")" || true) == true ]]'
 
   : >"$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_BEFORE"
+  before_authorize_epoch=$(state "$service_id" | jq -r .configurationEpoch)
   shell_ipc shell releaseTransactionPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "native authorization reaches pre-call barrier" '[[ -e $OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_READY ]]'
-  shell_ipc shell testBumpConfigurationEpoch >/dev/null
+  [[ $(shell_ipc shell testPersistConfigBase64 "$unrelated_config_b64") == ok ]] || fail "pre-authorization configuration mutation failed"
+  (( $(state "$service_id" | jq -r .configurationEpoch) > before_authorize_epoch )) ||
+    fail "pre-authorization mutation did not synchronously advance the epoch"
+  [[ $(projection_digest "$service_id") == "$initial_service_projection" ]] ||
+    fail "unrelated configuration mutation changed the plugin projection"
   printf 'resume\n' >"$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME"
   rm -f "$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_BEFORE" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_READY"
   wait_for "post-projection epoch change returns durable gate to unload-acknowledged" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == release-retained && $(state "$service_id" 2>/dev/null | jq -r .gate.state) == UNLOAD_ACKNOWLEDGED ]]'
-  pass "post-projection authority change is recoverably fail closed"
+  pass "real unrelated mutation before native authorization is recoverably fail closed"
+
+  [[ $(shell_ipc shell testPersistConfigBase64 "$initial_config_b64") == ok ]] || fail "pre-authorization test restoration failed"
+  wait_for "pre-authorization test restoration is accepted" '[[ $(state "$service_id" 2>/dev/null | jq -r ".shellConfig == .acceptedConfig and (.shellConfig.bar.floating == null)" || true) == true ]]'
 
   shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "service rescan completes after retained authorization" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-complete ]]'
@@ -301,10 +418,28 @@ else
   pass "post-native generation change cannot publish eligibility"
 
   shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
+  wait_for "service gated rescan completes before post-native configuration test" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-complete ]]'
+  : >"$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER"
+  before_post_native_epoch=$(state "$service_id" | jq -r .configurationEpoch)
+  shell_ipc shell releaseTransactionPlugin "$service_operation" "$service_id" >/dev/null
+  wait_for "second native release authorization reaches post-write barrier" '[[ -e $OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY ]]'
+  [[ $(shell_ipc shell testPersistConfigBase64 "$unrelated_config_b64") == ok ]] || fail "post-authorization configuration mutation failed"
+  (( $(state "$service_id" | jq -r .configurationEpoch) > before_post_native_epoch )) ||
+    fail "post-authorization mutation did not synchronously advance the epoch"
+  printf 'resume\n' >"$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME"
+  rm -f "$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER" "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY"
+  wait_for "post-authorization configuration change restores blocking rescan state" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == release-retained && $(state "$service_id" 2>/dev/null | jq -r .gate.state) == UNLOAD_ACKNOWLEDGED ]]'
+  pass "real configuration mutation after native authorization cannot publish eligibility"
+
+  [[ $(shell_ipc shell testPersistConfigBase64 "$initial_config_b64") == ok ]] || fail "post-authorization test restoration failed"
+  wait_for "post-authorization test restoration is accepted" '[[ $(state "$service_id" 2>/dev/null | jq -r ".shellConfig == .acceptedConfig and (.shellConfig.bar.floating == null)" || true) == true ]]'
+  shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "final service gated rescan completes" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-complete ]]'
   shell_ipc shell releaseTransactionPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "service conditional release completes" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == released ]]'
 fi
+[[ $(state "$service_id" | jq -r .directUrl) == "file://$plugin_dir/$service_id/Service.qml" ]] ||
+  fail "released service URL did not resolve beneath the exact verified destination"
 wait_for "post-release service load reaches a newer barrier" '(( $(state "$service_id" 2>/dev/null | jq -r .deferredService || echo 0) >= 2 ))'
 shell_ipc shell testResumeDeferredService "$service_id" 0 >/dev/null
 

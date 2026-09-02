@@ -7,6 +7,46 @@ let source = fs.readFileSync(path, 'utf8')
 const forgetScreenLoaders = process.env.OMARCHY_LIFECYCLE_FORGET_SCREEN_LOADERS === '1'
 const duplicateScreenLoader = process.env.OMARCHY_LIFECYCLE_DUPLICATE_SCREEN_LOADER === '1'
 
+const registryPath = nodePath.join(nodePath.dirname(path), 'services', 'PluginRegistry.qml')
+let registrySource = fs.readFileSync(registryPath, 'utf8')
+
+function replaceRegistryOnce(anchor, replacement, name) {
+  const first = registrySource.indexOf(anchor)
+  if (first < 0 || registrySource.indexOf(anchor, first + anchor.length) >= 0)
+    throw new Error(`registry anchor must occur exactly once: ${name}`)
+  registrySource = registrySource.slice(0, first) + replacement
+    + registrySource.slice(first + anchor.length)
+}
+
+const correctedScanAnchor = '    var script = "set -euo pipefail; shopt -s nullglob; "\n'
+const reviewedScanAnchor = '    var script = ""\n'
+const scanBarrier = 'if [[ -e "${OMARCHY_LIFECYCLE_HOLD_SCAN:-}" ]]; then '
+  + ': >"$OMARCHY_LIFECYCLE_SCAN_READY"; read -r _ <"$OMARCHY_LIFECYCLE_SCAN_RESUME"; fi; '
+if (registrySource.includes(correctedScanAnchor)) {
+  replaceRegistryOnce(correctedScanAnchor,
+    '    var script = "' + scanBarrier.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
+      + 'set -euo pipefail; shopt -s nullglob; "\n',
+    'corrected scanner barrier')
+} else {
+  replaceRegistryOnce(reviewedScanAnchor,
+    '    var script = "' + scanBarrier.replaceAll('\\', '\\\\').replaceAll('"', '\\"') + '"\n',
+    'reviewed scanner barrier')
+}
+replaceRegistryOnce(
+  '  function ensureUserDir() {\n',
+  `  function testSetLocalWatcherRunning(value) {
+    localPluginWatcher.running = value === true
+  }
+
+  function testLocalWatcherRunning() {
+    return localPluginWatcher.running
+  }
+
+  function ensureUserDir() {
+`,
+  'test-copy watcher control')
+fs.writeFileSync(registryPath, registrySource)
+
 if (process.env.OMARCHY_LIFECYCLE_DISABLE_GENERATION_GUARDS === '1') {
   const authorityPath = nodePath.join(nodePath.dirname(path), 'services', 'PluginEligibility.qml')
   let authority = fs.readFileSync(authorityPath, 'utf8')
@@ -16,20 +56,33 @@ if (process.env.OMARCHY_LIFECYCLE_DISABLE_GENERATION_GUARDS === '1') {
       throw new Error(`authority anchor must occur exactly once: ${name}`)
     authority = authority.slice(0, first) + replacement + authority.slice(first + anchor.length)
   }
-  replaceAuthorityOnce(
-    `    if (!registryGenerationProvider || Number(registryGenerationProvider()) !== Number(gateRecord.generation)) {
+  const reviewedInitialGuard = `    if (!registryGenerationProvider || Number(registryGenerationProvider()) !== Number(gateRecord.generation)) {
       setResult(operationId, pluginId, "release-retained", "stale rescan generation")
       return "stale-rescan-generation"
     }
-`,
-    '',
-    'initial current generation guard')
-  replaceAuthorityOnce(
-    `      && registryGenerationProvider
+`
+  if (authority.includes(reviewedInitialGuard)) {
+    replaceAuthorityOnce(reviewedInitialGuard, '', 'initial current generation guard')
+    replaceAuthorityOnce(
+      `      && registryGenerationProvider
       && Number(registryGenerationProvider()) === Number(command.generation)
 `,
-    '',
-    'continued current generation guard')
+      '',
+      'continued current generation guard')
+  } else {
+    replaceAuthorityOnce(
+      `    return current && current.scanning !== true && current.scanSuccessful === true
+      && current.unique === true
+      && Number(current.generation) === Number(generation)
+      && Number(current.scanEpoch) === Number(scanEpoch)
+      && String(current.sourceDirectory || "") === String(sourceDirectory || "")
+`,
+      `    return current && current.scanSuccessful === true
+      && current.unique === true
+      && String(current.sourceDirectory || "") === String(sourceDirectory || "")
+`,
+      'central current scan authority guard')
+  }
   fs.writeFileSync(authorityPath, authority)
 }
 
@@ -87,6 +140,8 @@ replaceOnce(
   property bool testGateOnSelectedBarLoading: false
   property bool testSelectedBarSawLoading: false
   property bool testSelectedBarGateRequested: false
+  property bool testSplitSnapshotObserved: false
+  property int testSplitSnapshotEpoch: -1
 
   function testEvent(value) {
     var next = testEvents.slice()
@@ -95,6 +150,27 @@ replaceOnce(
   }
 `,
   'service state')
+
+const vulnerableConfigAnchor = '    shellConfig = payload\n'
+if (source.includes(vulnerableConfigAnchor)) {
+  replaceOnce(
+    vulnerableConfigAnchor,
+    `    shellConfig = payload
+    if (JSON.stringify(shellConfig) !== JSON.stringify(pluginEligibility.acceptedConfig)) {
+      testSplitSnapshotObserved = true
+      testSplitSnapshotEpoch = pluginEligibility.configurationEpoch
+    }
+`,
+    'vulnerable programmatic configuration publication observation')
+} else {
+  const atomicConfigAnchor = `    configWriteOutcome = "idle"
+    publishAcceptedShellConfig(payload, "user", shell.userConfigPath, raw)
+    return true
+`
+  const first = source.indexOf(atomicConfigAnchor)
+  if (first < 0 || source.indexOf(atomicConfigAnchor, first + atomicConfigAnchor.length) >= 0)
+    throw new Error('atomic configuration publication anchor must occur exactly once')
+}
 
 replaceOnce(
   '  // ------------------------------------------------------------- services\n',
@@ -276,11 +352,24 @@ replaceOnce(
         selectedBarGateRequested: shell.testSelectedBarGateRequested,
         screenItems: shell.testScreenItems(key),
         screenLoading: shell.testScreenLoading(key),
+        registryScanning: shell.pluginRegistry.scanning,
+        pluginWatcherRunning: shell.pluginRegistry.testLocalWatcherRunning(),
         registryGeneration: shell.pluginRegistry.registryGeneration,
+        scanEpoch: ("scanEpoch" in shell.pluginRegistry) ? shell.pluginRegistry.scanEpoch : -1,
         configurationEpoch: shell.pluginEligibility.configurationEpoch,
+        shellConfig: shell.shellConfig,
+        acceptedConfig: shell.pluginEligibility.acceptedConfig,
+        acceptedSourceKind: shell.pluginEligibility.acceptedSourceKind,
+        acceptedSourceIdentity: shell.pluginEligibility.acceptedSourceIdentity,
+        acceptedRawText: shell.pluginEligibility.acceptedRawText,
+        fileRawText: userConfigFile.text(),
+        splitSnapshotObserved: shell.testSplitSnapshotObserved,
+        splitSnapshotEpoch: shell.testSplitSnapshotEpoch,
         shellInstance: shell.pluginEligibility.shellInstanceId,
         inventoryReady: shell.pluginEligibility.inventoryReady,
         gate: shell.pluginEligibility.gates[key] || null,
+        directUrl: shell.pluginRegistry.installedPlugins[key]
+          ? shell.pluginRegistry.entryPointUrl(shell.pluginRegistry.installedPlugins[key], "service") : "",
         results: shell.pluginEligibility.results,
         deferredService: shell.testDeferredServices[key] ? shell.testDeferredServices[key].length : 0,
         deferredWidget: shell.testDeferredWidgets[key] ? shell.testDeferredWidgets[key].length : 0,
@@ -306,9 +395,7 @@ replaceOnce(
       var next = JSON.parse(JSON.stringify(shell.shellConfig))
       if (!next.bar) next.bar = {}
       next.bar.id = String(pluginId)
-      shell.shellConfig = next
-      shell.pluginEligibility.acceptSnapshot(next, shell.pluginEligibility.acceptedSourceKind,
-        shell.pluginEligibility.acceptedSourceIdentity, JSON.stringify(next))
+      if (!shell.persistShellConfig(next)) return "configuration-write-failed"
       shell.pluginRegistry.registryRevision++
       shell.pluginRegistry.pluginsChanged()
       return "ok"
@@ -318,11 +405,18 @@ replaceOnce(
       return shell.pluginRegistry.rescan() ? "started" : "busy"
     }
 
-    function testBumpConfigurationEpoch(): string {
-      shell.pluginEligibility.acceptSnapshot(shell.pluginEligibility.acceptedConfig,
-        shell.pluginEligibility.acceptedSourceKind, shell.pluginEligibility.acceptedSourceIdentity,
-        shell.pluginEligibility.acceptedRawText)
-      return String(shell.pluginEligibility.configurationEpoch)
+    function testStopLocalPluginWatcher(): string {
+      shell.pluginRegistry.testSetLocalWatcherRunning(false)
+      return "stopping"
+    }
+
+    function testPersistConfigBase64(configBase64: string): string {
+      try {
+        var config = JSON.parse(Qt.atob(String(configBase64)))
+        return shell.persistShellConfig(config) ? "ok" : "failed"
+      } catch (error) {
+        return "invalid"
+      }
     }
 
     function testUnloadNow(pluginId: string): string {

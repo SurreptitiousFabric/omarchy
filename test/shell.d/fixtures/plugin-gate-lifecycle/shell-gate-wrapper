@@ -4,6 +4,13 @@ set -euo pipefail
 real_helper=${OMARCHY_LIFECYCLE_REAL_GATE:?missing real gate helper}
 action=${1:-}
 
+if [[ $action == install && ${2:-} == "${OMARCHY_LIFECYCLE_INDETERMINATE_OPERATION:-}"
+    && -e ${OMARCHY_LIFECYCLE_INJECT_INSTALL_PARENT_FSYNC:-/nonexistent} ]]; then
+  rm -f -- "$OMARCHY_LIFECYCLE_INJECT_INSTALL_PARENT_FSYNC"
+  OMARCHY_PLUGIN_TREE_TEST_FAIL_FSYNC=gate-parent:gate-install \
+    exec "$real_helper" "$@"
+fi
+
 hold_at() {
   local selector=$1 barrier=$2 resume=$3
   [[ -e $selector ]] || return 0
