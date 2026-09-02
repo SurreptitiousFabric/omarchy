@@ -82,18 +82,41 @@ printf 'ok - fresh-process inventory restores and exact install is idempotent\n'
 
 gate acknowledge-unload "$operation" "$plugin" shell-one >/dev/null
 [[ $(jq -r .state "$gate_file") == UNLOAD_ACKNOWLEDGED ]]
+unloaded_sha=$(sha256sum "$gate_file")
+unloaded_replay=$(gate install "$operation" "$plugin")
+[[ $(jq -r '.status + ":" + .gate.state' <<<"$unloaded_replay") == already-gated:UNLOAD_ACKNOWLEDGED ]]
+[[ $(sha256sum "$gate_file") == "$unloaded_sha" ]]
 cp -a "$STORE/$operation/candidate" "$PLUGIN_DIR/$plugin"
-gate acknowledge-rescan "$operation" "$plugin" shell-one 1 >/dev/null
+gate acknowledge-rescan "$operation" "$plugin" shell-one 1 1 "$PLUGIN_DIR/$plugin" >/dev/null
 [[ $(jq -r '.state + ":" + .rescan.shellInstance + ":" + (.rescan.generation|tostring)' "$gate_file") == RESCAN_ACKNOWLEDGED:shell-one:1 ]]
+rescanned_sha=$(sha256sum "$gate_file")
+rescanned_replay=$(gate install "$operation" "$plugin")
+[[ $(jq -r '.status + ":" + .gate.state + ":" + (.gate.rescan.generation|tostring)' <<<"$rescanned_replay") == already-gated:RESCAN_ACKNOWLEDGED:1 ]]
+[[ $(sha256sum "$gate_file") == "$rescanned_sha" ]]
 gate authorize-release "$operation" "$plugin" shell-one 1 7 user "$HOME_DIR/.config/omarchy/shell.json" \
   sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null
 [[ $(jq -r .state "$gate_file") == RELEASE_AUTHORIZED ]]
+authorized_sha=$(sha256sum "$gate_file")
+authorized_replay=$(gate install "$operation" "$plugin")
+[[ $(jq -r '.status + ":" + .gate.state + ":" + (.gate.release.configurationEpoch|tostring)' <<<"$authorized_replay") == already-gated:RELEASE_AUTHORIZED:7 ]]
+[[ $(sha256sum "$gate_file") == "$authorized_sha" ]]
+if gate authorize-release "$operation" "$plugin" shell-one 1 7 default "$HOME_DIR/.config/omarchy/shell.json" \
+  sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null 2>&1; then
+  printf 'not ok - authorized replay accepted a different configuration source\n' >&2; exit 1
+fi
+if gate authorize-release "$operation" "$plugin" shell-one 1 7 user "$HOME_DIR/.config/omarchy/shell.json" \
+  sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa unreferenced >/dev/null 2>&1; then
+  printf 'not ok - authorized replay accepted a different reference projection\n' >&2; exit 1
+fi
+[[ $(sha256sum "$gate_file") == "$authorized_sha" ]]
+printf 'ok - authorized replay revalidates all supplied authority without rewriting the gate\n'
 restart=$(gate inventory)
 [[ $(jq -r '.gates[0].record.state' <<<"$restart") == RELEASE_AUTHORIZED ]]
+printf 'ok - exact retries reconstruct every durable gate state without rewriting it\n'
 printf 'ok - tree-bound rescan and release evidence remain blocking after restart\n'
 
 baseline=$(sha256sum "$gate_file")
-if gate acknowledge-rescan "$operation" "$plugin" other-shell 2 >/dev/null 2>&1; then
+if gate acknowledge-rescan "$operation" "$plugin" other-shell 2 2 "$PLUGIN_DIR/$plugin" >/dev/null 2>&1; then
   printf 'not ok - stale rescan replaced gate\n' >&2; exit 1
 fi
 [[ $(sha256sum "$gate_file") == "$baseline" ]]
@@ -106,9 +129,47 @@ retained_again=$(gate retain-release "$operation" "$plugin" shell-one 1)
 [[ $(jq -r '.status + ":" + .state' <<<"$retained_again") == release-retained:UNLOAD_ACKNOWLEDGED ]]
 printf 'ok - interrupted release returns durably and idempotently to a blocking rescan state\n'
 
+race_plugin=acme.gate-race
+race_source="$TEST_ROOT/race-source"
+race_operation_a=40000000-0000-4000-8000-000000000002
+race_operation_b=40000000-0000-4000-8000-000000000003
+make_plugin "$race_source" "$race_plugin"
+stage "$race_operation_a" "$race_plugin" "$race_source"
+stage "$race_operation_b" "$race_plugin" "$race_source"
+mkfifo "$TEST_ROOT/gate-race-ready" "$TEST_ROOT/gate-race-resume"
+(
+  set +e
+  OMARCHY_PLUGIN_TREE_TEST_HOOK=after-gate-file-sync:gate-install \
+  OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/gate-race-ready" \
+  OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/gate-race-resume" \
+    gate install "$race_operation_a" "$race_plugin" \
+      >"$TEST_ROOT/gate-race-a.out" 2>"$TEST_ROOT/gate-race-a.err"
+  printf '%s\n' "$?" >"$TEST_ROOT/gate-race-a.status"
+) &
+race_a_pid=$!
+[[ $(cat "$TEST_ROOT/gate-race-ready") == after-gate-file-sync:gate-install ]]
+set +e
+gate install "$race_operation_b" "$race_plugin" \
+  >"$TEST_ROOT/gate-race-b.out" 2>"$TEST_ROOT/gate-race-b.err"
+race_b_status=$?
+set -e
+printf x >"$TEST_ROOT/gate-race-resume"
+wait "$race_a_pid"
+race_a_status=$(<"$TEST_ROOT/gate-race-a.status")
+(( (race_a_status == 0 ? 1 : 0) + (race_b_status == 0 ? 1 : 0) == 1 )) || {
+  printf 'not ok - different operations both published one shared plugin gate\n' >&2
+  exit 1
+}
+if (( race_a_status == 0 )); then
+  grep -qF plugin-gated-by-another-operation "$TEST_ROOT/gate-race-b.err"
+else
+  grep -qF plugin-gated-by-another-operation "$TEST_ROOT/gate-race-a.err"
+fi
+printf 'ok - canonical per-plugin lock admits exactly one operation publisher\n'
+
 chmod 0644 "$gate_file"
 invalid_inventory=$(gate inventory)
-[[ $(jq -r '.status + ":" + (.gates[0].valid|tostring)' <<<"$invalid_inventory") == ok:false ]]
+[[ $(jq -r --arg plugin "$plugin" '.status + ":" + ((.gates[] | select(.pluginId == $plugin) | .valid)|tostring)' <<<"$invalid_inventory") == ok:false ]]
 chmod 0600 "$gate_file"
 printf x >"$STATE/gates/unknown"
 global_inventory=$(gate inventory)

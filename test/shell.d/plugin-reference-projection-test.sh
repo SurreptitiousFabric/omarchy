@@ -35,14 +35,16 @@ JS
 eligibility=$(<"$ROOT/shell/services/PluginEligibility.qml")
 [[ $(grep -c '!releaseBindingCurrent(' <<<"$eligibility") == 3 ]] ||
   fail "release rechecks the complete binding before and after asynchronous phases"
-[[ $(grep -c 'Number(registryGenerationProvider()) === Number(command.generation)' <<<"$eligibility") == 1 ]] ||
+[[ $(grep -c 'registryBindingCurrent(' <<<"$eligibility") -ge 3 ]] ||
+  fail "release uses the shared current scan authority before and across asynchronous phases"
+grep -F 'Number(current.generation) === Number(generation)' <<<"$eligibility" >/dev/null ||
   fail "the shared release binding compares current registry generation"
-grep -F 'Number(registryGenerationProvider()) !== Number(gateRecord.generation)' <<<"$eligibility" >/dev/null ||
-  fail "release rejects a stale gated-rescan generation before projection"
+grep -F 'Number(current.scanEpoch) === Number(scanEpoch)' <<<"$eligibility" >/dev/null ||
+  fail "the shared release binding rejects a scan that started after acknowledgement"
 
-without_generation=${eligibility//Number(registryGenerationProvider()) !== Number(command.generation)/false}
-[[ $(grep -c 'registryGenerationProvider()) !== Number(command.generation)' <<<"$without_generation" || true) == 0 ]] ||
-  fail "generation negative control removes the release guard"
+without_generation=${eligibility//Number(current.generation) === Number(generation)/true}
+[[ $(grep -c 'Number(current.generation) === Number(generation)' <<<"$without_generation" || true) == 0 ]] ||
+  fail "generation negative control removes the current-generation guard"
 
 pass "release remains bound to the current registry generation"
 

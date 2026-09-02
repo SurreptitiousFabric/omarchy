@@ -458,22 +458,29 @@ expect_failure manual-attention stage "$missing_operation" acme.state-test "$mis
 [[ $(jq -r .state "$STATE/journals/$missing_operation.journal") == MANUAL_ATTENTION ]]
 printf 'ok - durable STAGED contradiction becomes transaction-level manual attention\n'
 
-plugin_a_hash=$(printf acme.state-test | "$HELPER" domain-hash omarchy-plugin-transaction-plugin-lock/v1)
-plugin_b_hash=$(printf other.state-test | "$HELPER" domain-hash omarchy-plugin-transaction-plugin-lock/v1)
-coproc PLUGIN_LOCK_A { "$HELPER" plugin-lock "$STATE" "$plugin_a_hash"; }
+plugin_a=acme.state-test
+plugin_b=other.state-test
+expected_plugin_a_lock=$(printf 'omarchy-plugin-transaction-plugin-lock/v1\0%s' "$plugin_a" | sha256sum | cut -d' ' -f1)
+OMARCHY_PLUGIN_TREE_TEST_EINTR_LOCK_READ=1 \
+  "$HELPER" plugin-lock "$STATE" "$plugin_a" </dev/null >"$TEST_ROOT/plugin-eintr.out"
+grep -qF locked "$TEST_ROOT/plugin-eintr.out"
+[[ -f $STATE/locks/plugins/$expected_plugin_a_lock ]]
+coproc PLUGIN_LOCK_A { "$HELPER" plugin-lock "$STATE" "$plugin_a"; }
 lock_pid=$PLUGIN_LOCK_A_PID
 IFS= read -r lock_ready <&"${PLUGIN_LOCK_A[0]}"
 [[ $lock_ready == locked ]]
-if "$HELPER" plugin-lock "$STATE" "$plugin_a_hash" </dev/null >"$TEST_ROOT/plugin-busy.out" 2>"$TEST_ROOT/plugin-busy.err"; then
+if "$HELPER" plugin-lock "$STATE" "$plugin_a" </dev/null >"$TEST_ROOT/plugin-busy.out" 2>"$TEST_ROOT/plugin-busy.err"; then
   printf 'not ok - same plugin lock was acquired twice\n' >&2; exit 1
 fi
 grep -qF plugin-busy "$TEST_ROOT/plugin-busy.err"
-"$HELPER" plugin-lock "$STATE" "$plugin_b_hash" </dev/null >"$TEST_ROOT/plugin-other.out"
+"$HELPER" plugin-lock "$STATE" "$plugin_b" </dev/null >"$TEST_ROOT/plugin-other.out"
 grep -qF locked "$TEST_ROOT/plugin-other.out"
 lock_input_fd=${PLUGIN_LOCK_A[1]}
 exec {lock_input_fd}>&-
 wait "$lock_pid"
 printf 'ok - plugin lifecycle locks conflict per plugin and isolate unrelated plugins\n'
+printf 'ok - plugin lifecycle lock key follows the independent domain-separated vector\n'
+printf 'ok - interrupted lock-holder reads retry without releasing authority\n'
 
 # The only O-5 seam that needs both locks acquires the blocking operation lock
 # first and the nonblocking plugin lifecycle lock second.
@@ -486,7 +493,7 @@ exec {ordered_output_fd}<>"$TEST_ROOT/ordered-output"
   OMARCHY_PLUGIN_TREE_TEST_HOOK=after-ordered-operation-lock \
   OMARCHY_PLUGIN_TREE_TEST_READY_FIFO="$TEST_ROOT/ordered-ready" \
   OMARCHY_PLUGIN_TREE_TEST_RESUME_FIFO="$TEST_ROOT/ordered-resume" \
-    "$HELPER" ordered-lock "$STATE" "$ordered_operation" "$plugin_a_hash" \
+    "$HELPER" ordered-lock "$STATE" "$ordered_operation" "$plugin_a" \
     <"$TEST_ROOT/ordered-hold" >"$TEST_ROOT/ordered-output" 2>"$TEST_ROOT/ordered.err"
 ) &
 ordered_pid=$!
@@ -495,11 +502,11 @@ if flock -n "$STATE/locks/operations/$ordered_operation.lock" true; then
   printf 'not ok - ordered seam did not hold operation lock first\n' >&2; exit 1
 fi
 # The plugin lock remains available until the operation-lock barrier releases.
-"$HELPER" plugin-lock "$STATE" "$plugin_a_hash" </dev/null >"$TEST_ROOT/ordered-plugin-before.out"
+"$HELPER" plugin-lock "$STATE" "$plugin_a" </dev/null >"$TEST_ROOT/ordered-plugin-before.out"
 printf x >"$TEST_ROOT/ordered-resume"
 IFS= read -r ordered_ready <&"$ordered_output_fd"
 [[ $ordered_ready == locked-operation-then-plugin ]]
-if "$HELPER" plugin-lock "$STATE" "$plugin_a_hash" </dev/null >/dev/null 2>"$TEST_ROOT/ordered-busy.err"; then
+if "$HELPER" plugin-lock "$STATE" "$plugin_a" </dev/null >/dev/null 2>"$TEST_ROOT/ordered-busy.err"; then
   printf 'not ok - ordered seam did not hold plugin lock second\n' >&2; exit 1
 fi
 grep -qF plugin-busy "$TEST_ROOT/ordered-busy.err"

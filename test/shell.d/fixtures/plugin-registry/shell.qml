@@ -442,6 +442,40 @@ ShellRoot {
     root.assertEqual(registry.localPluginIdForPath(cloneBase + "/.git/index"), "", "plugin git metadata is ignored")
     root.assertEqual(registry.localPluginIdForPath(registry.pluginsDir + "/.clone.abc123/manifest.json"), "", "hidden staging and backup dirs are ignored")
 
+    var beforeFailedScan = JSON.stringify(registry.installedPlugins)
+    registry.parseScanOutput(block("thirdparty", "/third/failed",
+      manifest("third.failed", ["service"], { service: "Service.qml" })), 47)
+    root.assertEqual(JSON.stringify(registry.installedPlugins), beforeFailedScan,
+      "a failed scan cannot replace the selected registry")
+    root.assertTrue(registry.lastScanOutcome && registry.lastScanOutcome.success === false,
+      "scan exit status is part of the authoritative outcome")
+
+    var duplicateScan = ""
+    var duplicateOperation = "71000000-0000-4000-8000-000000000001"
+    duplicateScan += block("thirdparty", "/third/duplicate-a",
+      manifest("third.duplicate", ["service"], { service: "Service.qml" }))
+    duplicateScan += block("thirdparty", "/third/duplicate-b",
+      manifest("third.duplicate", ["service"], { service: "Service.qml" }))
+    registry.parseScanOutput(duplicateScan, 0,
+      { gated: true, operationId: duplicateOperation, pluginId: "third.duplicate" }, 41)
+    root.assertTrue(!has("third.duplicate"), "duplicate third-party ids are non-loadable")
+    root.assertDeepEqual(registry.lastScanOutcome.thirdPartySources["third.duplicate"],
+      ["/third/duplicate-a", "/third/duplicate-b"], "duplicate source directories remain visible")
+    root.assertEqual(registry.gatedScanBinding(duplicateOperation, "third.duplicate",
+      "/third/duplicate-a").status,
+      "duplicate-plugin-id", "a duplicate target cannot acknowledge gated discovery")
+
+    var exactScan = block("thirdparty", "/third/exact",
+      manifest("third.exact", ["service"], { service: "Service.qml" }))
+    var exactOperation = "71000000-0000-4000-8000-000000000002"
+    registry.parseScanOutput(exactScan, 0,
+      { gated: true, operationId: exactOperation, pluginId: "third.exact" }, 42)
+    var exactBinding = registry.gatedScanBinding(exactOperation, "third.exact", "/third/exact")
+    root.assertTrue(exactBinding.valid === true, "one exact selected source is bindable")
+    root.assertEqual(exactBinding.sourceDirectory, "/third/exact", "binding returns the selected source")
+    root.assertEqual(registry.gatedScanBinding(exactOperation, "third.exact", "/third/other").status,
+      "registry-source-mismatch", "a different destination cannot acknowledge discovery")
+
     root.assertTrue(changeCount > 0, "registry emits change notifications")
     writeResult()
   }
@@ -455,6 +489,7 @@ ShellRoot {
       var next = JSON.parse(JSON.stringify(root.config || {}))
       mutator(next)
       root.config = next
+      return true
     }
     onPluginsChanged: root.changeCount++
   }
