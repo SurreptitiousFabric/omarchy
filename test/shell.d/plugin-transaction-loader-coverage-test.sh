@@ -41,6 +41,33 @@ assert(/var comp = Qt\.createComponent\(url, Component\.Asynchronous\)/.test(she
   'bar-widget dynamic component creation is inventoried')
 assert(/id: registryLoader[\s\S]{0,180}?sourceComponent: slot\.registered \? slot\.registryComponent : null/.test(bar),
   'bar slot component instantiation is inventoried')
+
+assert(/property var _pendingServices/.test(shell)
+  && /owner\.token !== token \|\| owner\.component !== comp/.test(shell),
+  'service completion requires ownership of its recorded pending component')
+assert(/pendingWidget\.component\.destroy\(\)/.test(shell)
+  && /owner\.loadToken !== token \|\| owner\.component !== comp/.test(shell),
+  'bar-widget unload invalidates its component and stale completion token')
+assert(/pluginBarLoader\.status === Loader\.Loading/.test(shell),
+  'selected-bar Loading state blocks unload acknowledgement')
+assert(/barHostRetainsPlugin\(key\)/.test(shell)
+  && /registryLoader\.status === Loader\.Loading/.test(bar),
+  'per-screen retained or Loading widget loaders block acknowledgement')
+
+function lifecycleGuardsPresent(shellText, barText) {
+  return /owner\.token !== token \|\| owner\.component !== comp/.test(shellText)
+    && /owner\.loadToken !== token \|\| owner\.component !== comp/.test(shellText)
+    && /barHostRetainsPlugin\(key\)/.test(shellText)
+    && /registryLoader\.status === Loader\.Loading/.test(barText)
+}
+
+assert(lifecycleGuardsPresent(shell, bar), 'complete lifecycle guard is accepted')
+assert(!lifecycleGuardsPresent(shell.replace('owner.token !== token || owner.component !== comp', 'false'), bar),
+  'negative control detects omitted service token ownership')
+assert(!lifecycleGuardsPresent(shell.replace('owner.loadToken !== token || owner.component !== comp', 'false'), bar),
+  'negative control detects stale widget completion permission')
+assert(!lifecycleGuardsPresent(shell.replace('&& !barHostRetainsPlugin(key)', ''), bar),
+  'negative control detects omitted per-screen retention')
 JS
 
 pass "third-party loader creation sites match the O-6 inventory"

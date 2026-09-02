@@ -276,12 +276,31 @@ ShellRoot {
   Loader {
     id: pluginBarLoader
 
+    property string retainedPluginId: ""
     active: !shell.pluginReloading && shell.activeBarId !== shell.defaultBarId && shell.activeBarSourceUrl !== ""
     source: shell.activeBarId !== shell.defaultBarId ? shell.activeBarSourceUrl : ""
     asynchronous: true
-    onLoaded: shell.configureBar(item, shell.activeBarManifest)
-    onActiveChanged: if (!active) shell.bar = null
+    onSourceChanged: {
+      var previous = retainedPluginId
+      if (String(source || "") !== "") retainedPluginId = shell.activeBarId
+      shell.notifyPluginLifecycleChanged(previous)
+      shell.notifyPluginLifecycleChanged(retainedPluginId)
+    }
+    onLoaded: {
+      shell.configureBar(item, shell.activeBarManifest)
+      shell.notifyPluginLifecycleChanged(retainedPluginId)
+    }
+    onActiveChanged: {
+      if (!active) shell.bar = null
+      shell.notifyPluginLifecycleChanged(retainedPluginId)
+    }
+    onItemChanged: {
+      var previous = retainedPluginId
+      if (item === null && status !== Loader.Loading && String(source || "") === "") retainedPluginId = ""
+      shell.notifyPluginLifecycleChanged(previous)
+    }
     onStatusChanged: {
+      shell.notifyPluginLifecycleChanged(retainedPluginId)
       if (status === Loader.Error) {
         var detail = errorString && errorString() ? errorString() : ""
         console.warn("bar option " + shell.activeBarId + " failed to load, falling back to " + shell.defaultBarId + ":", detail)
@@ -300,7 +319,65 @@ ShellRoot {
     visible: false
   }
 
+  Component {
+    id: serviceOwnerComponent
+
+    Item {
+      property string pluginId: ""
+      property int loadToken: 0
+      visible: false
+      Component.onDestruction: shell.completeServiceOwnerDestruction(pluginId, loadToken)
+    }
+  }
+
   property var _services: ({})
+  property var _pendingServices: ({})
+  property var _serviceOwners: ({})
+  property int pluginLoadGeneration: 0
+  property var barHosts: []
+
+  function nextPluginLoadGeneration() {
+    pluginLoadGeneration++
+    return pluginLoadGeneration
+  }
+
+  function registerBarHost(host) {
+    if (!host || barHosts.indexOf(host) !== -1) return
+    var next = barHosts.slice()
+    next.push(host)
+    barHosts = next
+    pluginEligibility.verifyPendingUnloads()
+  }
+
+  function unregisterBarHost(host) {
+    barHosts = barHosts.filter(function(item) { return item !== host })
+    pluginEligibility.verifyPendingUnloads()
+  }
+
+  function notifyPluginLifecycleChanged(pluginId) {
+    pluginEligibility.verifyPendingUnload(String(pluginId || ""))
+  }
+
+  function clearPendingService(pluginId, token) {
+    var key = String(pluginId)
+    var owner = _pendingServices[key]
+    if (!owner || (token !== undefined && owner.token !== token)) return false
+    var next = ({})
+    for (var pendingKey in _pendingServices) if (pendingKey !== key) next[pendingKey] = _pendingServices[pendingKey]
+    _pendingServices = next
+    notifyPluginLifecycleChanged(key)
+    return true
+  }
+
+  function completeServiceOwnerDestruction(pluginId, token) {
+    var key = String(pluginId)
+    var owner = _serviceOwners[key]
+    if (!owner || owner.token !== token) return
+    var next = ({})
+    for (var ownerKey in _serviceOwners) if (ownerKey !== key) next[ownerKey] = _serviceOwners[ownerKey]
+    _serviceOwners = next
+    notifyPluginLifecycleChanged(key)
+  }
 
   function serviceFor(pluginId) {
     return _services[String(pluginId)] || null
@@ -313,6 +390,7 @@ ShellRoot {
   function ensureService(pluginId) {
     var key = String(pluginId)
     if (_services[key]) return _services[key]
+    if (_pendingServices[key]) return null
     var manifest = pluginRegistry && pluginRegistry.installedPlugins
       ? pluginRegistry.installedPlugins[key] : null
     if (!manifest) return null
@@ -321,19 +399,45 @@ ShellRoot {
     var url = pluginRegistry.entryPointUrl(manifest, "service")
     if (!url) return null
 
+    var token = nextPluginLoadGeneration()
     var comp = Qt.createComponent(url, Component.PreferSynchronous)
+    var pendingNext = ({})
+    for (var pendingKey in _pendingServices) pendingNext[pendingKey] = _pendingServices[pendingKey]
+    pendingNext[key] = { token: token, component: comp, url: url }
+    _pendingServices = pendingNext
     function finalize() {
+      var owner = _pendingServices[key]
+      if (!owner || owner.token !== token || owner.component !== comp) {
+        if (typeof comp.destroy === "function") comp.destroy()
+        return
+      }
       if (!pluginRegistry.isEnabled(key)
           || pluginRegistry.entryPointUrl(manifest, "service") !== url) {
+        clearPendingService(key, token)
         if (typeof comp.destroy === "function") comp.destroy()
         return
       }
       if (comp.status !== Component.Ready) {
         console.warn("service plugin load failed for " + key + ": " + comp.errorString())
+        clearPendingService(key, token)
+        if (typeof comp.destroy === "function") comp.destroy()
         return
       }
-      var inst = comp.createObject(serviceHost)
+      var serviceOwner = serviceOwnerComponent.createObject(serviceHost, { pluginId: key, loadToken: token })
+      if (!serviceOwner) {
+        clearPendingService(key, token)
+        if (typeof comp.destroy === "function") comp.destroy()
+        console.warn("service plugin owner creation returned null for", key)
+        return
+      }
+      var owners = ({})
+      for (var ownerKey in _serviceOwners) owners[ownerKey] = _serviceOwners[ownerKey]
+      owners[key] = { token: token, owner: serviceOwner }
+      _serviceOwners = owners
+      var inst = comp.createObject(serviceOwner)
       if (!inst) {
+        serviceOwner.destroy()
+        clearPendingService(key, token)
         console.warn("service plugin createObject returned null for", key)
         return
       }
@@ -346,6 +450,7 @@ ShellRoot {
       for (var sk in _services) snext[sk] = _services[sk]
       snext[key] = inst
       _services = snext
+      clearPendingService(key, token)
     }
     if (comp.status === Component.Loading) {
       comp.statusChanged.connect(finalize)
@@ -386,12 +491,21 @@ ShellRoot {
       if (inst && typeof inst.destroy === "function") inst.destroy()
     }
     _services = ({})
+    for (var ownerId in _serviceOwners) {
+      var serviceOwner = _serviceOwners[ownerId]
+      if (serviceOwner && serviceOwner.owner && typeof serviceOwner.owner.destroy === "function") serviceOwner.owner.destroy()
+    }
   }
 
   function unloadExactPlugin(pluginId) {
     var key = String(pluginId)
+    var pendingService = _pendingServices[key]
+    if (pendingService && pendingService.component && typeof pendingService.component.destroy === "function") pendingService.component.destroy()
+    if (pendingService) clearPendingService(key, pendingService.token)
     var service = _services[key]
-    if (service && typeof service.destroy === "function") service.destroy()
+    var serviceOwner = _serviceOwners[key]
+    if (serviceOwner && serviceOwner.owner && typeof serviceOwner.owner.destroy === "function") serviceOwner.owner.destroy()
+    else if (service && typeof service.destroy === "function") service.destroy()
     if (_services[key]) {
       var services = ({})
       for (var serviceId in _services) if (serviceId !== key) services[serviceId] = _services[serviceId]
@@ -407,23 +521,39 @@ ShellRoot {
     pendingPayloads = pending
     panelEntries = computePanelEntries()
 
+    var pendingWidget = pluginWidgetComponents[key]
+    if (pendingWidget && pendingWidget.component && typeof pendingWidget.component.destroy === "function") pendingWidget.component.destroy()
     barWidgetRegistry.unregister(key)
     setPluginWidgetComponent(key, null)
     pluginRegistry.registryRevision++
     pluginRegistry.pluginsChanged()
+    notifyPluginLifecycleChanged(key)
   }
 
   function isExactPluginUnloaded(pluginId) {
     var key = String(pluginId)
-    var selectedPluginBarRetained = activeBarManifest && String(activeBarManifest.id || "") === key
-      && pluginBarLoader.item !== null
+    var selectedPluginBarRetained = pluginBarLoader.retainedPluginId === key
+      && (pluginBarLoader.active || String(pluginBarLoader.source || "") !== ""
+        || pluginBarLoader.item !== null || pluginBarLoader.status === Loader.Loading)
     var panel = panelLoaders[key]
-    var panelRetained = panel && (panel.item !== null || panel.status === Loader.Loading)
+    var panelRetained = panel && (panel.active || panel.source !== ""
+      || panel.item !== null || panel.status === Loader.Loading)
     return !selectedPluginBarRetained
       && !_services[key]
+      && !_pendingServices[key]
+      && !_serviceOwners[key]
       && !panelRetained
       && !barWidgetRegistry.has(key)
       && !pluginWidgetComponents[key]
+      && !barHostRetainsPlugin(key)
+  }
+
+  function barHostRetainsPlugin(pluginId) {
+    for (var index = 0; index < barHosts.length; index++) {
+      var host = barHosts[index]
+      if (host && typeof host.retainsPluginWidget === "function" && host.retainsPluginWidget(pluginId)) return true
+    }
+    return false
   }
 
   Connections {
@@ -594,6 +724,7 @@ ShellRoot {
     next[pluginId] = loader
     panelLoaders = next
     deliverIfLoaded(pluginId)
+    notifyPluginLifecycleChanged(pluginId)
   }
 
   function unregisterPanelLoader(pluginId) {
@@ -601,6 +732,7 @@ ShellRoot {
     var next = ({})
     for (var k in panelLoaders) if (k !== pluginId) next[k] = panelLoaders[k]
     panelLoaders = next
+    notifyPluginLifecycleChanged(pluginId)
   }
 
   function unloadPanels() {
@@ -713,9 +845,11 @@ ShellRoot {
           // state off `service`. Hand them the matching singleton if one was
           // loaded.
           if ("service" in item) item.service = shell.serviceFor(panelEntry.pluginId)
-          shell.registerPanelLoader(panelEntry.pluginId, this)
+          shell.notifyPluginLifecycleChanged(panelEntry.pluginId)
         }
+        onItemChanged: shell.notifyPluginLifecycleChanged(panelEntry.pluginId)
         onStatusChanged: {
+          shell.notifyPluginLifecycleChanged(panelEntry.pluginId)
           if (status === Loader.Error) {
             // Loader.errorString() reflects the source-load failure even when
             // sourceComponent is null. Surface both so the user sees something
@@ -726,8 +860,9 @@ ShellRoot {
             shell.hide(panelEntry.pluginId)
           }
         }
-        Component.onDestruction: shell.unregisterPanelLoader(panelEntry.pluginId)
       }
+      Component.onCompleted: shell.registerPanelLoader(pluginId, panelLoader)
+      Component.onDestruction: shell.unregisterPanelLoader(pluginId)
     }
   }
 
@@ -781,7 +916,7 @@ ShellRoot {
       // finishes. Starting a second one produces a second Component for the
       // same widget, and swapping a slot's component rebuilds its item —
       // briefly running two of the widget, each registering its IPC handler.
-      if (existing && existing.url === url && !existing.component) continue
+      if (existing && existing.url === url && existing.pending === true) continue
 
       // If the component URL is unchanged, just refresh the metadata in
       // place. We can't skip this even when the URL matches: manifests can
@@ -865,6 +1000,7 @@ ShellRoot {
     for (var k in pluginWidgetComponents) if (k !== registryKey) next[k] = pluginWidgetComponents[k]
     if (entry) next[registryKey] = entry
     pluginWidgetComponents = next
+    notifyPluginLifecycleChanged(registryKey)
   }
 
   function loadPluginWidget(registryKey, url, meta) {
@@ -872,10 +1008,15 @@ ShellRoot {
     // asynchronous and syncPluginWidgets runs several times while the shell
     // starts, so without a marker the later passes cannot tell a load in
     // flight from one that never happened.
-    setPluginWidgetComponent(registryKey, { url: url, component: null })
-
+    var token = nextPluginLoadGeneration()
     var comp = Qt.createComponent(url, Component.Asynchronous)
+    setPluginWidgetComponent(registryKey, { url: url, component: comp, loadToken: token, pending: true })
     function finalize() {
+      var owner = pluginWidgetComponents[registryKey]
+      if (!owner || owner.loadToken !== token || owner.component !== comp) {
+        if (typeof comp.destroy === "function") comp.destroy()
+        return
+      }
       var currentManifest = shell.pluginRegistry.installedPlugins[registryKey]
       if (!shell.pluginRegistry.isEnabled(registryKey)
           || shell.pluginRegistry.entryPointUrl(currentManifest, "barWidget") !== url) {
@@ -885,7 +1026,7 @@ ShellRoot {
       }
       if (comp.status === Component.Ready) {
         shell.barWidgetRegistry.register(registryKey, comp, meta)
-        shell.setPluginWidgetComponent(registryKey, { url: url, component: comp, metadata: meta })
+        shell.setPluginWidgetComponent(registryKey, { url: url, component: comp, metadata: meta, loadToken: token, pending: false })
       } else if (comp.status === Component.Error) {
         console.warn("Plugin widget " + registryKey + " failed: " + comp.errorString())
         // Drop the claim so a later rescan can retry.

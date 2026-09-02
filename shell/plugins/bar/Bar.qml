@@ -101,6 +101,18 @@ Item {
   property var clickTargets: []
   property var moduleSlots: []
 
+  Component.onDestruction: if (shell && typeof shell.unregisterBarHost === "function") shell.unregisterBarHost(root)
+
+  function retainsPluginWidget(pluginId) {
+    var key = root.canonicalWidgetId(String(pluginId || ""))
+    for (var index = 0; index < moduleSlots.length; index++) {
+      var slot = moduleSlots[index]
+      if (!slot || root.canonicalWidgetId(slot.moduleName) !== key) continue
+      if (slot.registryLoaderRetained()) return true
+    }
+    return false
+  }
+
   function registerClickTarget(target) {
     if (!target || clickTargets.indexOf(target) !== -1) return
     var next = clickTargets.slice()
@@ -118,11 +130,13 @@ Item {
     var next = moduleSlots.slice()
     next.push(slot)
     moduleSlots = next
+    if (shell && typeof shell.notifyPluginLifecycleChanged === "function") shell.notifyPluginLifecycleChanged(slot.moduleName)
   }
 
   function unregisterModuleSlot(slot) {
     var next = moduleSlots.filter(function(item) { return item !== slot })
     moduleSlots = next
+    if (shell && typeof shell.notifyPluginLifecycleChanged === "function") shell.notifyPluginLifecycleChanged(slot.moduleName)
   }
 
   function debugBarGeometry() {
@@ -579,7 +593,10 @@ Item {
     return source ? Util.fileUrl(source) : ""
   }
 
-  Component.onCompleted: applyBarConfig()
+  Component.onCompleted: {
+    if (shell && typeof shell.registerBarHost === "function") shell.registerBarHost(root)
+    applyBarConfig()
+  }
 
   // Revealing the indicators widens their section, which can slide a neighbour
   // under a stationary pointer. Collapsing on that un-hover would move it back
@@ -1560,6 +1577,9 @@ Item {
     readonly property bool qmlCustom: customType === "qml"
     readonly property bool commandCustom: customType === "command"
     readonly property bool registered: registryComponent !== null
+    function registryLoaderRetained() {
+      return registryLoader.item !== null || registryLoader.status === Loader.Loading
+    }
     readonly property var activeItem: {
       if (registered) return registryLoader.item
       if (qmlCustom) return qmlLoader.item
@@ -1611,7 +1631,10 @@ Item {
       onLoaded: {
         slot.injectProps()
         Qt.callLater(slot.injectProps)
+        if (root.shell && typeof root.shell.notifyPluginLifecycleChanged === "function") root.shell.notifyPluginLifecycleChanged(slot.moduleName)
       }
+      onItemChanged: if (root.shell && typeof root.shell.notifyPluginLifecycleChanged === "function") root.shell.notifyPluginLifecycleChanged(slot.moduleName)
+      onStatusChanged: if (root.shell && typeof root.shell.notifyPluginLifecycleChanged === "function") root.shell.notifyPluginLifecycleChanged(slot.moduleName)
     }
 
     Loader {
