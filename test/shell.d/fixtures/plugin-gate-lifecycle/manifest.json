@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "acme.lifecycle",
+  "name": "Lifecycle fixture",
+  "version": "1.0.0",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  }
+}

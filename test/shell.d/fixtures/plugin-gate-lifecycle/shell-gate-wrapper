@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+
+real_helper=${OMARCHY_LIFECYCLE_REAL_GATE:?missing real gate helper}
+action=${1:-}
+
+hold_at() {
+  local selector=$1 barrier=$2 resume=$3
+  [[ -e $selector ]] || return 0
+  : >"$barrier"
+  read -r _ <"$resume"
+}
+
+if [[ $action == projection-digest ]]; then
+  output=$("$real_helper" "$@")
+  hold_at "$OMARCHY_LIFECYCLE_HOLD_PROJECTION" "$OMARCHY_LIFECYCLE_PROJECTION_READY" "$OMARCHY_LIFECYCLE_PROJECTION_RESUME"
+  printf '%s\n' "$output"
+  exit 0
+fi
+
+if [[ $action == authorize-release ]]; then
+  hold_at "$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_BEFORE" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_READY" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME"
+  output=$("$real_helper" "$@")
+  hold_at "$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER" "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY" "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME"
+  printf '%s\n' "$output"
+  exit 0
+fi
+
+exec "$real_helper" "$@"

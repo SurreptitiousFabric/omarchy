@@ -17,15 +17,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-require_compositor "shell runtime smoke test"
-
-if ! command -v quickshell >/dev/null 2>&1; then
-  pass "quickshell not installed; skipping shell runtime smoke test"
-  exit 0
-fi
-
-require_command jq
-
 shell_ipc() {
   OMARCHY_PATH="$test_root" "$ROOT/bin/omarchy-shell" "$@"
 }
@@ -44,25 +35,83 @@ ipc_log_line=0
 
 max_ipc_collisions_since() {
   local first_line=$((ipc_log_line + 1))
-  sed -n "${first_line},\$p" "$1" |
-    grep -oE "another handler is registered for target [a-z.-]+" |
+  local last_line=$2
+  if [[ -n ${ipc_checkpoint_append_once:-} ]]; then
+    printf '%s\n' "$ipc_checkpoint_append_once" >>"$1"
+    ipc_checkpoint_append_once=""
+  fi
+  (( first_line <= last_line )) || return 0
+  sed -n "${first_line},${last_line}p" "$1" |
+    sed -nE 's/.*another handler is registered for target (.*)$/\1/p' |
     sort | uniq -c | sort -rn | head -1 | awk '{print $1}' || true
 }
 
 assert_widget_ipc_generation() {
   local description="$1"
-  local worst
-  worst=$(max_ipc_collisions_since "$log")
+  local worst frozen_line
+  frozen_line=$(wc -l <"$log")
+  worst=$(max_ipc_collisions_since "$log" "$frozen_line")
   worst=${worst:-0}
   if (( worst > screens - 1 )); then
     local first_line=$((ipc_log_line + 1))
-    sed -n "${first_line},\$p" "$log" |
+    sed -n "${first_line},${frozen_line}p" "$log" |
       grep "another handler is registered for target" |
       sed 's/^/  /' | head -20 >&2 || true
     fail_with_log "$description (saw $worst for $screens screen(s) in one lifecycle generation)"
   fi
-  ipc_log_line=$(wc -l <"$log")
+  ipc_log_line=$frozen_line
 }
+
+test_ipc_generation_parser() {
+  duplicate_probe="$TMPDIR/duplicate-ipc-generation.log"
+  for (( probe_index = 0; probe_index < screens; probe_index++ )); do
+    printf '%s\n' 'another handler is registered for target omarchy.fixture_1/test:probe with space'
+  done >"$duplicate_probe"
+  probe_worst=$(max_ipc_collisions_since "$duplicate_probe" "$(wc -l <"$duplicate_probe")")
+  (( probe_worst > screens - 1 )) || fail "IPC lifecycle assertion detects a same-generation duplicate"
+  pass "IPC lifecycle assertion detects a same-generation duplicate"
+
+  legacy_probe="$TMPDIR/legacy-checkpoint-ipc-generation.log"
+  printf '%s\n' 'another handler is registered for target omarchy.first' >"$legacy_probe"
+  legacy_segment=$(sed -n '1,$p' "$legacy_probe")
+  printf '%s\n' 'another handler is registered for target omarchy.skipped' >>"$legacy_probe"
+  legacy_checkpoint=$(wc -l <"$legacy_probe")
+  legacy_next=$(sed -n "$((legacy_checkpoint + 1)),\$p" "$legacy_probe")
+  [[ $legacy_segment != *omarchy.skipped* && $legacy_next != *omarchy.skipped* ]] ||
+    fail "legacy checkpoint negative control did not reproduce its skipped append"
+  pass "legacy checkpoint negative control reproduces the skipped-line window"
+
+  checkpoint_probe="$TMPDIR/checkpoint-ipc-generation.log"
+  printf '%s\n' 'another handler is registered for target omarchy.first' >"$checkpoint_probe"
+  checkpoint_boundary=$(wc -l <"$checkpoint_probe")
+  ipc_checkpoint_append_once='another handler is registered for target omarchy.Later_target/2:with space'
+  (( $(max_ipc_collisions_since "$checkpoint_probe" "$checkpoint_boundary") == 1 )) ||
+    fail "frozen IPC checkpoint analyses its bounded generation"
+  ipc_log_line=$checkpoint_boundary
+  (( $(max_ipc_collisions_since "$checkpoint_probe" "$(wc -l <"$checkpoint_probe")") == 1 )) ||
+    fail "warning appended after checkpoint remains for the next generation"
+  ipc_log_line=$(wc -l <"$checkpoint_probe")
+  next_worst=$(max_ipc_collisions_since "$checkpoint_probe" "$ipc_log_line")
+  [[ -z $next_worst ]] || fail "appended warning was analysed more than once"
+  ipc_log_line=0
+  pass "IPC lifecycle checkpoints analyse appended warnings exactly once"
+}
+
+if [[ ${OMARCHY_RUNTIME_SMOKE_CHECKPOINT_SELFTEST_ONLY:-0} == 1 ]]; then
+  TMPDIR=$(mktemp -d)
+  screens=${OMARCHY_RUNTIME_SMOKE_TEST_SCREENS:-2}
+  test_ipc_generation_parser
+  exit 0
+fi
+
+require_compositor "shell runtime smoke test"
+
+if ! command -v quickshell >/dev/null 2>&1; then
+  pass "quickshell not installed; skipping shell runtime smoke test"
+  exit 0
+fi
+
+require_command jq
 
 TMPDIR=$(mktemp -d)
 test_root="$TMPDIR/omarchy"
@@ -172,16 +221,7 @@ pass "shell IPC lists plugin metadata"
 screens=$(hyprctl -j monitors 2>/dev/null | jq 'length' 2>/dev/null || true)
 [[ $screens =~ ^[0-9]+$ ]] && (( screens > 0 )) || screens=1
 
-# Prove the generation-local assertion still rejects an actual duplicate on
-# one screen. Historical warnings from intentionally replaced generations are
-# not concurrent ownership and are checked in their own segments below.
-duplicate_probe="$TMPDIR/duplicate-ipc-generation.log"
-printf '%s\n' \
-  'another handler is registered for target omarchy.fixture' \
-  'another handler is registered for target omarchy.fixture' >"$duplicate_probe"
-probe_worst=$(max_ipc_collisions_since "$duplicate_probe")
-(( probe_worst > screens - 1 )) || fail "IPC lifecycle assertion detects a same-generation duplicate"
-pass "IPC lifecycle assertion detects a same-generation duplicate"
+test_ipc_generation_parser
 
 assert_widget_ipc_generation "startup creates one widget IPC owner per screen"
 pass "startup creates one widget IPC owner per screen"
