@@ -549,6 +549,22 @@ static bool simple_name(const char *name) {
          valid_utf8((const unsigned char *)name, length);
 }
 
+static bool third_party_plugin_id(const char *name) {
+  size_t length = strlen(name);
+  if (length == 0 || length > 128 || strstr(name, "..") != NULL ||
+      strncmp(name, "omarchy.", 8) == 0)
+    return false;
+  for (size_t index = 0; index < length; index++) {
+    unsigned char value = (unsigned char)name[index];
+    if (!((value >= 'A' && value <= 'Z') ||
+          (value >= 'a' && value <= 'z') ||
+          (value >= '0' && value <= '9') || value == '.' || value == '_' ||
+          value == '-'))
+      return false;
+  }
+  return true;
+}
+
 static void copy_snapshot(const char *source_path, const char *parent_path,
                           const char *name) {
   if (!simple_name(name))
@@ -725,6 +741,7 @@ static int open_private_state_root(const char *path) {
     free(copy);
   }
   ensure_private_directory_at(root, "journals");
+  ensure_private_directory_at(root, "gates");
   ensure_private_directory_at(root, "locks");
   int locks = openat(root, "locks",
                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -822,6 +839,71 @@ static void replace_journal(const char *state_path, const char *operation_id,
   if (transition_sync_fd(journals, "journal-parent", transition) < 0)
     reject_tree("journal-indeterminate", transition);
   close(journals);
+  close(state);
+}
+
+static void replace_gate(const char *state_path, const char *plugin_id,
+                         const char *input_path, const char *transition) {
+  if (!third_party_plugin_id(plugin_id))
+    reject_tree("invalid-plugin-id", plugin_id);
+  int state = open_private_state_root(state_path);
+  int gates = openat(state, "gates",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (gates < 0)
+    fail_io("open gates", state_path);
+  int input = open(input_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (input < 0)
+    fail_io("open gate input", input_path);
+  struct stat input_status;
+  if (fstat(input, &input_status) < 0)
+    fail_io("stat gate input", input_path);
+  if (!S_ISREG(input_status.st_mode) || input_status.st_nlink != 1)
+    reject_tree("invalid-gate-input", input_path);
+
+  char final_name[160];
+  char temporary_name[192];
+  int final_length = snprintf(final_name, sizeof(final_name), "%s.gate", plugin_id);
+  int temporary_length = snprintf(temporary_name, sizeof(temporary_name),
+                                  ".%s.gate.tmp.%ld.%ld", plugin_id,
+                                  (long)getpid(), (long)time(NULL));
+  if (final_length < 0 || (size_t)final_length >= sizeof(final_name) ||
+      temporary_length < 0 ||
+      (size_t)temporary_length >= sizeof(temporary_name))
+    reject_tree("gate-name-limit", plugin_id);
+
+  int temporary = openat(gates, temporary_name,
+                         O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                         0600);
+  if (temporary < 0)
+    fail_io("create temporary gate", temporary_name);
+  if (fchmod(temporary, 0600) < 0)
+    fail_io("set gate mode", temporary_name);
+  transition_hook("before-gate-write", transition);
+  copy_bounded_file(input, temporary, input_path);
+  close(input);
+  transition_hook("after-gate-write", transition);
+  if (transition_sync_fd(temporary, "gate-file", transition) < 0)
+    fail_io("sync gate file", temporary_name);
+  transition_hook("after-gate-file-sync", transition);
+  close(temporary);
+  if (renameat(gates, temporary_name, gates, final_name) < 0)
+    fail_io("replace gate", final_name);
+  transition_hook("after-gate-rename", transition);
+  if (transition_sync_fd(gates, "gate-parent", transition) < 0)
+    reject_tree("gate-indeterminate", transition);
+  close(gates);
+  close(state);
+}
+
+static void sync_gate_authority(const char *state_path) {
+  int state = open_private_state_root(state_path);
+  int gates = openat(state, "gates",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (gates < 0)
+    fail_io("open gates", state_path);
+  if (sync_fd(gates, "gate-reconciliation-parent") < 0)
+    fail_io("sync gate authority", state_path);
+  close(gates);
   close(state);
 }
 
@@ -1149,6 +1231,14 @@ int main(int argc, char **argv) {
     replace_journal(argv[2], argv[3], argv[4], argv[5]);
     return 0;
   }
+  if (argc == 6 && strcmp(argv[1], "gate-replace") == 0) {
+    replace_gate(argv[2], argv[3], argv[4], argv[5]);
+    return 0;
+  }
+  if (argc == 3 && strcmp(argv[1], "gate-sync") == 0) {
+    sync_gate_authority(argv[2]);
+    return 0;
+  }
   if (argc == 3 && strcmp(argv[1], "domain-hash") == 0) {
     print_domain_hash(argv[2]);
     return 0;
@@ -1179,6 +1269,7 @@ int main(int argc, char **argv) {
           "usage: %s identity ROOT | copy SOURCE PARENT NAME | prepare-import SOURCE STORE TEMPORARY | "
           "publish PARENT TEMPORARY COMPLETED | "
           "state-init STATE | journal-replace STATE OPERATION INPUT TRANSITION | "
+          "gate-replace STATE PLUGIN INPUT TRANSITION | gate-sync STATE | "
           "domain-hash DOMAIN | sync-directory PATH POINT | "
           "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "
           "plugin-lock STATE LOCK-NAME | ordered-lock STATE OPERATION LOCK-NAME | hash-equal EXPECTED\n",

@@ -24,7 +24,7 @@ The normalized request digest is SHA-256 over `omarchy-plugin-transaction-reques
 
 - `REQUEST_BOUND`: the immutable request, capability hash, and one exact deterministic operation-owned temporary slot are durable; no candidate identity or publication is claimed. Import creates and populates only that slot. A restart may remove and recreate that exact incomplete slot, but never scans for or removes another artifact. It may advance to `PUBLICATION_INTENT` or `MANUAL_ATTENTION`.
 - `PUBLICATION_INTENT`: the exact validated candidate identity and exact temporary/completed slots are durable before publication. It may advance to `STAGED`, `RECOVERY_REQUIRED`, or `MANUAL_ATTENTION`.
-- `STAGED`: the exact candidate is verified at the completed slot, candidate-store parent synchronization succeeded, and this journal state is durable. It has no O-5 transition.
+- `STAGED`: the exact candidate is verified at the completed slot, candidate-store parent synchronization succeeded, and this journal state is durable. It has no normal lifecycle transition in O-5. A later verification that proves the record and candidate contradictory may replace it with `MANUAL_ATTENTION`; that fail-closed corruption response is not normal transaction progression.
 - `RECOVERY_REQUIRED`: publication outcome is indeterminate and exact reconciliation is required. It may advance to `PUBLICATION_INTENT`, `STAGED`, or `MANUAL_ATTENTION`.
 - `MANUAL_ATTENTION`: exact reconciliation cannot establish a safe O-5 outcome, or corrupt/contradictory evidence was found. It has no automatic O-5 transition.
 

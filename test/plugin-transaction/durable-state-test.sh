@@ -49,7 +49,7 @@ stage() {
     OMARCHY_PLUGIN_EXPECTED_ACTIVE_IDENTITY="${TEST_ACTIVE_IDENTITY:-}" \
     OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_KIND="${TEST_CONFIG_KIND:-user}" \
     OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_IDENTITY="${TEST_CONFIG_IDENTITY:-test-user-config-v1}" \
-    OMARCHY_PLUGIN_EXPECTED_REFERENCE_PROJECTION="${TEST_PROJECTION:-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
+    OMARCHY_PLUGIN_EXPECTED_REFERENCE_PROJECTION="${TEST_PROJECTION:-sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432}" \
     OMARCHY_PLUGIN_EXPECTED_REFERENCE_STATE="${TEST_REFERENCE_STATE:-unreferenced}" \
     OMARCHY_PLUGIN_REFERENCE_POLICY="${TEST_POLICY:-require-unreferenced}" \
     OMARCHY_PLUGIN_STAGE_OBSERVATION_SOURCE="${TEST_OBSERVATION_SOURCE:-test-injected-o5}" \
@@ -97,7 +97,7 @@ for field in operation plugin source_kind source_path caller_candidate active co
     active) TEST_OPERATION_KIND=update TEST_ACTIVE_STATE=present TEST_ACTIVE_IDENTITY=omarchy-runtime-tree-sha256-v1:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd TEST_POLICY=preserve-observed expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;
     config_kind) TEST_CONFIG_KIND=default expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;
     config_identity) TEST_CONFIG_IDENTITY=other-config expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;
-    projection) TEST_PROJECTION=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;
+    projection) TEST_POLICY=preserve-observed TEST_PROJECTION=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;
     reference_state) TEST_REFERENCE_STATE=referenced expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;
     policy) TEST_POLICY=preserve-observed expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;
     observation_source) TEST_OBSERVATION_SOURCE=internal-unestablished expect_failure operation-conflict stage "$operation" acme.state-test "$source" ;;

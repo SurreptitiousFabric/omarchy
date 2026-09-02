@@ -8,6 +8,7 @@ def uuid_v4: string and test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-
 def plugin_id: string and test("^[A-Za-z0-9][A-Za-z0-9._-]*$") and (contains("..") | not) and (startswith("omarchy.") | not);
 def normalized_absolute_path: string and startswith("/") and (contains("//") | not) and (test("(^|/)\\.\\.?(/|$)") | not);
 def simple_slot: string and (length > 0 and length <= 128) and (contains("/") | not) and . != "." and . != "..";
+def empty_reference_projection: . == "sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432";
 
 def request_facts($operation_id; $plugin_id):
   exact_keys(["callerCandidateIdentity", "destination", "expectedActive", "expectedConfiguration", "operation", "operationId", "pluginId", "protocol", "source", "stageObservation"])
@@ -30,6 +31,10 @@ def request_facts($operation_id; $plugin_id):
   and (.expectedConfiguration.referenceProjection | sha_digest)
   and (.expectedConfiguration.referenceState == "referenced" or .expectedConfiguration.referenceState == "unreferenced")
   and (.expectedConfiguration.referencePolicy == "require-unreferenced" or .expectedConfiguration.referencePolicy == "preserve-observed")
+  and (if .expectedConfiguration.referencePolicy == "require-unreferenced" then
+         .expectedConfiguration.referenceState == "unreferenced"
+         and (.expectedConfiguration.referenceProjection | empty_reference_projection)
+       else true end)
   and (if .operation == "install" then .expectedConfiguration.referencePolicy == "require-unreferenced" else true end)
   and (.stageObservation | exact_keys(["provenance", "rawSha256", "referenceProjection", "referenceState"]))
   and (.stageObservation.provenance == "test-injected-o4" or .stageObservation.provenance == "test-injected-o5" or .stageObservation.provenance == "internal-unestablished")
@@ -51,6 +56,7 @@ def normal_record($operation_id):
   and (.candidate.temporarySlot == (".import." + $operation_id))
   and (.candidate.completedSlot == $operation_id)
   and (.candidate.observed | nullable_string)
+  and (if .candidate.observed != null then .candidate.observed == .candidate.expected else true end)
   and .corruptEvidenceSha256 == null;
 
 def manual_reason:
@@ -74,8 +80,8 @@ and (
   elif .state == "PUBLICATION_INTENT" then
     normal_record($operation_id)
     and (.candidate.observed | tree_identity)
-    and (.publication.state == "intended" or .publication.state == "temporary")
-    and (.reason == null or .reason == "publication-compensated")
+    and ((.publication.state == "intended" and .reason == null)
+         or (.publication.state == "temporary" and .reason == "publication-compensated"))
   elif .state == "STAGED" then
     normal_record($operation_id)
     and (.candidate.observed | tree_identity)
