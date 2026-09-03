@@ -461,6 +461,8 @@ ShellRoot {
     root.assertTrue(!has("third.duplicate"), "duplicate third-party ids are non-loadable")
     root.assertDeepEqual(registry.lastScanOutcome.thirdPartySources["third.duplicate"],
       ["/third/duplicate-a", "/third/duplicate-b"], "duplicate source directories remain visible")
+    root.assertEqual(registry.authoritySnapshot("third.duplicate").targetCount, 2,
+      "authority snapshot preserves duplicate target cardinality")
     root.assertEqual(registry.gatedScanBinding(duplicateOperation, "third.duplicate",
       "/third/duplicate-a").status,
       "duplicate-plugin-id", "a duplicate target cannot acknowledge gated discovery")
@@ -473,6 +475,8 @@ ShellRoot {
     var exactBinding = registry.gatedScanBinding(exactOperation, "third.exact", "/third/exact")
     root.assertTrue(exactBinding.valid === true, "one exact selected source is bindable")
     root.assertEqual(exactBinding.sourceDirectory, "/third/exact", "binding returns the selected source")
+    root.assertEqual(registry.authoritySnapshot("third.exact").targetCount, 1,
+      "authority snapshot reports one exact target")
     root.assertEqual(registry.gatedScanBinding(exactOperation, "third.exact", "/third/other").status,
       "registry-source-mismatch", "a different destination cannot acknowledge discovery")
 

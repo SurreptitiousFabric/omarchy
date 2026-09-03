@@ -30,6 +30,9 @@ ShellRoot {
   readonly property string firstPartyPluginsDir: shellPath + "/plugins"
   readonly property string defaultsPath: omarchyPath + "/config/omarchy/shell.json"
   readonly property string userConfigPath: home + "/.config/omarchy/shell.json"
+  readonly property string userConfigSourceIdentity: "omarchy-shell-config:user:v1"
+  readonly property string packagedDefaultsSourceIdentity: "omarchy-shell-config:packaged-default:v1"
+  readonly property string builtinDefaultsSourceIdentity: "omarchy-shell-config:builtin-default:v1"
 
   // Bundled fallback so the shell can start even when the default shell.json is
   // missing or unreadable. The bar config here mirrors the on-disk defaults
@@ -89,7 +92,9 @@ ShellRoot {
     }
     publishAcceptedShellConfig(user || defaults,
       user ? "user" : "default",
-      user ? shell.userConfigPath : (defaults === builtinShellConfig ? "builtin:shell-config-v1" : shell.defaultsPath),
+      user ? shell.userConfigSourceIdentity
+        : (defaults === builtinShellConfig ? shell.builtinDefaultsSourceIdentity
+          : shell.packagedDefaultsSourceIdentity),
       user ? userText : shell.defaultsRaw)
   }
 
@@ -127,7 +132,7 @@ ShellRoot {
     payload.version = 1
     var raw = JSON.stringify(payload, null, 2) + "\n"
     if (userConfigFile.text() === raw) {
-      publishAcceptedShellConfig(payload, "user", shell.userConfigPath, raw)
+      publishAcceptedShellConfig(payload, "user", shell.userConfigSourceIdentity, raw)
       return true
     }
     configWriteOutcome = "pending"
@@ -138,7 +143,7 @@ ShellRoot {
       return false
     }
     configWriteOutcome = "idle"
-    publishAcceptedShellConfig(payload, "user", shell.userConfigPath, raw)
+    publishAcceptedShellConfig(payload, "user", shell.userConfigSourceIdentity, raw)
     return true
   }
 
@@ -1165,6 +1170,26 @@ ShellRoot {
 
     function transactionPluginState(operationId: string): string {
       return shell.pluginEligibility.transactionState(operationId)
+    }
+
+    function transactionStageObservation(pluginId: string): string {
+      var observation = shell.pluginEligibility.stageObservation(pluginId)
+      if (!observation.valid) return JSON.stringify(observation)
+      var registry = shell.pluginRegistry.authoritySnapshot(pluginId)
+      if (!shell.pluginEligibility.inventoryReady || shell.pluginEligibility.inventoryBlocksAll)
+        return JSON.stringify({ valid: false, status: "gate-inventory-not-ready" })
+      if (registry.scanning === true || registry.scanSuccessful !== true)
+        return JSON.stringify({ valid: false, status: "registry-inventory-not-ready" })
+      if (registry.targetCount > 1 || (registry.targetCount === 1
+          && (registry.unique !== true || !registry.sourceDirectory))
+          || (registry.targetCount === 0 && registry.sourceDirectory))
+        return JSON.stringify({ valid: false, status: "registry-target-ambiguous" })
+      observation.discoveryDirectory = shell.pluginRegistry.pluginsDir
+      observation.transactionStateRoot = shell.pluginEligibility.stateRoot
+      observation.activeDiscovery = registry.targetCount === 0
+        ? { state: "absent" }
+        : { state: "present", sourceDirectory: registry.sourceDirectory }
+      return JSON.stringify(observation)
     }
 
     function reloadConfig(): string {

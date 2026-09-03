@@ -80,7 +80,7 @@ Request schema:
     }
   },
   "expectedConfiguration": {
-    "source": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
+    "source": { "kind": "user", "identity": "omarchy-shell-config:user:v1" },
     "referenceProjectionSha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "referenceState": "referenced",
     "referencePolicy": "preserve-observed"
@@ -112,7 +112,7 @@ Omarchy independently observes the current active tree and configuration during 
     }
   },
   "configurationObserved": {
-    "source": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
+    "source": { "kind": "user", "identity": "omarchy-shell-config:user:v1" },
     "rawSha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "referenceProjectionSha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "referenceState": "referenced"
@@ -186,9 +186,9 @@ Every response has this envelope:
   "previousTree": { "algorithm": "omarchy-runtime-tree-sha256-v1", "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
   "filesystem": { "state": "candidate-active", "liveTree": { "algorithm": "omarchy-runtime-tree-sha256-v1", "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } },
   "configuration": {
-    "sourceBefore": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
+    "sourceBefore": { "kind": "user", "identity": "omarchy-shell-config:user:v1" },
     "rawSha256Before": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "sourceAfter": { "kind": "user", "identity": "omarchy-user-shell-config/v1" },
+    "sourceAfter": { "kind": "user", "identity": "omarchy-shell-config:user:v1" },
     "rawSha256After": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     "referenceProjectionSha256Before": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "referenceProjectionSha256After": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"

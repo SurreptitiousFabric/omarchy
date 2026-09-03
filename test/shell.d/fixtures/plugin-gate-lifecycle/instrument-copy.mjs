@@ -164,7 +164,7 @@ if (source.includes(vulnerableConfigAnchor)) {
     'vulnerable programmatic configuration publication observation')
 } else {
   const atomicConfigAnchor = `    configWriteOutcome = "idle"
-    publishAcceptedShellConfig(payload, "user", shell.userConfigPath, raw)
+    publishAcceptedShellConfig(payload, "user", shell.userConfigSourceIdentity, raw)
     return true
 `
   const first = source.indexOf(atomicConfigAnchor)

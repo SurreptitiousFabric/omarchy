@@ -722,6 +722,7 @@ QtObject {
       scanEpoch: scanEpoch,
       generation: registryGeneration,
       scanSuccessful: lastScanOutcome && lastScanOutcome.success === true,
+      targetCount: sources.length,
       unique: sources.length === 1,
       sourceDirectory: selected && selected.__isFirstParty !== true
         ? String(selected.__sourceDir || "").replace(/\/$/, "") : ""

@@ -73,6 +73,41 @@ QtObject {
     }
   }
 
+  function stageObservation(pluginId) {
+    var key = String(pluginId || "")
+    var snapshot = acceptedSnapshot
+    var sourceKind = String(snapshot.sourceKind || "absent")
+    var sourceIdentity = String(snapshot.sourceIdentity || "")
+    if (Number(snapshot.epoch) < 1 || (sourceKind !== "user" && sourceKind !== "default")
+        || !sourceIdentity)
+      return { valid: false, status: "invalid-accepted-configuration" }
+    var entries = Projection.references(snapshot.config, key)
+    var projectionBytes = Projection.canonicalBytes(snapshot.config, key)
+    if (entries === null || projectionBytes === null)
+      return { valid: false, status: "invalid-accepted-configuration" }
+    var rawBytes
+    try {
+      rawBytes = Projection.utf8(String(snapshot.rawText || ""))
+    } catch (error) {
+      return { valid: false, status: "invalid-accepted-configuration" }
+    }
+    if (rawBytes.length === 0 || rawBytes.length > 32768 || projectionBytes.length > 4096)
+      return { valid: false, status: "accepted-configuration-too-large" }
+    return {
+      valid: true,
+      status: "observed",
+      schema: "omarchy-plugin-stage-observation/v1",
+      pluginId: key,
+      configurationSource: {
+        kind: sourceKind,
+        identity: sourceIdentity
+      },
+      rawBase64: Projection.base64(rawBytes),
+      referenceProjectionBase64: Projection.base64(projectionBytes),
+      referenceState: entries.length === 0 ? "unreferenced" : "referenced"
+    }
+  }
+
   function isGated(pluginId) {
     return gates[String(pluginId || "")] !== undefined
   }

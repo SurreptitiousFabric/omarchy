@@ -145,7 +145,7 @@ stage_operation() {
     OMARCHY_PLUGIN_DISCOVERY_DIR="$plugin_dir" OMARCHY_PLUGIN_OPERATION_KIND=update \
     OMARCHY_PLUGIN_SOURCE_KIND=directory OMARCHY_PLUGIN_CALLER_CANDIDATE_IDENTITY="$identity" \
     OMARCHY_PLUGIN_EXPECTED_ACTIVE_STATE=present OMARCHY_PLUGIN_EXPECTED_ACTIVE_IDENTITY="$identity" \
-    OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_KIND=user OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_IDENTITY="$config_file" \
+    OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_KIND=user OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_IDENTITY=omarchy-shell-config:user:v1 \
     OMARCHY_PLUGIN_EXPECTED_REFERENCE_PROJECTION="$projection" OMARCHY_PLUGIN_EXPECTED_REFERENCE_STATE=referenced \
     OMARCHY_PLUGIN_REFERENCE_POLICY=preserve-observed OMARCHY_PLUGIN_STAGE_OBSERVATION_SOURCE=test-injected-o5 \
     OMARCHY_PLUGIN_STAGE_OBSERVATION_RAW_SHA256="$raw" OMARCHY_PLUGIN_STAGE_OBSERVATION_REFERENCE_PROJECTION="$projection" \
@@ -238,6 +238,26 @@ wait_for() {
 }
 
 wait_for "isolated offscreen shell accepts IPC" '[[ $(shell_ipc shell ping 2>/dev/null || true) == ok ]]'
+wait_for "production transaction observation reaches ready authoritative inventory" \
+  '[[ $(shell_ipc shell transactionStageObservation "$service_id" 2>/dev/null | jq -r .valid || true) == true ]]'
+stage_observation=$(shell_ipc shell transactionStageObservation "$service_id")
+jq -e --arg plugin "$service_id" --arg discovery "$plugin_dir" \
+    --arg state "$state_dir/omarchy/plugin-transactions-v1" '
+  .schema == "omarchy-plugin-stage-observation/v1"
+  and .status == "observed"
+  and .pluginId == $plugin
+  and .configurationSource == {kind:"user",identity:"omarchy-shell-config:user:v1"}
+  and .referenceState == "referenced"
+  and .activeDiscovery == {state:"present",sourceDirectory:($discovery + "/" + $plugin)}
+  and .discoveryDirectory == $discovery
+  and .transactionStateRoot == $state
+' <<<"$stage_observation" >/dev/null || fail "production transaction observation did not expose exact O-6 authority"
+observed_raw=$(jq -r .rawBase64 <<<"$stage_observation" | base64 -d | sha256sum | cut -d' ' -f1)
+expected_raw=$(sha256sum "$config_file" | cut -d' ' -f1)
+[[ $observed_raw == "$expected_raw" ]] || fail "production transaction observation raw bytes differ from accepted configuration"
+observed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$stage_observation" | base64 -d | sha256sum | cut -d' ' -f1)
+[[ $observed_projection == "$initial_service_projection" ]] || fail "production transaction observation bypassed canonical projection"
+pass "production stage observation uses the live accepted O-6 snapshot and canonical projection"
 wait_for "real service completion reaches deterministic barrier" '(( $(state "$service_id" 2>/dev/null | jq -r .deferredService || echo 0) >= 1 ))'
 wait_for "real widget completion reaches deterministic barrier" '(( $(state "$widget_id" 2>/dev/null | jq -r .deferredWidget || echo 0) >= 1 ))'
 wait_for "active-service completion reaches deterministic barrier" '(( $(state "$active_service_id" 2>/dev/null | jq -r .deferredService || echo 0) >= 1 ))'
@@ -300,6 +320,9 @@ if [[ $EXPECTATION != reviewed-authority-vulnerable ]]; then
   cp -a "$plugin_dir/$service_id" "$duplicate_source"
   [[ $(shell_ipc shell testOrdinaryRescan) == started ]] || fail "duplicate-source ordinary scan did not start"
   wait_for "duplicate-source ordinary scan completes" '(( $(state "$service_id" 2>/dev/null | jq -r .registryGeneration || echo 0) > before_duplicate_generation )) && [[ $(state "$service_id" 2>/dev/null | jq -r .registryScanning || true) == false ]]'
+  duplicate_stage_observation=$(shell_ipc shell transactionStageObservation "$service_id")
+  jq -e '.valid == false and .status == "registry-target-ambiguous"' \
+    <<<"$duplicate_stage_observation" >/dev/null || fail "stage observation accepted an ambiguous active plugin ID"
   shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
   wait_for "duplicate source fails operation-bound discovery" '[[ $(transaction_status "$service_operation" 2>/dev/null || true) == gated-rescan-failed ]]'
   [[ $(state "$service_id" | jq -r '.gate.state + ":" + .directUrl') == UNLOAD_ACKNOWLEDGED: ]] ||
@@ -312,6 +335,7 @@ if [[ $EXPECTATION != reviewed-authority-vulnerable ]]; then
   [[ $(shell_ipc shell testOrdinaryRescan) == started ]] || fail "duplicate-removal ordinary scan did not start"
   wait_for "duplicate-removal ordinary scan completes" '(( $(state "$service_id" 2>/dev/null | jq -r .registryGeneration || echo 0) > before_duplicate_removal_generation )) && [[ $(state "$service_id" 2>/dev/null | jq -r .registryScanning || true) == false ]]'
   pass "duplicate registry source remains non-loadable and cannot acknowledge gated discovery"
+  pass "stage observation rejects ambiguous active plugin discovery"
 fi
 
 shell_ipc shell rescanGatedPlugin "$service_operation" "$service_id" >/dev/null
@@ -374,7 +398,7 @@ else
     fail "programmatic mutation did not publish one accepted configuration"
   (( $(jq -r .configurationEpoch <<<"$mutation_state") > before_mutation_epoch )) ||
     fail "programmatic mutation did not advance the accepted epoch synchronously"
-  [[ $(jq -r .acceptedSourceIdentity <<<"$mutation_state") == "$config_file" ]] ||
+  [[ $(jq -r .acceptedSourceIdentity <<<"$mutation_state") == omarchy-shell-config:user:v1 ]] ||
     fail "programmatic mutation published the wrong source identity"
   [[ $(jq -r .acceptedRawText <<<"$mutation_state") == "$(<"$config_file")" ]] ||
     fail "written shell.json and accepted raw snapshot differ"
