@@ -711,6 +711,36 @@ QtObject {
       scanEpoch: Number(result.scanEpoch), generation: Number(result.generation) }
   }
 
+  function gatedRollbackScanBinding(operationId, pluginId, expectedDestination, targetRole, outcome) {
+    var key = String(pluginId || "")
+    var expected = String(expectedDestination || "").replace(/\/$/, "")
+    var result = outcome || lastScanOutcome
+    if (!result || result.success !== true) return { valid: false, status: "scan-process-failed" }
+    var context = result.context
+    if (!context || context.gated !== true || context.rollback !== true
+        || String(context.operationId || "") !== String(operationId)
+        || String(context.pluginId || "") !== key)
+      return { valid: false, status: "scan-context-mismatch" }
+    var role = String(targetRole || context.targetRole || "")
+    var sources = result.thirdPartySources && Array.isArray(result.thirdPartySources[key])
+      ? result.thirdPartySources[key] : []
+    if (role === "absence") {
+      if (sources.length !== 0 || installedPlugins[key] !== undefined) return { valid: false, status: "rollback-target-present" }
+      return { valid: true, status: "rollback-absence-discovered", targetRole: "absence",
+        sourceDirectory: expected, scanEpoch: Number(result.scanEpoch), generation: Number(result.generation) }
+    }
+    if (role !== "prior-tree") return { valid: false, status: "invalid-rollback-target" }
+    if (sources.length !== 1) return { valid: false, status: sources.length === 0 ? "target-manifest-absent" : "duplicate-plugin-id" }
+    var source = String(sources[0] || "").replace(/\/$/, "")
+    if (source !== expected) return { valid: false, status: "registry-source-mismatch" }
+    var selected = installedPlugins[key]
+    if (!selected || selected.__isFirstParty === true || String(selected.id || "") !== key
+        || String(selected.__sourceDir || "").replace(/\/$/, "") !== source)
+      return { valid: false, status: "registry-selection-mismatch" }
+    return { valid: true, status: "rollback-tree-discovered", targetRole: "prior-tree",
+      sourceDirectory: source, scanEpoch: Number(result.scanEpoch), generation: Number(result.generation) }
+  }
+
   function authoritySnapshot(pluginId) {
     var key = String(pluginId || "")
     var selected = installedPlugins[key]

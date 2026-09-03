@@ -60,6 +60,11 @@ ShellRoot {
   property string defaultsRaw: JSON.stringify(builtinShellConfig)
   readonly property var shellConfig: pluginEligibility.acceptedConfig || builtinShellConfig
   property string configWriteOutcome: "idle"
+  property bool configVerificationInProgress: false
+  property bool configVerificationLoaded: false
+  property bool configVerificationFailed: false
+  property bool configWatcherPending: false
+  property string configVerificationRaw: ""
   property bool pluginReloading: false
   property bool pluginReloadPending: false
 
@@ -136,11 +141,32 @@ ShellRoot {
       return true
     }
     configWriteOutcome = "pending"
+    configVerificationInProgress = true
+    configVerificationLoaded = false
+    configVerificationFailed = false
+    configVerificationRaw = raw
     userConfigFile.setText(raw)
-    if (configWriteOutcome !== "saved") {
+    userConfigFile.reload()
+    var loadCompleted = userConfigFile.waitForJob()
+    var observedBytes = userConfigFile.data()
+    // FileView exposes data() as the QByteArray loaded from disk. String()
+    // preserves its UTF-8 byte sequence for the shell.json payload; do not
+    // publish the in-memory object until this exact comparison succeeds.
+    var bytesMatch = String(observedBytes) === raw
+    if (configWriteOutcome !== "saved" || loadCompleted !== true
+        || configVerificationFailed || !configVerificationLoaded || !bytesMatch) {
+      configVerificationFailed = true
+      configVerificationInProgress = false
+      configVerificationRaw = ""
       console.warn("shell.json write failed; retaining the previously accepted configuration")
       configWriteOutcome = "idle"
       return false
+    }
+    configVerificationInProgress = false
+    configVerificationRaw = ""
+    if (configWatcherPending) {
+      configWatcherPending = false
+      userConfigFile.reload()
     }
     configWriteOutcome = "idle"
     publishAcceptedShellConfig(payload, "user", shell.userConfigSourceIdentity, raw)
@@ -169,9 +195,18 @@ ShellRoot {
     atomicWrites: true
     blockWrites: true
     printErrors: false
-    onLoaded: shell.applyShellConfig()
-    onLoadFailed: function(error) { shell.applyShellConfig() }
-    onFileChanged: reload()
+    onLoaded: {
+      if (shell.configVerificationInProgress) shell.configVerificationLoaded = true
+      else shell.applyShellConfig()
+    }
+    onLoadFailed: function(error) {
+      if (shell.configVerificationInProgress) shell.configVerificationFailed = true
+      else shell.applyShellConfig()
+    }
+    onFileChanged: {
+      if (shell.configVerificationInProgress) shell.configWatcherPending = true
+      else reload()
+    }
     onSaved: if (shell.configWriteOutcome === "pending") shell.configWriteOutcome = "saved"
     onSaveFailed: function(error) {
       if (shell.configWriteOutcome === "pending") shell.configWriteOutcome = "failed"
@@ -193,6 +228,10 @@ ShellRoot {
     pluginEligibility.unloadVerifiedCallback = function(pluginId) { return shell.isExactPluginUnloaded(pluginId) }
     pluginEligibility.rescanCallback = function(operationId, pluginId) {
       return shell.pluginRegistry.rescan({ operationId: operationId, pluginId: pluginId, gated: true })
+    }
+    pluginEligibility.rollbackRescanCallback = function(operationId, pluginId, targetRole) {
+      return shell.pluginRegistry.rescan({ operationId: operationId, pluginId: pluginId,
+        gated: true, rollback: true, targetRole: String(targetRole || "absence") })
     }
     pluginEligibility.registryAuthorityProvider = function(pluginId) {
       return shell.pluginRegistry.authoritySnapshot(pluginId)
@@ -1021,11 +1060,19 @@ ShellRoot {
       shell.syncPluginWidgets()
       if (context && context.gated === true) {
         var gateRecord = shell.pluginEligibility.gates[String(context.pluginId)]
-        var binding = gateRecord && gateRecord.valid === true
-          ? shell.pluginRegistry.gatedScanBinding(context.operationId, context.pluginId,
-            gateRecord.expectedDestination, outcome)
-          : { valid: false, status: "gate-state-invalid" }
-        shell.pluginEligibility.acknowledgeRescan(context.operationId, context.pluginId, binding)
+        if (context.rollback === true) {
+          var rollbackBinding = gateRecord && gateRecord.valid === true
+            ? shell.pluginRegistry.gatedRollbackScanBinding(context.operationId, context.pluginId,
+              gateRecord.expectedDestination, gateRecord.expectedTargetRole, outcome)
+            : { valid: false, status: "gate-state-invalid" }
+          shell.pluginEligibility.acknowledgeRollbackRescan(context.operationId, context.pluginId, rollbackBinding)
+        } else {
+          var binding = gateRecord && gateRecord.valid === true
+            ? shell.pluginRegistry.gatedScanBinding(context.operationId, context.pluginId,
+              gateRecord.expectedDestination, outcome)
+            : { valid: false, status: "gate-state-invalid" }
+          shell.pluginEligibility.acknowledgeRescan(context.operationId, context.pluginId, binding)
+        }
       }
     }
   }
@@ -1166,6 +1213,28 @@ ShellRoot {
 
     function releaseTransactionPlugin(operationId: string, pluginId: string): string {
       return shell.pluginEligibility.releasePlugin(operationId, pluginId)
+    }
+
+    function rollbackTransactionPlugin(operationId: string, pluginId: string,
+                                       targetRole: string, targetIdentity: string): string {
+      return shell.pluginEligibility.rollbackPlugin(operationId, pluginId, targetRole, targetIdentity)
+    }
+
+    function rescanRollbackPlugin(operationId: string, pluginId: string): string {
+      return shell.pluginEligibility.rollbackRescan(operationId, pluginId)
+    }
+
+    function releaseRollbackTransactionPlugin(operationId: string, pluginId: string): string {
+      return shell.pluginEligibility.releaseRollbackPlugin(operationId, pluginId)
+    }
+
+    function retainTransactionPlugin(operationId: string, pluginId: string): string {
+      return shell.pluginEligibility.retainTransactionPlugin(operationId, pluginId)
+    }
+
+    function transactionTerminalReceipt(operationId: string, pluginId: string,
+                                        intendedState: string): string {
+      return shell.pluginEligibility.terminalReceipt(operationId, pluginId, intendedState)
     }
 
     function transactionPluginState(operationId: string): string {

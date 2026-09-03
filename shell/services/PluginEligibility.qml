@@ -34,6 +34,7 @@ QtObject {
   property var unloadCallback: null
   property var unloadVerifiedCallback: null
   property var rescanCallback: null
+  property var rollbackRescanCallback: null
   property var registryAuthorityProvider: null
   property string shellInstanceId: "shell-" + Date.now().toString(16) + "-" + Math.random().toString(16).slice(2)
 
@@ -130,16 +131,21 @@ QtObject {
     if (!record || typeof record !== "object"
         || record.operationId !== operationId || record.pluginId !== pluginId
         || !record.expected || !record.rescan || !record.release
-        || !/^[0-9a-f]{64}$/.test(String(record.operationJournalSha256 || ""))
+        || (record.schema === "omarchy-plugin-transaction-gate/v2"
+            ? !/^[0-9a-f]{64}$/.test(String(record.operationBindingSha256 || ""))
+            : !/^[0-9a-f]{64}$/.test(String(record.operationJournalSha256 || "")))
         || ["GATED", "UNLOAD_ACKNOWLEDGED", "RESCAN_ACKNOWLEDGED", "RELEASE_AUTHORIZED"].indexOf(record.state) === -1)
       return null
     return {
       valid: true,
       operationId: record.operationId,
       state: record.state,
+      schema: String(record.schema || "omarchy-plugin-transaction-gate/v1"),
       operationJournalSha256: String(record.operationJournalSha256),
+      operationBindingSha256: String(record.operationBindingSha256 || ""),
       expectedDestination: String(record.expected.destination || ""),
       expectedTree: String(record.expected.tree || ""),
+      expectedTargetRole: String(record.expected.targetRole || "candidate"),
       generation: record.rescan.generation,
       scanEpoch: record.rescan.scanEpoch,
       sourceDirectory: String(record.rescan.sourceDirectory || ""),
@@ -157,6 +163,16 @@ QtObject {
       && Number(current.generation) === Number(generation)
       && Number(current.scanEpoch) === Number(scanEpoch)
       && String(current.sourceDirectory || "") === String(sourceDirectory || "")
+  }
+
+  function rollbackRegistryBindingCurrent(pluginId, generation, scanEpoch, sourceDirectory, targetRole) {
+    if (!registryAuthorityProvider) return false
+    var current = registryAuthorityProvider(pluginId)
+    if (!current || current.scanning === true || current.scanSuccessful !== true
+        || Number(current.generation) !== Number(generation)
+        || Number(current.scanEpoch) !== Number(scanEpoch)) return false
+    if (targetRole === "absence") return Number(current.targetCount) === 0
+    return current.unique === true && String(current.sourceDirectory || "") === String(sourceDirectory || "")
   }
 
   function initialize() {
@@ -198,7 +214,8 @@ QtObject {
     var next = commandQueue.slice()
     var candidate = next.shift()
     commandQueue = next
-    if ((candidate.type === "projection" || candidate.type === "release")
+    if ((candidate.type === "projection" || candidate.type === "release"
+         || candidate.type === "rollback-projection" || candidate.type === "rollback-release")
         && !releaseBindingCurrent(candidate)) {
       setResult(candidate.operationId, candidate.pluginId, "release-precondition-mismatch",
         "configuration epoch, registry generation, or gate changed before helper invocation")
@@ -285,6 +302,45 @@ QtObject {
         String(binding.generation), String(binding.scanEpoch), String(binding.sourceDirectory || "")] })
   }
 
+  function rollbackPlugin(operationId, pluginId, targetRole, targetIdentity) {
+    if (!validOperation(operationId) || !validPlugin(pluginId) || !isGated(pluginId)) return "gate-missing"
+    var record = gates[String(pluginId)]
+    if (!record || record.valid !== true || record.operationId !== operationId) return "gate-missing"
+    if (targetRole !== "prior-tree" && targetRole !== "absence") return "invalid-rollback-target"
+    if (targetRole === "prior-tree" && !/^omarchy-runtime-tree-sha256-v1:[0-9a-f]{64}$/.test(String(targetIdentity || ""))) return "invalid-rollback-target"
+    setResult(operationId, pluginId, "rollback-target-pending", "")
+    enqueue({ type: "rollback-retarget", operationId: operationId, pluginId: pluginId,
+      targetRole: targetRole, targetIdentity: String(targetIdentity || ""),
+      command: [helperPath, "retarget-rollback", operationId, pluginId, shellInstanceId,
+        targetRole, String(targetIdentity || "")] })
+    return "pending"
+  }
+
+  function rollbackRescan(operationId, pluginId) {
+    if (!validOperation(operationId) || !validPlugin(pluginId) || !isGated(pluginId)) return "gate-missing"
+    var record = gates[String(pluginId)]
+    if (!record || record.valid !== true || record.operationId !== operationId
+        || record.state !== "UNLOAD_ACKNOWLEDGED") return "unload-incomplete"
+    setResult(operationId, pluginId, "rollback-rescan-pending", "")
+    if (!rollbackRescanCallback || rollbackRescanCallback(operationId, pluginId, record.expectedTargetRole || record.expectedRole || record.targetRole) !== true) {
+      setResult(operationId, pluginId, "rollback-rescan-busy", "ordinary-or-other scan active")
+      return "busy"
+    }
+    return "pending"
+  }
+
+  function acknowledgeRollbackRescan(operationId, pluginId, binding) {
+    if (!binding || binding.valid !== true) {
+      setResult(operationId, pluginId, "rollback-rescan-failed", binding ? binding.status : "invalid scan result")
+      return
+    }
+    enqueue({ type: "rollback-rescan", operationId: operationId, pluginId: pluginId,
+      generation: Number(binding.generation), scanEpoch: Number(binding.scanEpoch),
+      sourceDirectory: String(binding.sourceDirectory || ""), targetRole: String(binding.targetRole || "absence"),
+      command: [helperPath, "acknowledge-rollback-rescan", operationId, pluginId, shellInstanceId,
+        String(binding.generation), String(binding.scanEpoch), String(binding.sourceDirectory || "")] })
+  }
+
   function releasePlugin(operationId, pluginId) {
     if (!validOperation(operationId) || !validPlugin(pluginId) || !isGated(pluginId)) return "gate-missing"
     var gateRecord = gates[String(pluginId)]
@@ -293,7 +349,8 @@ QtObject {
       retainAuthorizedRelease({ operationId: operationId, pluginId: pluginId,
         generation: gateRecord.generation, shellInstance: gateRecord.shellInstance,
         scanEpoch: gateRecord.scanEpoch, sourceDirectory: gateRecord.sourceDirectory,
-        operationJournalSha256: gateRecord.operationJournalSha256 }, "stale rescan generation")
+        operationJournalSha256: gateRecord.operationJournalSha256,
+        operationBindingSha256: gateRecord.operationBindingSha256 }, "stale rescan generation")
       return "stale-rescan-generation"
     }
     var snapshot = referenceSnapshot(pluginId)
@@ -302,13 +359,37 @@ QtObject {
     enqueue({ type: "projection", operationId: operationId, pluginId: pluginId,
       generation: Number(gateRecord.generation), shellInstance: String(gateRecord.shellInstance || ""),
       scanEpoch: Number(gateRecord.scanEpoch), sourceDirectory: String(gateRecord.sourceDirectory || ""),
-      operationJournalSha256: String(gateRecord.operationJournalSha256 || ""), snapshot: snapshot,
+      operationJournalSha256: String(gateRecord.operationJournalSha256 || ""),
+      operationBindingSha256: String(gateRecord.operationBindingSha256 || ""), snapshot: snapshot,
+      command: [helperPath, "projection-digest", snapshot.canonicalBase64] })
+    return "pending"
+  }
+
+  function releaseRollbackPlugin(operationId, pluginId) {
+    if (!validOperation(operationId) || !validPlugin(pluginId) || !isGated(pluginId)) return "gate-missing"
+    var gateRecord = gates[String(pluginId)]
+    if (!gateRecord || gateRecord.operationId !== operationId || gateRecord.state !== "RESCAN_ACKNOWLEDGED") return "rollback-rescan-missing"
+    var targetRole = String(gateRecord.expectedTargetRole || gateRecord.targetRole || "")
+    if (targetRole !== "absence" && targetRole !== "prior-tree") targetRole = gateRecord.expected && gateRecord.expected.targetRole ? gateRecord.expected.targetRole : ""
+    if (!rollbackRegistryBindingCurrent(pluginId, gateRecord.generation, gateRecord.scanEpoch, gateRecord.sourceDirectory, targetRole)) return "stale-rollback-rescan"
+    var snapshot = referenceSnapshot(pluginId)
+    if (!snapshot.valid) return "configuration-invalid"
+    setResult(operationId, pluginId, "rollback-release-comparison-pending", "")
+    enqueue({ type: "rollback-projection", operationId: operationId, pluginId: pluginId,
+      generation: Number(gateRecord.generation), shellInstance: String(gateRecord.shellInstance || ""),
+      scanEpoch: Number(gateRecord.scanEpoch), sourceDirectory: String(gateRecord.sourceDirectory || ""),
+      operationJournalSha256: String(gateRecord.operationJournalSha256 || ""),
+      operationBindingSha256: String(gateRecord.operationBindingSha256 || ""), targetRole: targetRole, snapshot: snapshot,
       command: [helperPath, "projection-digest", snapshot.canonicalBase64] })
     return "pending"
   }
 
   function releaseBindingCurrent(command) {
     var gateRecord = gates[String(command.pluginId)]
+    var targetRole = command.targetRole || "candidate"
+    var registryOk = targetRole === "candidate"
+      ? registryBindingCurrent(command.pluginId, command.generation, command.scanEpoch, command.sourceDirectory)
+      : rollbackRegistryBindingCurrent(command.pluginId, command.generation, command.scanEpoch, command.sourceDirectory, targetRole)
     return gateRecord && gateRecord.valid === true
       && gateRecord.operationId === command.operationId
       && gateRecord.state === "RESCAN_ACKNOWLEDGED"
@@ -317,10 +398,16 @@ QtObject {
       && Number(gateRecord.scanEpoch) === Number(command.scanEpoch)
       && gateRecord.sourceDirectory === command.sourceDirectory
       && command.shellInstance === shellInstanceId
-      && gateRecord.operationJournalSha256 === command.operationJournalSha256
+      && (gateRecord.schema === "omarchy-plugin-transaction-gate/v2"
+        ? gateRecord.operationBindingSha256 === command.operationBindingSha256
+        : gateRecord.operationJournalSha256 === command.operationJournalSha256)
       && command.snapshot.epoch === configurationEpoch
-      && registryBindingCurrent(command.pluginId, command.generation, command.scanEpoch, command.sourceDirectory)
+      && registryOk
       && isGated(command.pluginId)
+  }
+
+  function rollbackBindingCurrent(command) {
+    return releaseBindingCurrent(command)
   }
 
   function retainAuthorizedRelease(command, detail) {
@@ -328,9 +415,33 @@ QtObject {
     enqueue({ type: "retain-release", operationId: command.operationId, pluginId: command.pluginId,
       generation: command.generation, shellInstance: command.shellInstance,
       scanEpoch: command.scanEpoch, sourceDirectory: command.sourceDirectory,
-      operationJournalSha256: command.operationJournalSha256, detail: detail,
+      operationJournalSha256: command.operationJournalSha256,
+      operationBindingSha256: command.operationBindingSha256, detail: detail,
       command: [helperPath, "retain-release", command.operationId, command.pluginId,
         command.shellInstance, String(command.generation)] })
+  }
+
+  function retainTransactionPlugin(operationId, pluginId) {
+    var gateRecord = gates[String(pluginId)]
+    if (!gateRecord || gateRecord.valid !== true || gateRecord.operationId !== operationId) return "gate-missing"
+    if (gateRecord.state !== "RELEASE_AUTHORIZED") return "not-release-authorized"
+    retainAuthorizedRelease({ operationId: operationId, pluginId: pluginId,
+      generation: gateRecord.releaseGeneration, shellInstance: gateRecord.releaseShellInstance,
+      scanEpoch: gateRecord.scanEpoch, sourceDirectory: gateRecord.sourceDirectory,
+      operationJournalSha256: gateRecord.operationJournalSha256,
+      operationBindingSha256: gateRecord.operationBindingSha256 }, "explicit retain/re-gate")
+    return "pending"
+  }
+
+  function terminalReceipt(operationId, pluginId, intendedState) {
+    var gateRecord = gates[String(pluginId)]
+    if (!gateRecord || gateRecord.valid !== true || gateRecord.operationId !== operationId
+        || gateRecord.state !== "RELEASE_AUTHORIZED")
+      return "release-not-authorized"
+    setResult(operationId, pluginId, "terminal-receipt-pending", "")
+    enqueue({ type: "terminal-receipt", operationId: operationId, pluginId: pluginId,
+      command: [helperPath, "terminal-receipt", operationId, pluginId, String(intendedState || "COMMITTED")] })
+    return "pending"
   }
 
   function refreshGateFromResult(command, payload) {
@@ -363,8 +474,18 @@ QtObject {
           shellInstance: installedGate.state === "RELEASE_AUTHORIZED"
             ? installedGate.releaseShellInstance : installedGate.shellInstance,
           scanEpoch: installedGate.scanEpoch, sourceDirectory: installedGate.sourceDirectory,
-          operationJournalSha256: installedGate.operationJournalSha256 },
+          operationJournalSha256: installedGate.operationJournalSha256,
+          operationBindingSha256: installedGate.operationBindingSha256 },
           "replayed gate authority requires a fresh gated rescan")
+      }
+    } else if (command.type === "rollback-retarget") {
+      var retargetedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!retargetedGate || retargetedGate.state !== "UNLOAD_ACKNOWLEDGED") {
+        setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
+        setResult(command.operationId, command.pluginId, "gate-state-invalid", "invalid rollback target result")
+      } else {
+        setGateRecord(command.pluginId, retargetedGate)
+        setResult(command.operationId, command.pluginId, "rollback-targeted", "")
       }
     } else if (command.type === "unload") {
       var unloadedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
@@ -388,6 +509,29 @@ QtObject {
       }
       setGateRecord(command.pluginId, rescannedGate)
       setResult(command.operationId, command.pluginId, payload.status || "gated-rescan-complete", JSON.stringify(payload))
+    } else if (command.type === "rollback-rescan") {
+      var rollbackRescannedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!rollbackRescannedGate || rollbackRescannedGate.state !== "RESCAN_ACKNOWLEDGED") {
+        setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
+        setResult(command.operationId, command.pluginId, "gate-state-invalid", "invalid rollback rescan result")
+      } else {
+        setGateRecord(command.pluginId, rollbackRescannedGate)
+        setResult(command.operationId, command.pluginId, payload.status || "rollback-rescan-complete", JSON.stringify(payload))
+      }
+    } else if (command.type === "rollback-projection") {
+      var rollbackDigest = String(actionStdout.text || "").trim()
+      if (!/^sha256:[0-9a-f]{64}$/.test(rollbackDigest) || !rollbackBindingCurrent(command)) {
+        setResult(command.operationId, command.pluginId, "rollback-release-precondition-mismatch", "configuration epoch, registry generation, shell instance, or gate changed")
+      } else {
+        enqueue({ type: "rollback-release", operationId: command.operationId, pluginId: command.pluginId,
+          targetRole: command.targetRole, generation: command.generation, epoch: command.snapshot.epoch,
+          snapshot: command.snapshot, scanEpoch: command.scanEpoch, sourceDirectory: command.sourceDirectory,
+          shellInstance: command.shellInstance, operationJournalSha256: command.operationJournalSha256,
+          operationBindingSha256: command.operationBindingSha256,
+          command: [helperPath, "authorize-rollback-release", command.operationId, command.pluginId,
+            command.shellInstance, String(command.generation), String(command.snapshot.epoch),
+            command.snapshot.sourceKind, command.snapshot.sourceIdentity, rollbackDigest, command.snapshot.state] })
+      }
     } else if (command.type === "projection") {
       var digest = String(actionStdout.text || "").trim()
       if (!/^sha256:[0-9a-f]{64}$/.test(digest) || !releaseBindingCurrent(command)) {
@@ -397,6 +541,7 @@ QtObject {
           generation: command.generation, epoch: command.snapshot.epoch, snapshot: command.snapshot,
           scanEpoch: command.scanEpoch, sourceDirectory: command.sourceDirectory,
           shellInstance: command.shellInstance, operationJournalSha256: command.operationJournalSha256,
+          operationBindingSha256: command.operationBindingSha256,
           command: [helperPath, "authorize-release", command.operationId, command.pluginId,
             command.shellInstance, String(command.generation), String(command.snapshot.epoch),
             command.snapshot.sourceKind, command.snapshot.sourceIdentity, digest, command.snapshot.state] })
@@ -406,13 +551,45 @@ QtObject {
       if (!authorizedGate || authorizedGate.state !== "RELEASE_AUTHORIZED") {
         setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
         setResult(command.operationId, command.pluginId, "release-retained", "invalid helper result")
-      } else if (!releaseBindingCurrent(command)) {
+      } else if (!rollbackBindingCurrent(command)) {
         setGateRecord(command.pluginId, authorizedGate)
         retainAuthorizedRelease(command, "configuration epoch, registry generation, shell instance, or gate changed")
       } else {
-        var next = ({})
-        for (var key in gates) if (key !== command.pluginId) next[key] = gates[key]
-        gates = next
+        if (authorizedGate.schema === "omarchy-plugin-transaction-gate/v2") {
+          terminalReceipt(command.operationId, command.pluginId, "COMMITTED")
+        } else {
+          var next = ({})
+          for (var key in gates) if (key !== command.pluginId) next[key] = gates[key]
+          gates = next
+          eligibilityChanged()
+          setResult(command.operationId, command.pluginId, "released", "discovery only; execution not observed")
+        }
+      }
+    } else if (command.type === "rollback-release") {
+      var rollbackAuthorizedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
+      if (!rollbackAuthorizedGate || rollbackAuthorizedGate.state !== "RELEASE_AUTHORIZED") {
+        setResult(command.operationId, command.pluginId, "rollback-release-retained", "invalid helper result")
+      } else if (!releaseBindingCurrent(command)) {
+        setGateRecord(command.pluginId, rollbackAuthorizedGate)
+        retainAuthorizedRelease(command, "rollback configuration epoch, registry generation, shell instance, or gate changed")
+      } else {
+        terminalReceipt(command.operationId, command.pluginId, "ROLLED_BACK")
+      }
+    } else if (command.type === "terminal-receipt") {
+      var receiptGate = payload.gate
+      if (!receiptGate || typeof receiptGate !== "object"
+          || receiptGate.schema !== "omarchy-plugin-transaction-gate/v2"
+          || receiptGate.state !== "TERMINAL_RECEIPT"
+          || receiptGate.operationId !== command.operationId
+          || receiptGate.pluginId !== command.pluginId
+          || !/^[0-9a-f]{64}$/.test(String(receiptGate.operationBindingSha256 || ""))
+          || !receiptGate.terminalReceipt
+          || receiptGate.terminalReceipt.state !== "durable") {
+        setResult(command.operationId, command.pluginId, "release-retained", "invalid terminal receipt")
+      } else {
+        var terminalNext = ({})
+        for (var terminalKey in gates) if (terminalKey !== command.pluginId) terminalNext[terminalKey] = gates[terminalKey]
+        gates = terminalNext
         eligibilityChanged()
         setResult(command.operationId, command.pluginId, "released", "discovery only; execution not observed")
       }
@@ -424,6 +601,9 @@ QtObject {
         return
       }
       setGateRecord(command.pluginId, retainedGate)
+      setPendingUnload(command.operationId, command.pluginId, false)
+      if (unloadCallback) unloadCallback(command.pluginId)
+      verifyPendingUnload(command.pluginId)
       setResult(command.operationId, command.pluginId, "release-retained", command.detail || "release authority changed")
     }
   }
@@ -434,7 +614,7 @@ QtObject {
     onExited: function(exitCode) {
       var command = authority.activeCommand
       var payload = ({})
-      if (exitCode === 0 && command.type !== "projection") {
+      if (exitCode === 0 && command.type !== "projection" && command.type !== "rollback-projection") {
         try { payload = JSON.parse(actionStdout.text || "{}") } catch (error) { exitCode = 2 }
       }
       if (exitCode === 0) authority.refreshGateFromResult(command, payload)
