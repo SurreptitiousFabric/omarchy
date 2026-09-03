@@ -83,6 +83,10 @@ elif .action == "abort" then
   exact_keys(["action", "operationId", "operationToken", "protocol"])
   and (.operationId | uuid_v4)
   and (.operationToken | operation_token)
+elif .action == "commit" then
+  exact_keys(["action", "operationId", "operationToken", "protocol"])
+  and (.operationId | uuid_v4)
+  and (.operationToken | operation_token)
 elif .action == "stage" then
   stage_request
 else false

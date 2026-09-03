@@ -10,6 +10,12 @@ fail() {
 action=$1
 shift
 
+journal=""
+gate=""
+journal_sha=""
+operation_binding=""
+journal_schema=""
+
 helper=${OMARCHY_PLUGIN_TREE_HELPER:-/usr/lib/omarchy/plugin-tree}
 state_root=${OMARCHY_PLUGIN_TRANSACTION_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugin-transactions-v1}
 journal_validator=${OMARCHY_PLUGIN_JOURNAL_VALIDATOR:-${OMARCHY_PATH:?missing OMARCHY_PATH}/native/plugin-transaction/validate-journal.jq}
@@ -87,8 +93,23 @@ load_operation() {
   "$helper" journal-sync "$state_root" "$operation_id"
   journal="$state_root/journals/$operation_id.journal"
   validate_canonical "$journal" "$journal_validator" operation_id "$operation_id" || fail invalid-operation-journal "$operation_id"
-  [[ $(jq -r .pluginId "$journal") == "$plugin_id" && $(jq -r .state "$journal") == STAGED ]] || fail operation-mismatch "$operation_id"
-  journal_sha=$(sha256sum "$journal" | cut -d' ' -f1)
+  [[ $(jq -r .pluginId "$journal") == "$plugin_id" ]] || fail operation-mismatch "$operation_id"
+  journal_schema=$(jq -r .schema "$journal")
+  case $journal_schema in
+    omarchy-plugin-transaction-journal/v1)
+      [[ $(jq -r .state "$journal") == STAGED ]] || fail operation-mismatch "$operation_id"
+      journal_sha=$(sha256sum "$journal" | cut -d' ' -f1)
+      operation_binding=""
+      ;;
+    omarchy-plugin-transaction-journal/v2)
+      operation_binding=$(jq -r .operationBindingSha256 "$journal")
+      [[ $operation_binding =~ ^[0-9a-f]{64}$ ]] || fail invalid-operation-binding "$operation_id"
+      [[ $(jq -r .state "$journal") != ABORTED &&
+          $(jq -r .state "$journal") != REJECTED &&
+          $(jq -r .state "$journal") != COMMITTED ]] || fail operation-mismatch "$operation_id"
+      ;;
+    *) fail unsupported-journal-schema "$operation_id" ;;
+  esac
   gate="$state_root/gates/$plugin_id.gate"
 }
 
@@ -99,7 +120,32 @@ load_gate() {
   [[ -e $gate || -L $gate ]] || fail gate-missing "$plugin_id"
   validate_canonical "$gate" "$gate_validator" plugin_id "$plugin_id" || fail gate-state-invalid "$plugin_id"
   [[ $(jq -r .operationId "$gate") == "$operation_id" ]] || fail plugin-gated-by-another-operation "$plugin_id"
-  [[ $(jq -r .operationJournalSha256 "$gate") == "$journal_sha" ]] || fail operation-journal-changed "$operation_id"
+  if [[ $journal_schema == omarchy-plugin-transaction-journal/v1 ]]; then
+    [[ $(jq -r .operationJournalSha256 "$gate") == "$journal_sha" ]] || fail operation-journal-changed "$operation_id"
+  else
+    [[ $(jq -r .schema "$gate") == omarchy-plugin-transaction-gate/v2 &&
+       $(jq -r .operationBindingSha256 "$gate") == "$operation_binding" ]] || fail operation-binding-mismatch "$operation_id"
+  fi
+}
+
+terminal_gate_safe() {
+  local path=$1 operation_id terminal_state journal_path
+  [[ -f $path && ! -L $path ]] || return 1
+  [[ $(jq -r '.schema // ""' "$path") == omarchy-plugin-transaction-gate/v2 &&
+      $(jq -r '.state // ""' "$path") == TERMINAL_RECEIPT ]] || return 1
+  operation_id=$(jq -r '.operationId // ""' "$path")
+  terminal_state=$(jq -r '.terminalReceipt.intendedJournalState // ""' "$path")
+  [[ $operation_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || return 1
+  [[ $terminal_state == COMMITTED || $terminal_state == ROLLED_BACK ]] || return 1
+  journal_path=$state_root/journals/$operation_id.journal
+  [[ -f $journal_path && ! -L $journal_path ]] || return 1
+  jq -e --arg operation_id "$operation_id" --arg terminal "$terminal_state" \
+    --arg binding "$(jq -r '.operationBindingSha256' "$path")" \
+    --arg plugin "$(jq -r '.pluginId' "$path")" --argjson receipt "$(jq -c .terminalReceipt "$path")" \
+    -f "$journal_validator" "$journal_path" >/dev/null 2>&1 || return 1
+  jq -e --arg terminal "$terminal_state" --arg binding "$(jq -r '.operationBindingSha256' "$path")" \
+    --arg plugin "$(jq -r '.pluginId' "$path")" --argjson receipt "$(jq -c .terminalReceipt "$path")" \
+    '.state == $terminal and .operationBindingSha256 == $binding and .pluginId == $plugin and .terminalReceipt == $receipt' "$journal_path" >/dev/null 2>&1
 }
 
 replace_gate() {
@@ -112,7 +158,7 @@ replace_gate() {
 emit_gate_result() {
   local status=$1
   jq -cS --arg status "$status" \
-    '{status:$status,state:.state,operationJournalSha256:.operationJournalSha256,gate:.}' "$gate"
+    '{status:$status,state:.state,operationBindingSha256:(.operationBindingSha256 // null),operationJournalSha256:(.operationJournalSha256 // null),gate:.}' "$gate"
 }
 
 case $action in
@@ -140,9 +186,13 @@ case $action in
           continue
         fi
         if validate_canonical "$path" "$gate_validator" plugin_id "$plugin_id"; then
-          next=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-inventory-next.XXXXXX")
-          jq --argjson gate "$(<"$path")" '. + [{pluginId:$gate.pluginId,valid:true,record:$gate}]' "$inventory" >"$next"
-          mv -- "$next" "$inventory"
+          terminal_safe=false
+          terminal_gate_safe "$path" && terminal_safe=true
+          if [[ $terminal_safe != true ]]; then
+            next=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-inventory-next.XXXXXX")
+            jq --argjson gate "$(<"$path")" '. + [{pluginId:$gate.pluginId,valid:true,record:$gate}]' "$inventory" >"$next"
+            mv -- "$next" "$inventory"
+          fi
         else
           next=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-inventory-next.XXXXXX")
           jq --arg plugin "$plugin_id" '. + [{pluginId:$plugin,valid:false,record:null}]' "$inventory" >"$next"
@@ -154,6 +204,36 @@ case $action in
         global=global-unreadable
       fi
     done
+    # A terminal journal without its matching durable terminal receipt is
+    # still blocking.  Keep this per-plugin so an unrelated plugin can
+    # continue, while an unidentifiable/corrupt journal fails the inventory
+    # closed for the whole authority set.
+    for path in "$state_root/journals"/*.journal; do
+      [[ -e $path || -L $path ]] || continue
+      name=${path##*/}
+      [[ $name =~ ^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.journal$ ]] || {
+        global=global-unreadable
+        continue
+      }
+      operation_id=${BASH_REMATCH[1]}
+      if ! validate_canonical "$path" "$journal_validator" operation_id "$operation_id"; then
+        global=global-unreadable
+        continue
+      fi
+      journal_state=$(jq -r '.state // ""' "$path")
+      [[ $journal_state == COMMITTED || $journal_state == ROLLED_BACK ]] || continue
+      plugin_id=$(jq -r '.pluginId // ""' "$path")
+      if ! valid_plugin "$plugin_id"; then
+        global=global-unreadable
+        continue
+      fi
+      gate_path=$state_root/gates/$plugin_id.gate
+      if [[ ! -f $gate_path ]] || ! terminal_gate_safe "$gate_path"; then
+        next=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-inventory-next.XXXXXX")
+        jq --arg plugin "$plugin_id" '. + [{pluginId:$plugin,valid:false,record:null}]' "$inventory" >"$next"
+        mv -- "$next" "$inventory"
+      fi
+    done
     jq -cn --arg status "$global" --slurpfile gates "$inventory" \
       '{schema:"omarchy-plugin-gate-inventory/v1",status:$status,gates:$gates[0]}'
     rm -f -- "$inventory"
@@ -162,16 +242,62 @@ case $action in
     [[ $# == 2 ]] || fail usage 'install OPERATION_ID PLUGIN_ID'
     operation_id=$1; plugin_id=$2
     load_operation "$operation_id" "$plugin_id"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") != COMMIT_PREPARED ]]; then
+      fail operation-state-mismatch "$operation_id"
+    fi
     "$helper" gate-sync "$state_root"
     if [[ -e $gate || -L $gate ]]; then
       validate_canonical "$gate" "$gate_validator" plugin_id "$plugin_id" || fail gate-state-invalid "$plugin_id"
-      [[ $(jq -r .operationId "$gate") == "$operation_id" ]] || fail plugin-gated-by-another-operation "$plugin_id"
-      [[ $(jq -r .operationJournalSha256 "$gate") == "$journal_sha" ]] || fail operation-journal-changed "$operation_id"
-      emit_gate_result already-gated
-      exit 0
+      replace_terminal_gate=false
+      if [[ $(jq -r .operationId "$gate") != "$operation_id" ]]; then
+        if ! terminal_gate_safe "$gate"; then
+          fail plugin-gated-by-another-operation "$plugin_id"
+        fi
+        # A validated terminal receipt paired with its terminal journal is a
+        # completed, non-blocking handoff.  It is safe to replace it with the
+        # new operation's gate; its old binding must not be compared with the
+        # new operation below.
+        replace_terminal_gate=true
+      fi
+      if [[ $replace_terminal_gate != true ]]; then
+        if [[ $journal_schema == omarchy-plugin-transaction-journal/v1 ]]; then
+          [[ $(jq -r .operationJournalSha256 "$gate") == "$journal_sha" ]] || fail operation-journal-changed "$operation_id"
+        else
+          [[ $(jq -r .schema "$gate") == omarchy-plugin-transaction-gate/v2 && $(jq -r .operationBindingSha256 "$gate") == "$operation_binding" ]] || fail operation-binding-mismatch "$operation_id"
+        fi
+        if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
+          existing_gate_state=$(jq -r .state "$gate")
+          case $existing_gate_state in
+            GATED|UNLOAD_ACKNOWLEDGED)
+              emit_gate_result already-gated
+              exit 0
+              ;;
+            *)
+              fail operation-state-mismatch "$operation_id"
+              ;;
+          esac
+        fi
+        emit_gate_result already-gated
+        exit 0
+      fi
     fi
     input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
-    jq -cS --arg journalSha "$journal_sha" '
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
+      jq -cS --arg binding "$operation_binding" '
+      {schema:"omarchy-plugin-transaction-gate/v2",operationId:.operationId,pluginId:.pluginId,
+       operationBindingSha256:$binding,state:"GATED",
+       expected:{tree:.candidate.observed,destination:.normalizedRequest.facts.destination,
+         targetRole:"candidate",configurationSource:.normalizedRequest.facts.expectedConfiguration.source,
+         referenceProjection:.normalizedRequest.facts.expectedConfiguration.referenceProjection,
+         referenceState:.normalizedRequest.facts.expectedConfiguration.referenceState,
+         referencePolicy:.normalizedRequest.facts.expectedConfiguration.referencePolicy},
+       unload:"pending",
+       rescan:{expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null,targetRole:"none"},
+       release:{configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null},
+       rollback:{targetRole:"none",target:null,outcome:"not-requested"},
+       terminalReceipt:{state:"not-requested",intendedJournalState:null,operationBindingSha256:null,operationId:null,pluginId:null,targetRole:"none",target:null,shellInstance:null,generation:null,scanEpoch:null,configurationEpoch:null,outcome:"not-requested"}}' "$journal" >"$input"
+    else
+      jq -cS --arg journalSha "$journal_sha" '
       {schema:"omarchy-plugin-transaction-gate/v1",operationId:.operationId,pluginId:.pluginId,
        operationJournalSha256:$journalSha,state:"GATED",
        expected:{tree:.candidate.observed,destination:.normalizedRequest.facts.destination,
@@ -182,6 +308,7 @@ case $action in
        unload:"pending",
        rescan:{expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null},
        release:{configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}}' "$journal" >"$input"
+    fi
     replace_gate "$plugin_id" "$input" gate-install
     rm -f -- "$input"
     gate="$state_root/gates/$plugin_id.gate"
@@ -192,11 +319,15 @@ case $action in
     operation_id=$1; plugin_id=$2; shell_instance=$3
     [[ -n $shell_instance && ${#shell_instance} -le 128 ]] || fail invalid-shell-instance "$shell_instance"
     load_gate "$operation_id" "$plugin_id"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") != COMMIT_PREPARED ]]; then
+      fail operation-state-mismatch "$operation_id"
+    fi
     state=$(jq -r .state "$gate")
-    if [[ $state != GATED ]]; then
+    if [[ $state == UNLOAD_ACKNOWLEDGED ]]; then
       emit_gate_result already-unloaded
       exit 0
     fi
+    [[ $state == GATED ]] || fail operation-state-mismatch "$operation_id"
     input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
     jq -cS '.state="UNLOAD_ACKNOWLEDGED" | .unload="acknowledged"' "$gate" >"$input"
     replace_gate "$plugin_id" "$input" gate-unload-acknowledged
@@ -209,6 +340,9 @@ case $action in
     operation_id=$1; plugin_id=$2; shell_instance=$3; generation=$4; scan_epoch=$5; source_directory=${6%/}
     [[ $generation =~ ^[0-9]+$ && $scan_epoch =~ ^[0-9]+$ && -n $shell_instance && ${#shell_instance} -le 128 ]] || fail invalid-rescan-binding "$plugin_id"
     load_gate "$operation_id" "$plugin_id"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") != LIVE_TREE_EXCHANGED ]]; then
+      fail operation-state-mismatch "$operation_id"
+    fi
     state=$(jq -r .state "$gate")
     if [[ $state == RESCAN_ACKNOWLEDGED ]]; then
       [[ $(jq -r .rescan.shellInstance "$gate") == "$shell_instance"
@@ -226,9 +360,15 @@ case $action in
     observed=$("$helper" identity "$destination")
     [[ $observed == "$expected" ]] || fail expected-live-tree-mismatch "$plugin_id"
     input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
-    jq -cS --arg instance "$shell_instance" --argjson generation "$generation" --argjson scanEpoch "$scan_epoch" \
-      --arg source "$source_directory" --arg tree "$expected" \
-      '.state="RESCAN_ACKNOWLEDGED" | .rescan={expectedTree:$tree,generation:$generation,observedTree:$tree,outcome:"completed",scanEpoch:$scanEpoch,shellInstance:$instance,sourceDirectory:$source}' "$gate" >"$input"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
+      jq -cS --arg instance "$shell_instance" --argjson generation "$generation" --argjson scanEpoch "$scan_epoch" \
+        --arg source "$source_directory" --arg tree "$expected" \
+        '.state="RESCAN_ACKNOWLEDGED" | .rescan={expectedTree:$tree,generation:$generation,observedTree:$tree,outcome:"completed",scanEpoch:$scanEpoch,shellInstance:$instance,sourceDirectory:$source,targetRole:"candidate"}' "$gate" >"$input"
+    else
+      jq -cS --arg instance "$shell_instance" --argjson generation "$generation" --argjson scanEpoch "$scan_epoch" \
+        --arg source "$source_directory" --arg tree "$expected" \
+        '.state="RESCAN_ACKNOWLEDGED" | .rescan={expectedTree:$tree,generation:$generation,observedTree:$tree,outcome:"completed",scanEpoch:$scanEpoch,shellInstance:$instance,sourceDirectory:$source}' "$gate" >"$input"
+    fi
     replace_gate "$plugin_id" "$input" gate-rescan-acknowledged
     rm -f -- "$input"
     gate="$state_root/gates/$plugin_id.gate"
@@ -236,12 +376,72 @@ case $action in
       shellInstance:.rescan.shellInstance,generation:.rescan.generation,scanEpoch:.rescan.scanEpoch,
       sourceDirectory:.rescan.sourceDirectory,tree:.rescan.observedTree,execution:"not-observed",gate:.}' "$gate"
     ;;
+  retarget-rollback)
+    [[ $# == 5 ]] || fail usage 'retarget-rollback OPERATION_ID PLUGIN_ID SHELL_INSTANCE TARGET_ROLE TARGET_IDENTITY'
+    operation_id=$1; plugin_id=$2; shell_instance=$3; target_role=$4; target_identity=$5
+    [[ -n $shell_instance && ${#shell_instance} -le 128 ]] || fail invalid-shell-instance "$plugin_id"
+    [[ $target_role == prior-tree || $target_role == absence ]] || fail invalid-rollback-target "$plugin_id"
+    if [[ $target_role == prior-tree ]]; then
+      [[ $target_identity =~ ^omarchy-runtime-tree-sha256-v1:[0-9a-f]{64}$ ]] || fail invalid-rollback-target "$plugin_id"
+    else
+      [[ -z $target_identity ]] || fail invalid-rollback-target "$plugin_id"
+    fi
+    load_gate "$operation_id" "$plugin_id"
+    [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") == ROLLBACK_STARTED ]] || fail operation-state-mismatch "$operation_id"
+    [[ $(jq -r .state "$gate") == UNLOAD_ACKNOWLEDGED || $(jq -r .state "$gate") == RESCAN_ACKNOWLEDGED ]] || fail unload-incomplete "$plugin_id"
+    input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
+    if [[ $target_role == absence ]]; then
+      jq -cS --arg role "$target_role" \
+        '.state="UNLOAD_ACKNOWLEDGED" | .expected.targetRole=$role | .expected.tree=null | .rollback={targetRole:$role,target:{state:"absent",identity:null},outcome:"pending"} | .rescan={expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null,targetRole:"none"} | .release={configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null} | .terminalReceipt={state:"not-requested",intendedJournalState:null,operationBindingSha256:null,operationId:null,pluginId:null,targetRole:"none",target:null,shellInstance:null,generation:null,scanEpoch:null,configurationEpoch:null,outcome:"not-requested"}' "$gate" >"$input"
+    else
+      jq -cS --arg role "$target_role" --arg tree "$target_identity" \
+        '.state="UNLOAD_ACKNOWLEDGED" | .expected.targetRole=$role | .expected.tree=$tree | .rollback={targetRole:$role,target:{state:"present",identity:$tree},outcome:"pending"} | .rescan={expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null,targetRole:"none"} | .release={configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null} | .terminalReceipt={state:"not-requested",intendedJournalState:null,operationBindingSha256:null,operationId:null,pluginId:null,targetRole:"none",target:null,shellInstance:null,generation:null,scanEpoch:null,configurationEpoch:null,outcome:"not-requested"}' "$gate" >"$input"
+    fi
+    replace_gate "$plugin_id" "$input" rollback-gate-retarget
+    rm -f -- "$input"
+    gate="$state_root/gates/$plugin_id.gate"
+    emit_gate_result rollback-targeted
+    ;;
+  acknowledge-rollback-rescan)
+    [[ $# == 6 ]] || fail usage 'acknowledge-rollback-rescan OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION SCAN_EPOCH SOURCE_DIRECTORY'
+    operation_id=$1; plugin_id=$2; shell_instance=$3; generation=$4; scan_epoch=$5; source_directory=${6%/}
+    [[ $generation =~ ^[0-9]+$ && $scan_epoch =~ ^[0-9]+$ && -n $shell_instance && ${#shell_instance} -le 128 ]] || fail invalid-rescan-binding "$plugin_id"
+    load_gate "$operation_id" "$plugin_id"
+    [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") == ROLLBACK_STARTED ]] || fail operation-state-mismatch "$operation_id"
+    [[ $(jq -r .state "$gate") == UNLOAD_ACKNOWLEDGED ]] || fail unload-incomplete "$plugin_id"
+    destination=$(jq -r .expected.destination "$gate")
+    [[ $source_directory == "$destination" ]] || fail registry-source-mismatch "$plugin_id"
+    target_role=$(jq -r .expected.targetRole "$gate")
+    expected=$(jq -r '.expected.tree // ""' "$gate")
+    if [[ $target_role == absence ]]; then
+      [[ ! -e $destination && ! -L $destination ]] || fail expected-rollback-absence-missing "$plugin_id"
+    else
+      [[ -d $destination && ! -L $destination ]] || fail expected-rollback-tree-missing "$plugin_id"
+      observed=$($helper identity "$destination")
+      [[ $observed == "$expected" ]] || fail expected-rollback-tree-mismatch "$plugin_id"
+    fi
+    input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
+    if [[ $target_role == absence ]]; then
+      jq -cS --arg instance "$shell_instance" --argjson generation "$generation" --argjson scanEpoch "$scan_epoch" --arg source "$source_directory" \
+        '.state="RESCAN_ACKNOWLEDGED" | .rescan={expectedTree:null,generation:$generation,observedTree:null,outcome:"completed",scanEpoch:$scanEpoch,shellInstance:$instance,sourceDirectory:$source,targetRole:"absence"} | .rollback.outcome="pending"' "$gate" >"$input"
+    else
+      jq -cS --arg instance "$shell_instance" --argjson generation "$generation" --argjson scanEpoch "$scan_epoch" --arg source "$source_directory" --arg tree "$expected" \
+        '.state="RESCAN_ACKNOWLEDGED" | .rescan={expectedTree:$tree,generation:$generation,observedTree:$tree,outcome:"completed",scanEpoch:$scanEpoch,shellInstance:$instance,sourceDirectory:$source,targetRole:"prior-tree"} | .rollback.outcome="pending"' "$gate" >"$input"
+    fi
+    replace_gate "$plugin_id" "$input" rollback-rescan-acknowledged
+    rm -f -- "$input"
+    gate="$state_root/gates/$plugin_id.gate"
+    emit_gate_result rollback-rescan-complete
+    ;;
   authorize-release)
     [[ $# == 9 ]] || fail usage 'authorize-release OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION EPOCH SOURCE_KIND SOURCE_IDENTITY PROJECTION REFERENCE_STATE'
     operation_id=$1; plugin_id=$2; shell_instance=$3; generation=$4; epoch=$5
     source_kind=$6; source_identity=$7; projection=$8; reference_state=$9
     [[ $generation =~ ^[0-9]+$ && $epoch =~ ^[0-9]+$ ]] || fail invalid-release-binding "$plugin_id"
     load_gate "$operation_id" "$plugin_id"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") != RELEASE_PENDING ]]; then
+      fail operation-state-mismatch "$operation_id"
+    fi
     state=$(jq -r .state "$gate")
     if [[ $state == RELEASE_AUTHORIZED ]]; then
       [[ $(jq -r .release.shellInstance "$gate") == "$shell_instance"
@@ -277,11 +477,81 @@ case $action in
     jq -cS '{status:"release-authorized",state:.state,operationJournalSha256:.operationJournalSha256,
       configurationEpoch:.release.configurationEpoch,execution:"not-observed",gate:.}' "$gate"
     ;;
+  authorize-rollback-release)
+    [[ $# == 9 ]] || fail usage 'authorize-rollback-release OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION EPOCH SOURCE_KIND SOURCE_IDENTITY PROJECTION REFERENCE_STATE'
+    operation_id=$1; plugin_id=$2; shell_instance=$3; generation=$4; epoch=$5
+    source_kind=$6; source_identity=$7; projection=$8; reference_state=$9
+    [[ $generation =~ ^[0-9]+$ && $epoch =~ ^[0-9]+$ ]] || fail invalid-release-binding "$plugin_id"
+    load_gate "$operation_id" "$plugin_id"
+    [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") == ROLLBACK_STARTED ]] || fail operation-state-mismatch "$operation_id"
+    state=$(jq -r .state "$gate")
+    [[ $state == RESCAN_ACKNOWLEDGED || $state == RELEASE_AUTHORIZED ]] || fail rollback-rescan-missing "$plugin_id"
+    [[ $(jq -r .rescan.shellInstance "$gate") == "$shell_instance" &&
+       $(jq -r .rescan.generation "$gate") == "$generation" ]] || fail stale-release-binding "$plugin_id"
+    [[ $(jq -r .expected.configurationSource.kind "$gate") == "$source_kind" && $(jq -r .expected.configurationSource.identity "$gate") == "$source_identity" ]] || fail release-configuration-source-mismatch "$plugin_id"
+    policy=$(jq -r .expected.referencePolicy "$gate")
+    if [[ $policy == require-unreferenced ]]; then
+      [[ $projection == sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 && $reference_state == unreferenced ]] || fail release-reference-mismatch "$plugin_id"
+    else
+      [[ $(jq -r .expected.referenceProjection "$gate") == "$projection" && $(jq -r .expected.referenceState "$gate") == "$reference_state" ]] || fail release-reference-mismatch "$plugin_id"
+    fi
+    destination=$(jq -r .expected.destination "$gate")
+    target_role=$(jq -r .expected.targetRole "$gate")
+    expected=$(jq -r '.expected.tree // ""' "$gate")
+    if [[ $target_role == absence ]]; then
+      [[ ! -e $destination && ! -L $destination ]] || fail expected-rollback-absence-missing "$plugin_id"
+    else
+      [[ -d $destination && ! -L $destination ]] || fail expected-rollback-tree-missing "$plugin_id"
+      observed=$($helper identity "$destination")
+      [[ $observed == "$expected" ]] || fail expected-rollback-tree-mismatch "$plugin_id"
+    fi
+    if [[ $state == RELEASE_AUTHORIZED ]]; then
+      emit_gate_result rollback-release-already-authorized
+      exit 0
+    fi
+    input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
+    jq -cS --arg instance "$shell_instance" --argjson generation "$generation" --argjson epoch "$epoch" \
+      '.state="RELEASE_AUTHORIZED" | .release={configurationEpoch:$epoch,generation:$generation,outcome:"authorized",shellInstance:$instance}' "$gate" >"$input"
+    replace_gate "$plugin_id" "$input" rollback-release-authorized
+    rm -f -- "$input"
+    gate="$state_root/gates/$plugin_id.gate"
+    jq -cS '{status:"rollback-release-authorized",state:.state,operationBindingSha256:.operationBindingSha256,configurationEpoch:.release.configurationEpoch,gate:.}' "$gate"
+    ;;
+  terminal-receipt)
+    [[ $# == 3 ]] || fail usage 'terminal-receipt OPERATION_ID PLUGIN_ID COMMITTED|ROLLED_BACK'
+    operation_id=$1; plugin_id=$2; intended_state=$3
+    [[ $intended_state == COMMITTED || $intended_state == ROLLED_BACK ]] || fail invalid-terminal-state "$intended_state"
+    load_gate "$operation_id" "$plugin_id"
+    if [[ $intended_state == COMMITTED ]]; then
+      [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") == RELEASE_PENDING ]] || fail operation-state-mismatch "$operation_id"
+    else
+      [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") == ROLLBACK_STARTED ]] || fail operation-state-mismatch "$operation_id"
+    fi
+    [[ $(jq -r .state "$gate") == RELEASE_AUTHORIZED ]] || fail release-not-authorized "$plugin_id"
+    input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
+    target_role=$(jq -r .expected.targetRole "$gate")
+    target_identity=$(jq -r '.expected.tree // ""' "$gate")
+    jq -cS --arg intended "$intended_state" --arg binding "$operation_binding" --arg operationId "$operation_id" --arg pluginId "$plugin_id" \
+      --arg role "$target_role" --arg tree "$target_identity" --arg instance "$(jq -r .release.shellInstance "$gate")" \
+      --argjson generation "$(jq -r .release.generation "$gate")" --argjson scanEpoch "$(jq -r .rescan.scanEpoch "$gate")" \
+      --argjson configurationEpoch "$(jq -r .release.configurationEpoch "$gate")" \
+      '.state="TERMINAL_RECEIPT" | .terminalReceipt={state:"durable",intendedJournalState:$intended,operationBindingSha256:$binding,operationId:$operationId,pluginId:$pluginId,targetRole:$role,target:(if $role == "absence" then {state:"absent",identity:null} else {state:"present",identity:$tree} end),shellInstance:$instance,generation:$generation,scanEpoch:$scanEpoch,configurationEpoch:$configurationEpoch,outcome:(if $intended == "ROLLED_BACK" then "restored" else "authorized" end)}' "$gate" >"$input"
+    replace_gate "$plugin_id" "$input" terminal-receipt
+    rm -f -- "$input"
+    gate="$state_root/gates/$plugin_id.gate"
+    jq -cS '{status:"terminal-receipt-durable",state:.state,operationBindingSha256:.operationBindingSha256,terminalReceipt:.terminalReceipt,gate:.}' "$gate"
+    ;;
   retain-release)
     [[ $# == 4 ]] || fail usage 'retain-release OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION'
     operation_id=$1; plugin_id=$2; shell_instance=$3; generation=$4
     [[ $generation =~ ^[0-9]+$ && -n $shell_instance && ${#shell_instance} -le 128 ]] || fail invalid-release-binding "$plugin_id"
     load_gate "$operation_id" "$plugin_id"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
+      case $(jq -r .state "$journal") in
+        RELEASE_PENDING|ROLLBACK_STARTED) ;;
+        *) fail operation-state-mismatch "$operation_id" ;;
+      esac
+    fi
     state=$(jq -r .state "$gate")
     if [[ $state == UNLOAD_ACKNOWLEDGED ]]; then
       emit_gate_result release-retained
@@ -297,9 +567,16 @@ case $action in
       fail release-not-authorized "$plugin_id"
     fi
     input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
-    jq -cS '.state="UNLOAD_ACKNOWLEDGED"
-      | .rescan={expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null}
-      | .release={configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}' "$gate" >"$input"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
+      jq -cS '.state="UNLOAD_ACKNOWLEDGED"
+        | .rescan={expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null,targetRole:"none"}
+        | .release={configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}
+        | .terminalReceipt={state:"not-requested",intendedJournalState:null,operationBindingSha256:null,operationId:null,pluginId:null,targetRole:"none",target:null,shellInstance:null,generation:null,scanEpoch:null,configurationEpoch:null,outcome:"not-requested"}' "$gate" >"$input"
+    else
+      jq -cS '.state="UNLOAD_ACKNOWLEDGED"
+        | .rescan={expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null}
+        | .release={configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}' "$gate" >"$input"
+    fi
     replace_gate "$plugin_id" "$input" gate-release-retained
     rm -f -- "$input"
     gate="$state_root/gates/$plugin_id.gate"

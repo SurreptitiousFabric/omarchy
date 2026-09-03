@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/if_alg.h>
+#include <linux/fs.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -935,6 +936,227 @@ static void print_identity(const char *root_path) {
   fputc('\n', stdout);
 }
 
+/* Compute an identity from an already opened, no-follow directory.  O-8
+ * namespace operations use this descriptor-pinned boundary for every
+ * precheck and postcheck; the operation never hashes a caller-replaceable
+ * pathname. */
+static void identity_from_fd(int root, char output[96]) {
+  int hash = open_hash();
+  hash_update(hash, DOMAIN, sizeof(DOMAIN) - 1, ".");
+  WalkContext context = {.hash_fd = hash, .total_bytes = 0, .entries = 0};
+  walk_tree(root, -1, "", 0, &context);
+  if (send(hash, NULL, 0, 0) < 0)
+    fail_io("finalize sha256", "AF_ALG");
+  unsigned char digest[32];
+  ssize_t received = read(hash, digest, sizeof(digest));
+  close(hash);
+  if (received != (ssize_t)sizeof(digest))
+    fail_io("read sha256", "AF_ALG");
+  int length = snprintf(output, 96, "omarchy-runtime-tree-sha256-v1:");
+  if (length < 0 || length >= 96)
+    fail_io("format identity", "namespace");
+  for (size_t index = 0; index < sizeof(digest); index++)
+    snprintf(output + 31 + index * 2, 3, "%02x", digest[index]);
+}
+
+static bool identity_matches(const char *actual, const char *expected) {
+  return expected != NULL && strlen(expected) == 95 &&
+         strcmp(actual, expected) == 0;
+}
+
+static bool simple_name(const char *name);
+
+static void emit_namespace_result(const char *status, const char *operation,
+                                  const char *source, const char *destination,
+                                  const char *detail, int exit_code) {
+  printf("{\"destinationIdentity\":\"%s\",\"operation\":\"%s\","
+         "\"sourceIdentity\":\"%s\",\"status\":\"%s\","
+         "\"detail\":\"%s\"}\n",
+         destination != NULL ? destination : "", operation, source, status,
+         detail != NULL ? detail : "");
+  fflush(stdout);
+  exit(exit_code);
+}
+
+static int open_namespace_parent(const char *path, const char *description) {
+  int parent = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (parent < 0)
+    fail_io(description, path);
+  struct stat status;
+  if (fstat(parent, &status) < 0)
+    fail_io("stat namespace parent", path);
+  if (!S_ISDIR(status.st_mode) || status.st_nlink < 1)
+    reject_tree("invalid-namespace-parent", path);
+  return parent;
+}
+
+static void namespace_mutate(const char *operation, const char *source_parent,
+                             const char *source_name, const char *dest_parent,
+                             const char *dest_name, const char *expected_source,
+                             const char *expected_destination) {
+  if (!simple_name(source_name) || !simple_name(dest_name))
+    reject_tree("invalid-namespace-entry", "namespace");
+  int source_directory = open_namespace_parent(source_parent,
+                                                "open candidate parent");
+  int destination_directory = open_namespace_parent(dest_parent,
+                                                     "open discovery parent");
+  struct stat source_parent_stat;
+  struct stat destination_parent_stat;
+  if (fstat(source_directory, &source_parent_stat) < 0 ||
+      fstat(destination_directory, &destination_parent_stat) < 0)
+    fail_io("stat namespace parent", "namespace");
+  if (source_parent_stat.st_dev != destination_parent_stat.st_dev)
+    emit_namespace_result("unsupported-atomic-operation", operation, "", "",
+                          "different-filesystem", 4);
+
+  struct stat source_stat;
+  if (fstatat(source_directory, source_name, &source_stat,
+              AT_SYMLINK_NOFOLLOW) < 0)
+    fail_io("stat namespace source", source_name);
+  if (!S_ISDIR(source_stat.st_mode))
+    emit_namespace_result("stale-candidate", operation, "", "",
+                          "source-not-directory", 2);
+  int source = openat(source_directory, source_name,
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (source < 0)
+    fail_io("open namespace source", source_name);
+  char source_identity[96];
+  identity_from_fd(source, source_identity);
+  if (!identity_matches(source_identity, expected_source))
+    emit_namespace_result("stale-candidate", operation, source_identity, "",
+                          "source-identity-mismatch", 2);
+
+  struct stat destination_stat;
+  bool destination_exists =
+      fstatat(destination_directory, dest_name, &destination_stat,
+              AT_SYMLINK_NOFOLLOW) == 0;
+  if (strcmp(operation, "install") == 0 ||
+      strcmp(operation, "rollback-install") == 0) {
+    if (destination_exists)
+      emit_namespace_result("destination-unexpectedly-present", operation,
+                            source_identity, "", "noreplace-destination", 2);
+  } else {
+    if (!destination_exists || !S_ISDIR(destination_stat.st_mode))
+      emit_namespace_result("stale-active-tree", operation, source_identity,
+                            "", "exchange-destination", 2);
+    int destination = openat(destination_directory, dest_name,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (destination < 0)
+      fail_io("open namespace destination", dest_name);
+    char active_identity[96];
+    identity_from_fd(destination, active_identity);
+    close(destination);
+    if (!identity_matches(active_identity, expected_destination))
+      emit_namespace_result("stale-active-tree", operation, source_identity,
+                            active_identity, "destination-identity-mismatch", 2);
+  }
+
+  bool exchange = strcmp(operation, "exchange") == 0 ||
+                  strcmp(operation, "rollback-exchange") == 0;
+  const unsigned int flags = exchange ? RENAME_EXCHANGE : RENAME_NOREPLACE;
+  const char *fault_name = exchange ? "namespace-exchange" : "namespace-install";
+  test_hook(exchange ? "before-namespace-exchange" : "before-namespace-install");
+  if (test_rename_failure(fault_name))
+    emit_namespace_result("definitely-not-performed", operation, source_identity,
+                          "", "rename-failed", 3);
+  if (syscall(SYS_renameat2, source_directory, source_name,
+              destination_directory, dest_name, flags) < 0) {
+    if (errno == ENOSYS || errno == EINVAL)
+      emit_namespace_result("unsupported-atomic-operation", operation,
+                            source_identity, "", "renameat2", 4);
+    if (errno == EEXIST)
+      emit_namespace_result("destination-unexpectedly-present", operation,
+                            source_identity, "", "noreplace-destination", 2);
+    fail_io("rename namespace", dest_name);
+  }
+  test_hook(exchange ? "after-namespace-exchange" : "after-namespace-install");
+
+  int saved_errno = 0;
+  if (sync_fd(source_directory, "namespace-candidate-parent") < 0)
+    saved_errno = errno;
+  if (saved_errno == 0 && sync_fd(destination_directory,
+                                  "namespace-discovery-parent") < 0)
+    saved_errno = errno;
+  if (saved_errno != 0) {
+    bool compensated = false;
+    if (exchange) {
+      compensated = syscall(SYS_renameat2, source_directory, source_name,
+                            destination_directory, dest_name,
+                            RENAME_EXCHANGE) == 0;
+    } else {
+      compensated = syscall(SYS_renameat2, destination_directory, dest_name,
+                            source_directory, source_name,
+                            RENAME_NOREPLACE) == 0;
+    }
+    if (compensated && sync_fd(source_directory,
+                               "namespace-candidate-parent") == 0 &&
+        sync_fd(destination_directory, "namespace-discovery-parent") == 0) {
+      close(source);
+      close(source_directory);
+      close(destination_directory);
+      emit_namespace_result("completed-and-exactly-compensated", operation,
+                            source_identity, "", "parent-sync-failed", 0);
+    }
+    close(source);
+    close(source_directory);
+    close(destination_directory);
+    emit_namespace_result("indeterminate-namespace", operation, source_identity,
+                          "", "parent-sync-failed", 5);
+  }
+  close(source);
+  int destination = openat(destination_directory, dest_name,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (destination < 0)
+    emit_namespace_result("exact-postcheck-mismatch", operation, source_identity,
+                          "", "destination-missing", 5);
+  char destination_identity[96];
+  identity_from_fd(destination, destination_identity);
+  close(destination);
+  if (exchange) {
+    struct stat retained_status;
+    if (fstatat(source_directory, source_name, &retained_status,
+                AT_SYMLINK_NOFOLLOW) < 0)
+      emit_namespace_result("exact-postcheck-mismatch", operation,
+                            source_identity, destination_identity,
+                            errno == ENOENT ? "retained-source-missing"
+                                            : "retained-source-unreadable",
+                            5);
+    if (!S_ISDIR(retained_status.st_mode))
+      emit_namespace_result("exact-postcheck-mismatch", operation,
+                            source_identity, destination_identity,
+                            "retained-source-not-directory", 5);
+    int retained = openat(source_directory, source_name,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (retained < 0)
+      fail_io("open retained source", source_name);
+    char retained_identity[96];
+    identity_from_fd(retained, retained_identity);
+    close(retained);
+    if (!identity_matches(retained_identity, expected_destination))
+      emit_namespace_result("exact-postcheck-mismatch", operation,
+                            source_identity, destination_identity,
+                            "retained-source-identity-mismatch", 5);
+  } else {
+    struct stat source_after;
+    if (fstatat(source_directory, source_name, &source_after,
+                AT_SYMLINK_NOFOLLOW) == 0)
+      emit_namespace_result("exact-postcheck-mismatch", operation,
+                            source_identity, destination_identity,
+                            "source-slot-still-present", 5);
+    if (errno != ENOENT)
+      emit_namespace_result("indeterminate-namespace", operation,
+                            source_identity, destination_identity,
+                            "source-slot-unreadable", 5);
+  }
+  close(source_directory);
+  close(destination_directory);
+  if (!identity_matches(destination_identity, expected_source))
+    emit_namespace_result("exact-postcheck-mismatch", operation, source_identity,
+                          destination_identity, "candidate-not-live", 5);
+  emit_namespace_result("completed-durable", operation, source_identity,
+                        destination_identity, "", 0);
+}
+
 static bool simple_name(const char *name) {
   size_t length = strlen(name);
   return length > 0 && length <= 128 && strcmp(name, ".") != 0 &&
@@ -1352,6 +1574,17 @@ static void sync_directory_path(const char *path, const char *point) {
   if (sync_fd(directory, point) < 0)
     fail_io("sync directory", path);
   close(directory);
+}
+
+static void probe_atomic_support(void) {
+  errno = 0;
+  long result = syscall(SYS_renameat2, -1, "", -1, "", RENAME_NOREPLACE);
+  (void)result;
+  if (errno == ENOSYS) {
+    fputs("unsupported-atomic-operation\n", stdout);
+    exit(4);
+  }
+  fputs("supported-atomic-operation\n", stdout);
 }
 
 static bool equal_file_bytes(int left, int right) {
@@ -1940,6 +2173,15 @@ int main(int argc, char **argv) {
     publish_snapshot(argv[2], argv[3], argv[4]);
     return 0;
   }
+  if (argc == 9 && strcmp(argv[1], "namespace-mutate") == 0) {
+    if (strcmp(argv[2], "install") != 0 && strcmp(argv[2], "exchange") != 0 &&
+        strcmp(argv[2], "rollback-install") != 0 &&
+        strcmp(argv[2], "rollback-exchange") != 0)
+      reject_tree("invalid-namespace-operation", argv[2]);
+    namespace_mutate(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                     argv[8]);
+    return 0;
+  }
   if (argc == 6 && strcmp(argv[1], "journal-replace") == 0) {
     replace_journal(argv[2], argv[3], argv[4], argv[5]);
     return 0;
@@ -1954,6 +2196,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 3 && strcmp(argv[1], "domain-hash") == 0) {
     print_domain_hash(argv[2]);
+    return 0;
+  }
+  if (argc == 2 && strcmp(argv[1], "atomic-support") == 0) {
+    probe_atomic_support();
     return 0;
   }
   if (argc == 4 && strcmp(argv[1], "sync-directory") == 0) {
@@ -2002,8 +2248,9 @@ int main(int argc, char **argv) {
           "usage: %s identity ROOT | copy SOURCE PARENT NAME | prepare-import SOURCE STORE TEMPORARY | "
           "publish PARENT TEMPORARY COMPLETED | "
           "state-init STATE | journal-replace STATE OPERATION INPUT TRANSITION | "
+          "namespace-mutate install|exchange|rollback-install|rollback-exchange SOURCE-PARENT SOURCE-NAME DEST-PARENT DEST-NAME EXPECTED-SOURCE EXPECTED-DEST | "
           "gate-replace STATE PLUGIN INPUT TRANSITION | gate-sync STATE | "
-          "domain-hash DOMAIN | sync-directory PATH POINT | "
+          "domain-hash DOMAIN | sync-directory PATH POINT | atomic-support | "
           "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "
           "journal-read STATE OPERATION | journal-read-locked STATE OPERATION | "
           "journal-read-held STATE OPERATION | json-request-check | "
