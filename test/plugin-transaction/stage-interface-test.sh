@@ -59,6 +59,19 @@ printf '%s\n' "$token" | "$real_stage" "$@"
 SH
 chmod 0755 "$INSTALL_ROOT/native/plugin-transaction/stage-candidate"
 
+mv "$INSTALL_ROOT/bin/omarchy-plugin-validate" "$INSTALL_ROOT/bin/omarchy-plugin-validate.real"
+cat >"$INSTALL_ROOT/bin/omarchy-plugin-validate" <<'SH'
+#!/bin/bash
+set -euo pipefail
+if [[ -e $HOME/.o7-validator-fail-once ]]; then
+  rm "$HOME/.o7-validator-fail-once"
+  printf 'diagnostic mentions manifest-id-mismatch but is not a machine result\n' >&2
+  exit 1
+fi
+exec "$(dirname -- "${BASH_SOURCE[0]}")/omarchy-plugin-validate.real" "$@"
+SH
+chmod 0755 "$INSTALL_ROOT/bin/omarchy-plugin-validate"
+
 cat >"$INSTALL_ROOT/bin/omarchy-shell" <<'SH'
 #!/bin/bash
 set -euo pipefail
@@ -239,7 +252,58 @@ replay_output=$(printf '%s' "$install_request" | invoke 2>"$TEST_ROOT/replay.err
 [[ $replay_output == "$install_output" ]]
 [[ $(stat -c '%d:%i' "$STORE/$install_operation/candidate") == "$candidate_inode" ]]
 [[ $(sha256sum "$journal") == "$journal_sha" ]]
+rm "$HOME_DIR/.o7-shell-unavailable"
 printf 'ok - exact replay needs neither external source nor shell authority\n'
+
+recover_operation=82000000-0000-4000-8000-000000000025
+recover_plugin=acme.o7-recoverable
+recover_source="$TEST_ROOT/source-path-mentions-validation-failed"
+make_interface_plugin "$ROOT" "$recover_source" "$recover_plugin"
+recover_identity=$($NATIVE identity "$recover_source")
+write_config
+write_observation "$recover_plugin" user omarchy-shell-config:user:v1 unreferenced
+recover_request=$(stage_request "$recover_operation" "$TOKEN" install "$recover_plugin" \
+  "$recover_source" "$recover_identity" absent '' user omarchy-shell-config:user:v1 \
+  "$EMPTY_DIGEST" unreferenced require-unreferenced)
+: >"$HOME_DIR/.o7-validator-fail-once"
+set +e
+recover_first=$(printf '%s' "$recover_request" | invoke 2>"$TEST_ROOT/recover-first.err")
+recover_first_code=$?
+set -e
+[[ $recover_first_code == 0 ]]
+jq -e '.state == "REQUEST_BOUND" and .status == "in-progress" and .reason == "request-bound"' \
+  <<<"$recover_first" >/dev/null
+recover_journal="$STATE_ROOT/journals/$recover_operation.journal"
+[[ $(jq -r .state "$recover_journal") == REQUEST_BOUND ]]
+recover_status_request=$(jq -cnS --arg operationId "$recover_operation" \
+  '{protocol:"legacy-schema-v1-transaction/v1",action:"status",operationId:$operationId}')
+recover_status=$(printf '%s' "$recover_status_request" | invoke)
+jq -e '.state == "REQUEST_BOUND" and .status == "in-progress"' <<<"$recover_status" >/dev/null
+recover_retry=$(printf '%s' "$recover_request" | invoke 2>"$TEST_ROOT/recover-retry.err")
+jq -e '.state == "STAGED" and .status == "ok"' <<<"$recover_retry" >/dev/null
+[[ $(jq -r .state "$recover_journal") == STAGED ]]
+grep -qF 'manifest-id-mismatch' "$TEST_ROOT/recover-first.err"
+printf 'ok - post-REQUEST_BOUND validator failure uses structured result and exact retry reaches STAGED\n'
+
+mismatch_operation=82000000-0000-4000-8000-000000000027
+mismatch_plugin=acme.o7-manifest-mismatch
+mismatch_source="$TEST_ROOT/source-manifest-id-diagnostic-marker"
+make_interface_plugin "$ROOT" "$mismatch_source" acme.o7-different-manifest
+mismatch_identity=$($NATIVE identity "$mismatch_source")
+write_observation "$mismatch_plugin" user omarchy-shell-config:user:v1 unreferenced
+mismatch_request=$(stage_request "$mismatch_operation" "$TOKEN" install "$mismatch_plugin" \
+  "$mismatch_source" "$mismatch_identity" absent '' user omarchy-shell-config:user:v1 \
+  "$EMPTY_DIGEST" unreferenced require-unreferenced)
+set +e
+mismatch_output=$(printf '%s' "$mismatch_request" | invoke 2>"$TEST_ROOT/mismatch.err")
+mismatch_code=$?
+set -e
+[[ $mismatch_code == 0 ]]
+jq -e '.state == "REQUEST_BOUND" and .status == "in-progress" and .reason == "request-bound"' \
+  <<<"$mismatch_output" >/dev/null
+[[ $(jq -r .state "$STATE_ROOT/journals/$mismatch_operation.journal") == REQUEST_BOUND ]]
+grep -qF 'manifest-id-mismatch' "$TEST_ROOT/mismatch.err"
+printf 'ok - manifest mismatch after durable request binding cannot become a false rejection\n'
 
 conflict_request=$(jq -c '.expectedConfiguration.source.identity="different-opaque-identity"' <<<"$install_request")
 set +e
@@ -255,7 +319,6 @@ jq -e '.reason == "invalid-operation-token"' <<<"$wrong_output" >/dev/null
 [[ $(sha256sum "$journal") == "$journal_sha" &&
     $(stat -c '%d:%i' "$STORE/$install_operation/candidate") == "$candidate_inode" ]]
 ! grep -aF "$TOKEN" "$TEST_ROOT/conflict.err" "$TEST_ROOT/wrong.err" >/dev/null
-rm "$HOME_DIR/.o7-shell-unavailable"
 printf 'ok - capability precedes immutable-request conflict without changing evidence\n'
 
 cp "$HOME_DIR/.o7-stage-argv" "$TEST_ROOT/clean-argv"
@@ -419,6 +482,38 @@ jq -e --arg active "sha256:${active_identity##*:}" --arg candidate "sha256:${can
 [[ $(sha256sum "$HOME_DIR/.config/omarchy/shell.json") == "$config_before" ]]
 [[ ! -e $STATE_ROOT/gates/$update_plugin.gate ]]
 printf 'ok - authoritative update observes exact active tree and remains inert\n'
+
+different_update_plugin=acme.o7-update-basename-compatible
+different_update_active="$DISCOVERY/repository-folder"
+different_update_candidate="$TEST_ROOT/update-basename-candidate"
+make_interface_plugin "$ROOT" "$different_update_active" "$different_update_plugin"
+make_interface_plugin "$ROOT" "$different_update_candidate" "$different_update_plugin"
+printf 'candidate-v2\n' >>"$different_update_candidate/Service.qml"
+different_update_active_identity=$($NATIVE identity "$different_update_active")
+different_update_candidate_identity=$($NATIVE identity "$different_update_candidate")
+write_config "$different_update_plugin"
+write_observation "$different_update_plugin" user omarchy-shell-config:user:v1 referenced
+jq --arg source "$different_update_active" \
+  '.activeDiscovery={state:"present",sourceDirectory:$source}' \
+  "$HOME_DIR/.o7-observation.json" >"$HOME_DIR/.o7-observation.next"
+mv "$HOME_DIR/.o7-observation.next" "$HOME_DIR/.o7-observation.json"
+different_update_projection=$(projection_digest "$different_update_plugin")
+different_update_operation=82000000-0000-4000-8000-000000000026
+different_update_request=$(stage_request "$different_update_operation" "$TOKEN" update \
+  "$different_update_plugin" "$different_update_candidate" "$different_update_candidate_identity" \
+  present "$different_update_active_identity" user omarchy-shell-config:user:v1 \
+  "$different_update_projection" referenced preserve-observed)
+different_update_output=$(printf '%s' "$different_update_request" | invoke)
+jq -e '.state == "STAGED" and .status == "ok" and .observedActive.state == "present"' \
+  <<<"$different_update_output" >/dev/null
+different_update_journal="$STATE_ROOT/journals/$different_update_operation.journal"
+[[ $(jq -r .normalizedRequest.facts.destination "$different_update_journal") == "$different_update_active" ]]
+different_update_journal_sha=$(sha256sum "$different_update_journal")
+find "$different_update_candidate" -depth -delete
+different_update_replay=$(printf '%s' "$different_update_request" | invoke)
+[[ $different_update_replay == "$different_update_output" ]]
+[[ $(sha256sum "$different_update_journal") == "$different_update_journal_sha" ]]
+printf 'ok - update accepts and replays an authoritative direct child whose basename differs from plugin ID\n'
 
 concurrent_plugin=acme.o7-concurrent
 concurrent_source="$TEST_ROOT/concurrent-source"
