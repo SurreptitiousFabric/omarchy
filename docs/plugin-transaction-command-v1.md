@@ -2,7 +2,7 @@
 
 ## Scope and route
 
-`omarchy plugin transaction` routes to the hidden `omarchy-plugin-transaction` binary. It reads one JSON object from standard input and writes one canonical compact JSON object plus LF to standard output. The only actions are `capabilities`, `stage`, `status`, and `abort`. This O-7 interface has no commit, gate, rescan, release, activation, live-tree mutation, rollback, recovery-execution, configuration-mutation, safety, trust, signer, scanner, publisher, consent, or A Quo surface.
+`omarchy plugin transaction` routes to the hidden `omarchy-plugin-transaction` binary. It reads one JSON object from standard input and writes one canonical compact JSON object plus LF to standard output. The actions are `capabilities`, `stage`, `status`, `abort`, and the O-8 `commit` action. The interface still has no public gate, rescan, release, activation, recovery-execution, configuration-mutation, safety, trust, signer, scanner, publisher, consent, or A Quo surface.
 
 The protocol is exactly `legacy-schema-v1-transaction/v1`. Input is at most 65,536 bytes. The package native helper validates UTF-8 and complete JSON grammar, rejects literal NUL, trailing bytes, multiple values, and decoded-equivalent duplicate keys at every object depth, and returns the unchanged bytes through an anonymous pipe. The action-specific jq validator then checks exact key sets, types, vocabularies, and bounds. jq is deliberately not treated as a duplicate-key detector.
 
@@ -23,6 +23,51 @@ Exit codes are:
 | 5 | Indeterminate durable outcome or durable recovery-required state. |
 
 Clients use JSON `status` and `reason`, not stderr or the exit code alone, as the transaction result. Stderr is diagnostic only and never contains the request or raw operation token.
+
+## O-8 commit authority
+
+The hidden `commit` action is derived from a bounded structured native result
+and the authoritative durable operation journal. A terminal `rejected` result
+is never emitted when a nonterminal operation record exists. O-8 uses
+state-conditioned journal fields and gate-v2's stable operation binding rather
+than a mutable full-journal digest.
+
+Status is logically read-only, but synchronizes the existing journal directory
+under the existing operation lock before its descriptor-pinned validation. A
+prior parent-fsync ambiguity remains indeterminate until that reconciliation
+synchronization succeeds.
+
+Fresh installs use the package-owned `discoveryDirectory/pluginId` destination.
+Updates use the exact authoritative active source directory selected by the
+O-6 registry authority. That source must be one real direct child of the
+discovery directory; its basename need not equal the manifest ID.
+
+The O-8 commit coordinator reserves `COMMIT_PREPARED` before requesting shell
+gating and never holds the ordered operation/plugin locks while waiting for a
+shell action. It accepts a gated rescan only from `LIVE_TREE_EXCHANGED`, and
+accepts candidate release only from durable `RELEASE_PENDING` with a
+`RESCAN_ACKNOWLEDGED` gate. Every namespace operation has a durable intent,
+uses descriptor-relative `renameat2` (`RENAME_NOREPLACE` for install and
+`RENAME_EXCHANGE` for update), synchronizes the candidate/operation parent
+before the discovery parent, and postchecks exact runtime-tree identities.
+There is no copy-based live-tree fallback.
+
+The shell-to-coordinator terminal handoff is receipt-first: the shell writes a
+durable `TERMINAL_RECEIPT` gate targeting `COMMITTED` or `ROLLED_BACK` only
+after its final eligibility decision has been published, acknowledges that
+receipt, and the coordinator writes the terminal journal state last. A
+terminal receipt without its matching terminal journal, or a terminal journal
+without its matching receipt, remains blocking on restart. A release timeout
+therefore reconciles the receipt and current shell state; `RELEASE_AUTHORIZED`
+alone is not treated as proof that this shell is still gated or released.
+
+Rollback records `ROLLBACK_STARTED` before mutation, retargets the blocking
+gate to exact absence for install or the retained prior tree for update, and
+requires rollback rescan plus restoration of source identity, canonical
+projection, reference policy, and reference state before publishing restored
+eligibility. Filesystem restoration without that eligibility acknowledgement
+is indeterminate, not `ROLLED_BACK`. O-8 performs only direct exact rollback
+and replay of completed steps; broad restart recovery remains O-9.
 
 ## Request-field ledger
 

@@ -39,7 +39,7 @@ capabilities='{"protocol":"legacy-schema-v1-transaction/v1","action":"capabiliti
 before=$(find "$HOME_DIR" "$STATE_HOME" -print 2>/dev/null | sort || true)
 capability_output=$(printf '%s' "$capabilities" | invoke)
 after=$(find "$HOME_DIR" "$STATE_HOME" -print 2>/dev/null | sort || true)
-expected_capabilities='{"actions":["capabilities","stage","status","abort"],"capabilities":["legacy-schema-v1-transaction/v1"],"operations":["install","update"],"protocol":"legacy-schema-v1-transaction/v1","referencePolicies":["require-unreferenced","preserve-observed"],"treeIdentityAlgorithms":["omarchy-runtime-tree-sha256-v1"]}'
+expected_capabilities='{"actions":["capabilities","stage","status","abort","commit"],"capabilities":["legacy-schema-v1-transaction/v1"],"operations":["install","update"],"protocol":"legacy-schema-v1-transaction/v1","referencePolicies":["require-unreferenced","preserve-observed"],"treeIdentityAlgorithms":["omarchy-runtime-tree-sha256-v1"]}'
 [[ $capability_output == "$expected_capabilities" ]]
 [[ $before == "$after" ]]
 minimal_capability_output=$(printf '%s' "$capabilities" |
@@ -52,9 +52,9 @@ route_output=$(printf '%s' "$capabilities" |
 [[ $route_output == "$expected_capabilities" ]]
 printf 'ok - exact omarchy plugin transaction route dispatches the stdin protocol\n'
 
-[[ $capability_output != *commit* && $capability_output != *recover* &&
-    $capability_output != *activate* && $capability_output != *rollback* ]]
-printf 'ok - capabilities advertise only implemented inert actions\n'
+[[ $capability_output == *commit* && $capability_output != *recover* &&
+   $capability_output != *activate* && $capability_output != *rollback* ]]
+printf 'ok - capabilities advertise only implemented O-8 actions\n'
 
 set +e
 empty_output=$(invoke </dev/null 2>"$TEST_ROOT/empty.err")
@@ -141,7 +141,7 @@ for mutation in \
 done
 
 expect_invalid "unsupported protocol fails" "$(jq -c '.protocol="legacy-schema-v1-transaction/v2"' <<<"$valid_stage")"
-expect_invalid "unsupported action fails" "$(jq -c '.action="commit"' <<<"$valid_stage")"
+expect_invalid "unsupported action fails" "$(jq -c '.action="recover"' <<<"$valid_stage")"
 expect_invalid "non-v4 UUID fails" "$(jq -c '.operationId="81000000-0000-3000-8000-000000000001"' <<<"$valid_stage")"
 expect_invalid "uppercase UUID fails" "$(jq -c '.operationId="81000000-0000-4000-8000-00000000000A"' <<<"$valid_stage")"
 expect_invalid "reserved plugin ID fails" "$(jq -c '.pluginId="omarchy.parser"' <<<"$valid_stage")"

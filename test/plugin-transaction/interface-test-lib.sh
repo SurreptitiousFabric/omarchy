@@ -16,6 +16,7 @@ build_interface_install() {
     "$root/native/plugin-transaction/validate-request.jq" \
     "$root/native/plugin-transaction/validate-stage-observation.jq" \
     "$root/native/plugin-transaction/validate-journal.jq" \
+    "$root/native/plugin-transaction/validate-gate.jq" \
     "$install_root/native/plugin-transaction/"
   mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
     -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
