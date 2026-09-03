@@ -795,11 +795,42 @@ rollback_operation() {
 }
 
 reject_competing_operation() {
-  local other_operation=$1 op_read op_write op_pid ready input
-  [[ -f $state_root/gates/$request_plugin_id.gate ]] || return 1
-  if [[ $("$jq_bin" -r '.operationId // ""' "$state_root/gates/$request_plugin_id.gate" 2>/dev/null || true) == "$request_operation_id" ]]; then
-    return 1
+  local other_operation=$1 op_read op_write op_pid ready input gate_path gate_operation gate_plugin
+  local gate_binding other_journal other_binding candidate_path expected_candidate operation destination
+  local active_state active_identity
+  gate_path=$state_root/gates/$request_plugin_id.gate
+  [[ -f $gate_path && ! -L $gate_path ]] || return 1
+  # A visible gate is not enough evidence after a possible interrupted rename.
+  # Reconcile the existing gate directory before treating it as another
+  # operation's durable authority.
+  native_run gate-sync "$state_root" >/dev/null 2>&1 || return 2
+  "$jq_bin" -e --arg plugin_id "$request_plugin_id" -f "$gate_validator" "$gate_path" >/dev/null 2>&1 || return 2
+  gate_operation=$("$jq_bin" -r '.operationId // ""' "$gate_path")
+  gate_plugin=$("$jq_bin" -r '.pluginId // ""' "$gate_path")
+  gate_binding=$("$jq_bin" -r '.operationBindingSha256 // ""' "$gate_path")
+  [[ $gate_operation != "$request_operation_id" && $gate_plugin == "$request_plugin_id" &&
+      $gate_operation =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
+      $gate_binding =~ ^[0-9a-f]{64}$ ]] || return 2
+  # Bind the observed gate to the other operation's authoritative journal;
+  # a gate with no readable matching journal is ambiguous, never a rejection.
+  if ! other_journal=$(native_run journal-read-locked "$state_root" "$gate_operation" 2>/dev/null); then
+    return 2
   fi
+  [[ $(printf '%s' "$other_journal" | "$jq_bin" -r '.schema // ""') == omarchy-plugin-transaction-journal/v2 ]] || return 2
+  "$jq_bin" -eS --arg operation_id "$gate_operation" -f "$journal_validator" \
+    <(printf '%s' "$other_journal") >/dev/null 2>&1 || return 2
+  other_binding=$(printf '%s' "$other_journal" | "$jq_bin" -cS '
+    {operationId,pluginId,
+     operation: .normalizedRequest.facts.operation,
+     requestDigest: .normalizedRequest.digest,
+     candidateExpected: .candidate.expected,
+     candidateObserved: .candidate.observed,
+     candidateSlot: .candidate.completedSlot,
+     expectedActive: .normalizedRequest.facts.expectedActive,
+     destination: .normalizedRequest.facts.destination}' |
+    native_run domain-hash omarchy-plugin-transaction-operation-binding/v1 2>/dev/null) || return 2
+  [[ $other_binding == "$gate_binding" ]] || return 2
+
   coproc O8_OPERATION_LOCK { native_run operation-lock "$state_root" "$request_operation_id"; }
   op_pid=$O8_OPERATION_LOCK_PID
   op_read=${O8_OPERATION_LOCK[0]}
@@ -815,9 +846,36 @@ reject_competing_operation() {
   fi
   if [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') != COMMIT_PREPARED ||
         $(printf '%s' "$journal" | "$jq_bin" -r '.namespaceIntent.state') != none ||
-        $(printf '%s' "$journal" | "$jq_bin" -r '.gate') != not-established ]]; then
+        $(printf '%s' "$journal" | "$jq_bin" -r '.gate') != not-established ||
+        $(printf '%s' "$journal" | "$jq_bin" -r '.rollback') != not-applicable ]]; then
     exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
-    return 1
+    return 2
+  fi
+  candidate_path=$candidate_store/$request_operation_id/candidate
+  expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed // ""')
+  [[ -d $candidate_path && ! -L $candidate_path &&
+      $(native_run identity "$candidate_path" 2>/dev/null || true) == "$expected_candidate" ]] || {
+    exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
+    return 2
+  }
+  operation=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.operation')
+  destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
+  active_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.state')
+  active_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.identity // ""')
+  if [[ $operation == install ]]; then
+    [[ $destination == "$discovery_dir/$request_plugin_id" && ! -e $destination && ! -L $destination ]] || {
+      exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
+      return 2
+    }
+  elif [[ $operation == update ]]; then
+    validate_update_destination "$destination" && [[ $active_state == present && -d $destination && ! -L $destination &&
+      $(native_run identity "$destination" 2>/dev/null || true) == "$active_identity" ]] || {
+      exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
+      return 2
+    }
+  else
+    exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
+    return 2
   fi
   input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-rejected.XXXXXX)
   printf '%s' "$journal" | "$jq_bin" -cS '.state="REJECTED" | .reason="plugin-gated-by-another-operation"' >"$input"
@@ -837,6 +895,7 @@ reject_competing_operation() {
 commit_operation() {
   local stored_capability supplied_capability state operation destination candidate_path source_parent source_name dest_parent dest_name
   local expected_candidate expected_active active_state active_identity mutation_result mutation_status
+  local competing_status
   if ! read_journal_authoritative; then
     [[ $journal_read_error == operation-not-found ]] && emit_error not-found operation-not-found 0
     [[ $journal_read_error == durability-indeterminate ]] && emit_error indeterminate journal-authority-indeterminate 5
@@ -904,7 +963,15 @@ commit_operation() {
   set -e
   if (( lock_status != 0 )); then
     if (( lock_status == 3 )); then
-      reject_competing_operation other || emit_error rejected plugin-gated-by-another-operation 0 COMMIT_PREPARED
+      if reject_competing_operation other; then
+        :
+      else
+        competing_status=$?
+        if (( competing_status == 2 )); then
+          emit_error indeterminate competing-operation-ambiguous 5 COMMIT_PREPARED
+        fi
+        emit_error unavailable lock-failure 4 COMMIT_PREPARED
+      fi
     fi
     emit_error unavailable lock-failure 4
   fi
