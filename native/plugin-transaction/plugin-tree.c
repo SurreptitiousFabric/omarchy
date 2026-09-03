@@ -51,6 +51,49 @@ typedef struct {
 
 static void fd_write_all(int fd, const void *buffer, size_t length,
                          const char *operation, const char *path);
+static int open_existing_state_root(const char *state_path,
+                                    const char *operation_id);
+static int open_existing_directory(int parent, const char *name,
+                                   const char *operation_id,
+                                   const char *description,
+                                   bool missing_is_not_found);
+static int open_lock_file(int directory, const char *name,
+                           const char *description);
+static void derive_plugin_lock_name(const char *plugin_id, char output[65]);
+static void fail_io(const char *operation, const char *path);
+
+/* Read authority must not be able to wait forever behind a writer.  The
+ * caller maps a timeout to an indeterminate authority result and reconciles
+ * from a fresh process. */
+static int acquire_flock_bounded(int fd, int operation, const char *description,
+                                 const char *path) {
+  (void)description;
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+    fail_io("read lock deadline", path);
+  const time_t deadline_seconds = now.tv_sec + 5;
+  const long deadline_nseconds = now.tv_nsec;
+  const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+  for (;;) {
+    if (flock(fd, operation | LOCK_NB) == 0)
+      return 0;
+    if (errno == EINTR)
+      continue;
+    if (errno != EWOULDBLOCK && errno != EAGAIN)
+      return -1;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+      fail_io("read lock deadline", path);
+    if (now.tv_sec > deadline_seconds ||
+        (now.tv_sec == deadline_seconds && now.tv_nsec >= deadline_nseconds)) {
+      errno = ETIMEDOUT;
+      return 1;
+    }
+    while (nanosleep(&pause, NULL) < 0) {
+      if (errno != EINTR)
+        return -1;
+    }
+  }
+}
 
 static void fail_io(const char *operation, const char *path) {
   fprintf(stderr, "omarchy-plugin-tree: io: %s: %s: %s\n", operation, path,
@@ -68,6 +111,18 @@ static void operation_not_found(const char *operation_id) {
   fprintf(stderr, "omarchy-plugin-tree: operation-not-found: %s\n",
           operation_id);
   exit(3);
+}
+
+static void gate_not_found(const char *plugin_id) {
+  fprintf(stderr, "omarchy-plugin-tree: gate-not-found: %s\n", plugin_id);
+  exit(3);
+}
+
+static void gate_authority_indeterminate(const char *plugin_id) {
+  fprintf(stderr,
+          "omarchy-plugin-tree: gate-authority-indeterminate: %s\n",
+          plugin_id);
+  exit(5);
 }
 
 static bool valid_utf8(const unsigned char *bytes, size_t length) {
@@ -990,6 +1045,35 @@ static int open_namespace_parent(const char *path, const char *description) {
   return parent;
 }
 
+static bool compensated_namespace_matches(bool exchange, int source_directory,
+                                          const char *source_name,
+                                          int destination_directory,
+                                          const char *dest_name,
+                                          const char *expected_source,
+                                          const char *expected_destination) {
+  int source = openat(source_directory, source_name,
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (source < 0)
+    return false;
+  char source_identity[96];
+  identity_from_fd(source, source_identity);
+  close(source);
+  if (!identity_matches(source_identity, expected_source))
+    return false;
+  struct stat destination_stat;
+  if (!exchange)
+    return fstatat(destination_directory, dest_name, &destination_stat,
+                   AT_SYMLINK_NOFOLLOW) < 0 && errno == ENOENT;
+  int destination = openat(destination_directory, dest_name,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (destination < 0)
+    return false;
+  char destination_identity[96];
+  identity_from_fd(destination, destination_identity);
+  close(destination);
+  return identity_matches(destination_identity, expected_destination);
+}
+
 static void namespace_mutate(const char *operation, const char *source_parent,
                              const char *source_name, const char *dest_parent,
                              const char *dest_name, const char *expected_source,
@@ -1088,9 +1172,15 @@ static void namespace_mutate(const char *operation, const char *source_parent,
                             source_directory, source_name,
                             RENAME_NOREPLACE) == 0;
     }
-    if (compensated && sync_fd(source_directory,
-                               "namespace-candidate-parent") == 0 &&
-        sync_fd(destination_directory, "namespace-discovery-parent") == 0) {
+    if (compensated && compensated_namespace_matches(
+                          exchange, source_directory, source_name,
+                          destination_directory, dest_name, expected_source,
+                          expected_destination) &&
+        sync_fd(source_directory, "namespace-candidate-parent") == 0 &&
+        sync_fd(destination_directory, "namespace-discovery-parent") == 0 &&
+        compensated_namespace_matches(
+            exchange, source_directory, source_name, destination_directory,
+            dest_name, expected_source, expected_destination)) {
       close(source);
       close(source_directory);
       close(destination_directory);
@@ -1890,11 +1980,13 @@ static void read_journal_locked(const char *state_path,
   if (!S_ISREG(operation_status.st_mode) || operation_status.st_nlink != 1 ||
       (operation_status.st_mode & 0777) != 0600)
     reject_tree("invalid-operation-lock", operation_id);
-  while (flock(operation, LOCK_SH) < 0) {
-    if (errno == EINTR)
-      continue;
+  int lock_result = acquire_flock_bounded(operation, LOCK_SH,
+                                          "acquire operation lock",
+                                          operation_name);
+  if (lock_result < 0)
     fail_io("acquire operation lock", operation_name);
-  }
+  if (lock_result > 0)
+    journal_authority_indeterminate(operation_id);
   int journals = open_existing_directory(state, "journals", operation_id,
                                          "open existing journal directory", true);
   if (sync_fd(journals, "journal-reconciliation-parent") < 0)
@@ -1919,6 +2011,141 @@ static void read_journal_held(const char *state_path,
     journal_authority_indeterminate(operation_id);
   read_journal_from_directory(journals, operation_id);
   close(journals);
+  close(state);
+}
+
+/* Read one atomically installed gate from an already opened gates directory.
+ * The directory must have been synchronized by the caller.  This is the
+ * gate counterpart of read_journal_from_directory: no pathname-only read is
+ * allowed to become transaction authority. */
+static void read_gate_from_directory(int gates, const char *plugin_id) {
+  if (!third_party_plugin_id(plugin_id))
+    reject_tree("invalid-plugin-id", plugin_id);
+  char name[192];
+  int length = snprintf(name, sizeof(name), "%s.gate", plugin_id);
+  if (length < 0 || (size_t)length >= sizeof(name))
+    reject_tree("gate-name-limit", plugin_id);
+  int gate = openat(gates, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC |
+                                      O_NOATIME);
+  if (gate < 0) {
+    if (errno == ENOENT)
+      gate_not_found(plugin_id);
+    reject_tree("invalid-authoritative-gate", plugin_id);
+  }
+  struct stat before;
+  if (fstat(gate, &before) < 0)
+    fail_io("stat read-only gate", plugin_id);
+  if (!S_ISREG(before.st_mode) || before.st_nlink != 1 ||
+      (before.st_mode & 0777) != 0600 || before.st_size <= 0 ||
+      before.st_size > 1024 * 1024)
+    reject_tree("invalid-authoritative-gate", plugin_id);
+  unsigned char buffer[64 * 1024];
+  off_t total = 0;
+  for (;;) {
+    ssize_t received = read(gate, buffer, sizeof(buffer));
+    if (received < 0) {
+      if (errno == EINTR)
+        continue;
+      fail_io("read authoritative gate", plugin_id);
+    }
+    if (received == 0)
+      break;
+    if (received > before.st_size - total)
+      reject_tree("gate-changed", plugin_id);
+    fd_write_all(STDOUT_FILENO, buffer, (size_t)received,
+                 "write authoritative gate", "stdout");
+    total += received;
+  }
+  struct stat after;
+  if (fstat(gate, &after) < 0)
+    fail_io("restat read-only gate", plugin_id);
+  if (total != before.st_size || before.st_dev != after.st_dev ||
+      before.st_ino != after.st_ino || before.st_size != after.st_size ||
+      before.st_mode != after.st_mode || before.st_nlink != after.st_nlink ||
+      !same_timestamp(before.st_mtim, after.st_mtim) ||
+      !same_timestamp(before.st_ctim, after.st_ctim))
+    reject_tree("gate-changed", plugin_id);
+  close(gate);
+}
+
+/* Read-only gate authority without creating state or locks. */
+static void read_gate_authority(const char *state_path, const char *plugin_id) {
+  int state = open_existing_state_root(state_path, plugin_id);
+  int gates = open_existing_directory(state, "gates", plugin_id,
+                                      "open existing gate directory", true);
+  if (sync_fd(gates, "gate-reconciliation-parent") < 0)
+    gate_authority_indeterminate(plugin_id);
+  read_gate_from_directory(gates, plugin_id);
+  close(gates);
+  close(state);
+}
+
+/* Gate authority while the caller already owns operation then plugin locks. */
+static void read_gate_held(const char *state_path, const char *plugin_id) {
+  int state = open_existing_state_root(state_path, plugin_id);
+  int gates = open_existing_directory(state, "gates", plugin_id,
+                                      "open existing gate directory", true);
+  if (sync_fd(gates, "gate-reconciliation-parent") < 0)
+    gate_authority_indeterminate(plugin_id);
+  read_gate_from_directory(gates, plugin_id);
+  close(gates);
+  close(state);
+}
+
+/* Gate authority with the existing ordered lock holder acquired here. */
+static void read_gate_locked(const char *state_path, const char *operation_id,
+                             const char *plugin_id) {
+  if (!simple_name(operation_id) || !third_party_plugin_id(plugin_id))
+    reject_tree("invalid-gate-authority-identity", plugin_id);
+  int state = open_existing_state_root(state_path, operation_id);
+  int locks = open_existing_directory(state, "locks", operation_id,
+                                      "open existing lock directory", false);
+  int operations = open_existing_directory(locks, "operations", operation_id,
+                                           "open existing operation directory", false);
+  int plugins = open_existing_directory(locks, "plugins", operation_id,
+                                        "open existing plugin directory", false);
+  char operation_name[160];
+  int operation_length = snprintf(operation_name, sizeof(operation_name),
+                                  "%s.lock", operation_id);
+  if (operation_length < 0 || (size_t)operation_length >= sizeof(operation_name))
+    reject_tree("operation-lock-name-limit", operation_id);
+  int operation_fd = openat(operations, operation_name,
+                            O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (operation_fd < 0)
+    reject_tree("invalid-operation-lock", operation_id);
+  struct stat operation_status;
+  if (fstat(operation_fd, &operation_status) < 0)
+    fail_io("stat operation lock", operation_name);
+  if (!S_ISREG(operation_status.st_mode) || operation_status.st_nlink != 1 ||
+      (operation_status.st_mode & 0777) != 0600)
+    reject_tree("invalid-operation-lock", operation_id);
+  int operation_lock_result = acquire_flock_bounded(
+      operation_fd, LOCK_EX, "acquire operation lock", operation_name);
+  if (operation_lock_result < 0)
+    fail_io("acquire operation lock", operation_name);
+  if (operation_lock_result > 0)
+    gate_authority_indeterminate(plugin_id);
+  char plugin_lock_name[65];
+  derive_plugin_lock_name(plugin_id, plugin_lock_name);
+  int plugin_fd = open_lock_file(plugins, plugin_lock_name,
+                                 "open plugin lifecycle lock");
+  int plugin_lock_result = acquire_flock_bounded(
+      plugin_fd, LOCK_EX, "acquire plugin lifecycle lock", plugin_lock_name);
+  if (plugin_lock_result < 0)
+    fail_io("acquire plugin lifecycle lock", plugin_lock_name);
+  if (plugin_lock_result > 0)
+    gate_authority_indeterminate(plugin_id);
+  int gates = open_existing_directory(state, "gates", plugin_id,
+                                      "open existing gate directory", true);
+  if (sync_fd(gates, "gate-reconciliation-parent") < 0)
+    gate_authority_indeterminate(plugin_id);
+  read_gate_from_directory(gates, plugin_id);
+  close(gates);
+  close(plugin_fd);
+  close(operation_fd);
+  close(plugins);
+  close(operations);
+  close(locks);
   close(state);
 }
 
@@ -2226,6 +2453,18 @@ int main(int argc, char **argv) {
     read_journal_held(argv[2], argv[3]);
     return 0;
   }
+  if (argc == 4 && strcmp(argv[1], "gate-read") == 0) {
+    read_gate_authority(argv[2], argv[3]);
+    return 0;
+  }
+  if (argc == 4 && strcmp(argv[1], "gate-read-held") == 0) {
+    read_gate_held(argv[2], argv[3]);
+    return 0;
+  }
+  if (argc == 5 && strcmp(argv[1], "gate-read-locked") == 0) {
+    read_gate_locked(argv[2], argv[3], argv[4]);
+    return 0;
+  }
   if (argc == 4 && strcmp(argv[1], "plugin-lock") == 0) {
     hold_plugin_lock(argv[2], argv[3]);
     return 0;
@@ -2254,6 +2493,8 @@ int main(int argc, char **argv) {
           "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "
           "journal-read STATE OPERATION | journal-read-locked STATE OPERATION | "
           "journal-read-held STATE OPERATION | json-request-check | "
+          "gate-read STATE PLUGIN | gate-read-locked STATE OPERATION PLUGIN | "
+          "gate-read-held STATE PLUGIN | "
           "operation-lock STATE OPERATION | plugin-lock STATE PLUGIN-ID | "
           "ordered-lock STATE OPERATION PLUGIN-ID | "
           "hash-equal EXPECTED\n",

@@ -22,7 +22,7 @@ elif .valid == false then
   exact_keys(["status", "valid"])
   and (.status | bounded_string(1; 128))
 elif .valid == true then
-  exact_keys(["activeDiscovery", "configurationSource", "discoveryDirectory", "pluginId", "rawBase64", "referenceProjectionBase64", "referenceState", "schema", "status", "transactionStateRoot", "valid"])
+  exact_keys(["activeDiscovery", "configurationEpoch", "configurationSource", "discoveryDirectory", "pluginId", "rawBase64", "referenceProjectionBase64", "referenceState", "schema", "status", "transactionStateRoot", "valid"])
   and .schema == "omarchy-plugin-stage-observation/v1"
   and .status == "observed"
   and .pluginId == $plugin_id
@@ -36,6 +36,7 @@ elif .valid == true then
   and (.rawBase64 | canonical_base64(43692))
   and (.referenceProjectionBase64 | canonical_base64(5464))
   and (.referenceState == "referenced" or .referenceState == "unreferenced")
+  and (.configurationEpoch | type == "number" and floor == . and . >= 0)
   and (if .activeDiscovery.state == "absent" then
          (.activeDiscovery | exact_keys(["state"]))
        else

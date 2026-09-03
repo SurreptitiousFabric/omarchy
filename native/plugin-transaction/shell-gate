@@ -15,6 +15,7 @@ gate=""
 journal_sha=""
 operation_binding=""
 journal_schema=""
+computed_operation_binding=""
 
 helper=${OMARCHY_PLUGIN_TREE_HELPER:-/usr/lib/omarchy/plugin-tree}
 state_root=${OMARCHY_PLUGIN_TRANSACTION_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugin-transactions-v1}
@@ -61,14 +62,18 @@ release_locks() {
 trap release_locks EXIT
 
 lock_operation_then_plugin() {
-  local operation_id=$1 plugin_id=$2 ready status
+  local operation_id=$1 plugin_id=$2 ready status read_status
   coproc GATE_LOCK_HOLDER {
     "$helper" ordered-lock "$state_root" "$operation_id" "$plugin_id"
   }
   lock_holder_pid=$GATE_LOCK_HOLDER_PID
   lock_output_fd=${GATE_LOCK_HOLDER[0]}
   lock_input_fd=${GATE_LOCK_HOLDER[1]}
-  if ! IFS= read -r ready <&"$lock_output_fd"; then
+  if IFS= read -r -t 5 ready <&"$lock_output_fd"; then
+    :
+  else
+    read_status=$?
+    kill "$lock_holder_pid" 2>/dev/null || true
     set +e
     wait "$lock_holder_pid"
     status=$?
@@ -78,6 +83,7 @@ lock_operation_then_plugin() {
     exec {lock_input_fd}>&-
     lock_input_fd=
     (( status == 3 )) && fail plugin-gated-by-another-operation "$plugin_id"
+    (( read_status == 142 )) && fail operation-plugin-lock-timeout "$plugin_id"
     fail operation-plugin-lock-failed "$plugin_id"
   fi
   exec {lock_output_fd}<&-
@@ -104,6 +110,17 @@ load_operation() {
     omarchy-plugin-transaction-journal/v2)
       operation_binding=$(jq -r .operationBindingSha256 "$journal")
       [[ $operation_binding =~ ^[0-9a-f]{64}$ ]] || fail invalid-operation-binding "$operation_id"
+      computed_operation_binding=$(jq -cS '{operationId,pluginId,
+        operation:.normalizedRequest.facts.operation,
+        requestDigest:.normalizedRequest.digest,
+        candidateExpected:.candidate.expected,
+        candidateObserved:.candidate.observed,
+        candidateSlot:.candidate.completedSlot,
+        expectedActive:.normalizedRequest.facts.expectedActive,
+        destination:.normalizedRequest.facts.destination}' "$journal" |
+        "$helper" domain-hash omarchy-plugin-transaction-operation-binding/v1 2>/dev/null) ||
+        fail invalid-operation-binding "$operation_id"
+      [[ $computed_operation_binding == "$operation_binding" ]] || fail operation-binding-mismatch "$operation_id"
       [[ $(jq -r .state "$journal") != ABORTED &&
           $(jq -r .state "$journal") != REJECTED &&
           $(jq -r .state "$journal") != COMMITTED ]] || fail operation-mismatch "$operation_id"
@@ -129,23 +146,52 @@ load_gate() {
 }
 
 terminal_gate_safe() {
-  local path=$1 operation_id terminal_state journal_path
+  local path=$1 operation_id plugin_id terminal_state journal journal_authority gate_authority
   [[ -f $path && ! -L $path ]] || return 1
   [[ $(jq -r '.schema // ""' "$path") == omarchy-plugin-transaction-gate/v2 &&
       $(jq -r '.state // ""' "$path") == TERMINAL_RECEIPT ]] || return 1
   operation_id=$(jq -r '.operationId // ""' "$path")
+  plugin_id=$(jq -r '.pluginId // ""' "$path")
   terminal_state=$(jq -r '.terminalReceipt.intendedJournalState // ""' "$path")
   [[ $operation_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || return 1
+  valid_plugin "$plugin_id" || return 1
+  [[ ${path##*/} == "$plugin_id.gate" ]] || return 1
   [[ $terminal_state == COMMITTED || $terminal_state == ROLLED_BACK ]] || return 1
-  journal_path=$state_root/journals/$operation_id.journal
-  [[ -f $journal_path && ! -L $journal_path ]] || return 1
+  # A visible terminal journal is not startup authority until the existing
+  # operation and plugin locks are held and the journals directory has been
+  # synchronized by the native held-reader.
+  lock_operation_then_plugin "$operation_id" "$plugin_id" || return 1
+  journal=$("$helper" journal-read-held "$state_root" "$operation_id" 2>/dev/null) || {
+    release_locks
+    return 1
+  }
+  gate_authority=$("$helper" gate-read-held "$state_root" "$plugin_id" 2>/dev/null) || {
+    release_locks
+    return 1
+  }
+  [[ "$gate_authority" == "$(cat -- "$path")" ]] || {
+    release_locks
+    return 1
+  }
+  computed_operation_binding=$(printf '%s' "$journal" | jq -cS '{operationId,pluginId,
+    operation:.normalizedRequest.facts.operation,requestDigest:.normalizedRequest.digest,
+    candidateExpected:.candidate.expected,candidateObserved:.candidate.observed,
+    candidateSlot:.candidate.completedSlot,expectedActive:.normalizedRequest.facts.expectedActive,
+    destination:.normalizedRequest.facts.destination}' |
+    "$helper" domain-hash omarchy-plugin-transaction-operation-binding/v1 2>/dev/null) || {
+    release_locks
+    return 1
+  }
   jq -e --arg operation_id "$operation_id" --arg terminal "$terminal_state" \
     --arg binding "$(jq -r '.operationBindingSha256' "$path")" \
-    --arg plugin "$(jq -r '.pluginId' "$path")" --argjson receipt "$(jq -c .terminalReceipt "$path")" \
-    -f "$journal_validator" "$journal_path" >/dev/null 2>&1 || return 1
+    --arg plugin "$plugin_id" --arg computed "$computed_operation_binding" --argjson receipt "$(jq -c .terminalReceipt "$path")" \
+    -f "$journal_validator" <<<"$journal" >/dev/null 2>&1 || { release_locks; return 1; }
   jq -e --arg terminal "$terminal_state" --arg binding "$(jq -r '.operationBindingSha256' "$path")" \
-    --arg plugin "$(jq -r '.pluginId' "$path")" --argjson receipt "$(jq -c .terminalReceipt "$path")" \
-    '.state == $terminal and .operationBindingSha256 == $binding and .pluginId == $plugin and .terminalReceipt == $receipt' "$journal_path" >/dev/null 2>&1
+    --arg plugin "$plugin_id" --arg computed "$computed_operation_binding" --argjson receipt "$(jq -c .terminalReceipt "$path")" \
+    '.state == $terminal and .operationBindingSha256 == $binding and $computed == $binding and .pluginId == $plugin and .terminalReceipt == $receipt' <<<"$journal" >/dev/null 2>&1
+  local result=$?
+  release_locks
+  return $result
 }
 
 replace_gate() {
@@ -185,12 +231,16 @@ case $action in
           global=global-unreadable
           continue
         fi
-        if validate_canonical "$path" "$gate_validator" plugin_id "$plugin_id"; then
+        # A pathname-visible gate is only a candidate for inventory.  The
+        # native reader synchronizes the existing gates directory and pins
+        # the complete record before any state is accepted below.
+        gate_authority=$($helper gate-read "$state_root" "$plugin_id" 2>/dev/null || true)
+        if [[ -n $gate_authority ]] && printf '%s' "$gate_authority" | jq -e --arg plugin_id "$plugin_id" -f "$gate_validator" >/dev/null 2>&1; then
           terminal_safe=false
           terminal_gate_safe "$path" && terminal_safe=true
           if [[ $terminal_safe != true ]]; then
             next=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-inventory-next.XXXXXX")
-            jq --argjson gate "$(<"$path")" '. + [{pluginId:$gate.pluginId,valid:true,record:$gate}]' "$inventory" >"$next"
+            jq --argjson gate "$gate_authority" '. + [{pluginId:$gate.pluginId,valid:true,record:$gate}]' "$inventory" >"$next"
             mv -- "$next" "$inventory"
           fi
         else
@@ -216,13 +266,17 @@ case $action in
         continue
       }
       operation_id=${BASH_REMATCH[1]}
-      if ! validate_canonical "$path" "$journal_validator" operation_id "$operation_id"; then
+      journal_authority=$($helper journal-read-locked "$state_root" "$operation_id" 2>/dev/null) || {
+        global=global-unreadable
+        continue
+      }
+      if ! printf '%s' "$journal_authority" | jq -e --arg operation_id "$operation_id" -f "$journal_validator" >/dev/null 2>&1; then
         global=global-unreadable
         continue
       fi
-      journal_state=$(jq -r '.state // ""' "$path")
+      journal_state=$(printf '%s' "$journal_authority" | jq -r '.state // ""')
       [[ $journal_state == COMMITTED || $journal_state == ROLLED_BACK ]] || continue
-      plugin_id=$(jq -r '.pluginId // ""' "$path")
+      plugin_id=$(printf '%s' "$journal_authority" | jq -r '.pluginId // ""')
       if ! valid_plugin "$plugin_id"; then
         global=global-unreadable
         continue
@@ -250,9 +304,21 @@ case $action in
       validate_canonical "$gate" "$gate_validator" plugin_id "$plugin_id" || fail gate-state-invalid "$plugin_id"
       replace_terminal_gate=false
       if [[ $(jq -r .operationId "$gate") != "$operation_id" ]]; then
+        previous_gate_operation_id=$(jq -r .operationId "$gate")
+        # The current operation already owns the plugin lock from
+        # load_operation.  Terminal-pair validation must acquire the old
+        # operation lock before that same plugin lock, so release the current
+        # ordered locks for this bounded validation and then reacquire and
+        # revalidate the current operation before replacing the receipt.
+        release_locks
         if ! terminal_gate_safe "$gate"; then
           fail plugin-gated-by-another-operation "$plugin_id"
         fi
+        load_operation "$operation_id" "$plugin_id"
+        "$helper" gate-sync "$state_root"
+        [[ -e $gate && ! -L $gate ]] || fail plugin-gated-by-another-operation "$plugin_id"
+        validate_canonical "$gate" "$gate_validator" plugin_id "$plugin_id" || fail gate-state-invalid "$plugin_id"
+        [[ $(jq -r .operationId "$gate") == "$previous_gate_operation_id" ]] || fail plugin-gated-by-another-operation "$plugin_id"
         # A validated terminal receipt paired with its terminal journal is a
         # completed, non-blocking handoff.  It is safe to replace it with the
         # new operation's gate; its old binding must not be compared with the

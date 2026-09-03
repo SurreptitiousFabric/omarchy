@@ -149,11 +149,24 @@ def o8_rescan:
   and (.expectedTree == null or (.expectedTree | o8_tree))
   and (.observedTree == null or (.observedTree | o8_tree));
 def o8_release:
-  exact_keys(["outcome","shellInstance","generation","configurationEpoch"])
+  exact_keys(["outcome","shellInstance","generation","configurationEpoch","source","rawSha256","referenceProjection","referenceState","referencePolicy"])
   and (.outcome == "not-requested" or .outcome == "authorized")
   and (.shellInstance == null or (.shellInstance | string and length > 0 and length <= 128))
   and (.generation == null or (.generation | type == "number" and floor == . and . >= 0))
-  and (.configurationEpoch == null or (.configurationEpoch | type == "number" and floor == . and . >= 0));
+  and (.configurationEpoch == null or (.configurationEpoch | type == "number" and floor == . and . >= 0))
+  and (.source == null or (.source | exact_keys(["kind","identity"]) and (.kind == "user" or .kind == "default" or .kind == "absent") and (.identity | string)))
+  and (.rawSha256 == null or (.rawSha256 | o8_sha))
+  and (.referenceProjection == null or (.referenceProjection | o8_sha))
+  and (.referenceState == null or .referenceState == "referenced" or .referenceState == "unreferenced")
+  and (.referencePolicy == null or .referencePolicy == "require-unreferenced" or .referencePolicy == "preserve-observed");
+def o8_release_evidence:
+  .source != null
+  and (.source | exact_keys(["kind","identity"]) and (.kind == "user" or .kind == "default" or .kind == "absent") and (.identity | string))
+  and (.rawSha256 | o8_sha)
+  and (.referenceProjection | o8_sha)
+  and (.referenceState == "referenced" or .referenceState == "unreferenced")
+  and (.referencePolicy == "require-unreferenced" or .referencePolicy == "preserve-observed")
+  and (.configurationEpoch | type == "number" and . >= 0 and floor == .);
 def o8_rollback:
   exact_keys(["state","targetRole","target","outcome"])
   and (.state == "not-started" or .state == "intended" or .state == "completed")
@@ -181,6 +194,7 @@ def o8_candidate:
   and (.expected | o8_tree)
   and (.observed | o8_tree)
   and (.temporarySlot | simple_slot)
+  and .temporarySlot == (".import." + .completedSlot)
   and (.completedSlot | simple_slot)
   and (.role == "candidate");
 def o8_publication:
@@ -191,6 +205,48 @@ def o8_retained_prior:
   and (.identity == null or (.identity | o8_tree))
   and (.slot == null or (.slot | simple_slot));
 def o8_registry: . == "not-requested" or . == "requested" or . == "completed";
+def o8_forward_intent:
+  .namespaceIntent.destination == .normalizedRequest.facts.destination
+  and .namespaceIntent.sourceSlot == .candidate.completedSlot
+  and .namespaceIntent.candidate == .candidate.observed
+  and ((.normalizedRequest.facts.operation == "install"
+        and .namespaceIntent.kind == "install"
+        and .namespaceIntent.prior == null)
+       or (.normalizedRequest.facts.operation == "update"
+        and .namespaceIntent.kind == "exchange"
+        and .namespaceIntent.prior == .normalizedRequest.facts.expectedActive.identity));
+def o8_live_prior:
+  if .normalizedRequest.facts.operation == "install" then
+    .retainedPrior == {state:"absent",identity:null,slot:null}
+  else
+    .retainedPrior.state == "captured"
+    and .retainedPrior.identity == .normalizedRequest.facts.expectedActive.identity
+    and .retainedPrior.slot == .candidate.completedSlot
+  end;
+def o8_rollback_intent:
+  .namespaceIntent.destination == .normalizedRequest.facts.destination
+  and .namespaceIntent.candidate == .candidate.observed
+  and ((.normalizedRequest.facts.operation == "install"
+        and .namespaceIntent.kind == "rollback-install"
+        and .namespaceIntent.sourceSlot == "live"
+        and .namespaceIntent.prior == null
+        and .rollbackEvidence.targetRole == "absence"
+        and .rollbackEvidence.target == {state:"absent",identity:null})
+       or (.normalizedRequest.facts.operation == "update"
+        and .namespaceIntent.kind == "rollback-exchange"
+        and .namespaceIntent.sourceSlot == .candidate.completedSlot
+        and .namespaceIntent.prior == .rollbackEvidence.target.identity
+        and .rollbackEvidence.targetRole == "prior-tree"
+        and (.rollbackEvidence.target.identity | o8_tree)));
+def o8_recovery_reason:
+  . == "stale-namespace-precondition"
+  or . == "namespace-not-performed"
+  or . == "namespace-indeterminate"
+  or . == "namespace-compensated"
+  or . == "namespace-io-failure"
+  or . == "unsupported-atomic-operation"
+  or . == "competing-operation-ambiguous"
+  or test("^pre-exposure-(shell-authority-unavailable|invalid-shell-observation|stale-candidate|stale-active-tree|stale-configuration-source|stale-reference-projection|stale-reference-state|require-unreferenced-violation|registry-source-ambiguous)$");
 def validate_v2($operation_id):
   exact_keys(["candidate","capabilityHash","corruptEvidenceSha256","gate","normalizedRequest","operationBindingSha256","operationId","pluginId","publication","registry","retainedPrior","rollback","rollbackEvidence","namespaceIntent","rescan","release","terminalReceipt","schema","state","reason"])
   and .schema == "omarchy-plugin-transaction-journal/v2"
@@ -202,7 +258,11 @@ def validate_v2($operation_id):
   and (.capabilityHash | hex_digest)
   and (.operationBindingSha256 | o8_binding)
   and (.candidate | o8_candidate)
+  and (.normalizedRequest.facts.pluginId == .pluginId)
+  and (.normalizedRequest.facts.operationId == .operationId)
   and (.candidate.expected == .normalizedRequest.facts.callerCandidateIdentity)
+  and (.candidate.expected == .candidate.observed)
+  and (.candidate.completedSlot == .operationId)
   and (.publication | o8_publication)
   and (.gate == "not-established" or .gate == "established")
   and (.registry | o8_registry)
@@ -219,18 +279,19 @@ def validate_v2($operation_id):
   and (
     (.state == "STAGED" and .reason == null and .gate == "not-established" and .registry == "not-requested" and .rollback == "not-applicable" and .namespaceIntent.state == "none" and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
     or (.state == "COMMIT_PREPARED" and .reason == null and .gate == "not-established" and .registry == "not-requested" and .rollback == "not-applicable" and .namespaceIntent.state == "none" and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "LOAD_GATED" and .reason == null and .gate == "established" and .namespaceIntent.state == "intended" and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "LIVE_TREE_EXCHANGED" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "GATED_RESCAN_COMPLETED" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and .rescan.outcome == "completed" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "RELEASE_PENDING" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and .rescan.outcome == "completed" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "COMMITTED" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and .rescan.outcome == "completed" and .release.outcome == "authorized" and .terminalReceipt.state == "durable" and .terminalReceipt.intendedJournalState == "COMMITTED" and .terminalReceipt.targetRole == "candidate" and .terminalReceipt.target.state == "present" and .terminalReceipt.target.identity == .candidate.observed)
-    or (.state == "ROLLBACK_STARTED" and .gate == "established" and .rollbackEvidence.state == "intended" and .rollbackEvidence.targetRole != "none" and .rollbackEvidence.outcome == "pending" and .namespaceIntent.state == "intended" and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "ROLLBACK_STARTED" and .gate == "established" and .rollbackEvidence.state == "completed" and .rollbackEvidence.targetRole != "none" and .rollbackEvidence.outcome == "restored" and .namespaceIntent.state == "completed" and (.rescan.outcome == "not-requested" or .rescan.outcome == "completed") and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "ROLLED_BACK" and .gate == "established" and .rollbackEvidence.state == "completed" and .rollbackEvidence.outcome == "restored" and .rollbackEvidence.targetRole != "none" and .terminalReceipt.state == "durable" and .terminalReceipt.intendedJournalState == "ROLLED_BACK" and .terminalReceipt.targetRole == .rollbackEvidence.targetRole and .terminalReceipt.target == .rollbackEvidence.target and .namespaceIntent.state == "completed" and .rescan.outcome == "completed" and .release.outcome == "authorized")
+    or (.state == "LOAD_GATED" and .reason == null and .gate == "established" and .namespaceIntent.state == "intended" and (. | o8_forward_intent) and .namespaceIntent.sourceSlot == .candidate.completedSlot and .namespaceIntent.destination == .normalizedRequest.facts.destination and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested" and .retainedPrior.state == "not-captured")
+    or (.state == "LIVE_TREE_EXCHANGED" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and (. | o8_forward_intent) and (. | o8_live_prior) and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
+    or (.state == "GATED_RESCAN_COMPLETED" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and (. | o8_forward_intent) and (. | o8_live_prior) and .rescan.outcome == "completed" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
+    or (.state == "RELEASE_PENDING" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and (. | o8_forward_intent) and (. | o8_live_prior) and .rescan.outcome == "completed" and .release.outcome == "not-requested" and (.release | o8_release_evidence) and .release.source == .normalizedRequest.facts.expectedConfiguration.source and .release.referenceProjection == .normalizedRequest.facts.expectedConfiguration.referenceProjection and .release.referenceState == .normalizedRequest.facts.expectedConfiguration.referenceState and .release.referencePolicy == .normalizedRequest.facts.expectedConfiguration.referencePolicy and .terminalReceipt.state == "not-requested")
+    or (.state == "COMMITTED" and .reason == null and .gate == "established" and .namespaceIntent.state == "completed" and (. | o8_forward_intent) and (. | o8_live_prior) and .rescan.outcome == "completed" and .rescan.sourceDirectory == .normalizedRequest.facts.destination and .rescan.expectedTree == .candidate.observed and .rescan.observedTree == .candidate.observed and .release.outcome == "authorized" and (.release | o8_release_evidence) and .release.source == .normalizedRequest.facts.expectedConfiguration.source and .release.referenceProjection == .normalizedRequest.facts.expectedConfiguration.referenceProjection and .release.referenceState == .normalizedRequest.facts.expectedConfiguration.referenceState and .release.referencePolicy == .normalizedRequest.facts.expectedConfiguration.referencePolicy and (.release.shellInstance | string and length > 0) and (.release.generation | type == "number" and . >= 0 and floor == .) and (.release.configurationEpoch | type == "number" and . >= 0 and floor == .) and (.rescan.shellInstance | string and length > 0) and (.rescan.generation | type == "number" and . >= 0 and floor == .) and (.rescan.scanEpoch | type == "number" and . >= 0 and floor == .) and .release.shellInstance == .rescan.shellInstance and .release.generation == .rescan.generation and .terminalReceipt.state == "durable" and .terminalReceipt.intendedJournalState == "COMMITTED" and .terminalReceipt.operationBindingSha256 == .operationBindingSha256 and .terminalReceipt.operationId == .operationId and .terminalReceipt.pluginId == .pluginId and .terminalReceipt.targetRole == "candidate" and .terminalReceipt.target == {state:"present",identity:.candidate.observed} and .terminalReceipt.shellInstance == .release.shellInstance and .terminalReceipt.shellInstance == .rescan.shellInstance and .terminalReceipt.generation == .release.generation and .terminalReceipt.generation == .rescan.generation and .terminalReceipt.scanEpoch == .rescan.scanEpoch and .terminalReceipt.configurationEpoch == .release.configurationEpoch and .terminalReceipt.outcome == "authorized")
+    or (.state == "ROLLBACK_STARTED" and .gate == "established" and .rollbackEvidence.state == "intended" and .rollbackEvidence.targetRole != "none" and .rollbackEvidence.outcome == "pending" and .namespaceIntent.state == "intended" and (. | o8_rollback_intent) and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
+    or (.state == "ROLLBACK_STARTED" and .gate == "established" and .rollbackEvidence.state == "completed" and .rollbackEvidence.targetRole != "none" and .rollbackEvidence.outcome == "restored" and .namespaceIntent.state == "completed" and (. | o8_rollback_intent) and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
+    or (.state == "ROLLBACK_STARTED" and .gate == "established" and .rollbackEvidence.state == "completed" and .rollbackEvidence.targetRole != "none" and .rollbackEvidence.outcome == "restored" and .namespaceIntent.state == "completed" and .rescan.outcome == "completed" and ((.release.outcome == "not-requested" and .release.source == null and .release.rawSha256 == null and .release.referenceProjection == null and .release.referenceState == null and .release.referencePolicy == null and .release.configurationEpoch == null) or ((.release | o8_release_evidence) and .release.outcome == "not-requested" and .release.source == .normalizedRequest.facts.expectedConfiguration.source and .release.referenceProjection == .normalizedRequest.facts.expectedConfiguration.referenceProjection and .release.referenceState == .normalizedRequest.facts.expectedConfiguration.referenceState and .release.referencePolicy == .normalizedRequest.facts.expectedConfiguration.referencePolicy)) and .terminalReceipt.state == "not-requested")
+    or (.state == "ROLLED_BACK" and .gate == "established" and .rollbackEvidence.state == "completed" and .rollbackEvidence.outcome == "restored" and .rollbackEvidence.targetRole != "none" and (. | o8_rollback_intent) and ((.normalizedRequest.facts.operation == "install" and .retainedPrior == {state:"absent",identity:null,slot:null}) or (.normalizedRequest.facts.operation == "update" and .retainedPrior.state == "restored" and (.retainedPrior.identity | o8_tree) and .retainedPrior.slot == .candidate.completedSlot)) and .terminalReceipt.state == "durable" and .terminalReceipt.intendedJournalState == "ROLLED_BACK" and .terminalReceipt.operationBindingSha256 == .operationBindingSha256 and .terminalReceipt.operationId == .operationId and .terminalReceipt.pluginId == .pluginId and .terminalReceipt.targetRole == .rollbackEvidence.targetRole and .terminalReceipt.target == .rollbackEvidence.target and (.terminalReceipt.shellInstance | string and length > 0) and (.terminalReceipt.generation | type == "number" and . >= 0) and (.terminalReceipt.scanEpoch | type == "number" and . >= 0) and (.terminalReceipt.configurationEpoch | type == "number" and . >= 0) and .terminalReceipt.outcome == "restored" and .namespaceIntent.state == "completed" and .rescan.outcome == "completed" and .release.outcome == "authorized" and (.release | o8_release_evidence) and .release.source == .normalizedRequest.facts.expectedConfiguration.source and .release.referenceProjection == .normalizedRequest.facts.expectedConfiguration.referenceProjection and .release.referenceState == .normalizedRequest.facts.expectedConfiguration.referenceState and .release.referencePolicy == .normalizedRequest.facts.expectedConfiguration.referencePolicy and .release.shellInstance == .terminalReceipt.shellInstance and .release.generation == .terminalReceipt.generation and .rescan.shellInstance == .terminalReceipt.shellInstance and .rescan.generation == .terminalReceipt.generation and .rescan.scanEpoch == .terminalReceipt.scanEpoch and .release.configurationEpoch == .terminalReceipt.configurationEpoch)
     or (.state == "REJECTED" and (.reason | o8_rejected_reason) and .gate == "not-established" and .registry == "not-requested" and .rollback == "not-applicable" and .namespaceIntent.state == "none" and .rescan.outcome == "not-requested" and .release.outcome == "not-requested" and .terminalReceipt.state == "not-requested")
-    or (.state == "RECOVERY_REQUIRED" and .gate == "established")
-    or (.state == "MANUAL_ATTENTION" and .gate == "established")
-    or (.state == "ABORTED" and .gate == "not-established" and .namespaceIntent.state == "none")
+    or (.state == "RECOVERY_REQUIRED" and .gate == "established" and (.reason | o8_recovery_reason))
+    or (.state == "MANUAL_ATTENTION" and .gate == "established" and (.reason | string and (. == "invalid-state" or . == "operation-binding-mismatch" or . == "retained-prior-missing" or . == "invalid-generated-state" or . == "manual-attention")))
+    or (.state == "ABORTED" and .gate == "not-established" and .namespaceIntent.state == "none" and .rollback == "not-applicable" and .terminalReceipt.state == "not-requested")
   );
 
 validate_v1($operation_id) or validate_v2($operation_id)

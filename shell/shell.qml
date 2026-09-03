@@ -1255,6 +1255,7 @@ ShellRoot {
         return JSON.stringify({ valid: false, status: "registry-target-ambiguous" })
       observation.discoveryDirectory = shell.pluginRegistry.pluginsDir
       observation.transactionStateRoot = shell.pluginEligibility.stateRoot
+      observation.configurationEpoch = shell.pluginEligibility.configurationEpoch
       observation.activeDiscovery = registry.targetCount === 0
         ? { state: "absent" }
         : { state: "present", sourceDirectory: registry.sourceDirectory }
