@@ -26,7 +26,7 @@ IDENTITY=$("$INSTALL_ROOT/native/plugin-transaction/plugin-tree" identity "$SOUR
 RAW_BASE64=$(printf '%s\n' '{"version":1,"plugins":[]}' | base64 -w0)
 jq -cnS --arg plugin "$PLUGIN" --arg raw "$RAW_BASE64" --arg discovery "$DISCOVERY" \
   --arg state "$STATE_HOME/omarchy/plugin-transactions-v1" \
-  '{valid:true,status:"observed",schema:"omarchy-plugin-stage-observation/v1",pluginId:$plugin,
+  '{valid:true,status:"observed",schema:"omarchy-plugin-stage-observation/v1",pluginId:$plugin,configurationEpoch:1,
     configurationSource:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawBase64:$raw,
     referenceProjectionBase64:"b21hcmNoeS1zY2hlbWEtdjEtcmVmZXJlbmNlLXByb2plY3Rpb24vdjEA",
     referenceState:"unreferenced",discoveryDirectory:$discovery,transactionStateRoot:$state,
@@ -51,6 +51,9 @@ case "$2" in
     if [[ "$3" == acme.o8.update ]]; then
       jq --arg plugin "$3" --arg active "$HOME/.config/omarchy/plugins/repository-folder" \
         '.pluginId=$plugin | .activeDiscovery={state:"present",sourceDirectory:$active} | .referenceState="unreferenced"' "$HOME/.o8-observation.json"
+    elif [[ -d "$HOME/.config/omarchy/plugins/$3" ]]; then
+      jq --arg plugin "$3" --arg active "$HOME/.config/omarchy/plugins/$3" \
+        '.pluginId=$plugin | .activeDiscovery={state:"present",sourceDirectory:$active}' "$HOME/.o8-observation.json"
     else
       jq --arg plugin "$3" '.pluginId=$plugin' "$HOME/.o8-observation.json"
     fi
@@ -64,7 +67,10 @@ case "$2" in
   rescanRollbackPlugin)
     rollback_destination=$(jq -r .expected.destination "$XDG_STATE_HOME/omarchy/plugin-transactions-v1/gates/$4.gate")
     run_gate acknowledge-rollback-rescan "$3" "$4" shell-o8 2 2 "$rollback_destination" >/dev/null ;;
-  releaseTransactionPlugin) run_gate authorize-release "$3" "$4" shell-o8 1 1 user omarchy-shell-config:user:v1 sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null ;;
+  releaseTransactionPlugin)
+    run_gate authorize-release "$3" "$4" shell-o8 1 1 user omarchy-shell-config:user:v1 sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null
+    run_gate terminal-receipt "$3" "$4" COMMITTED >/dev/null
+    ;;
   releaseRollbackTransactionPlugin) run_gate authorize-rollback-release "$3" "$4" shell-o8 2 2 user omarchy-shell-config:user:v1 sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null ;;
   retainTransactionPlugin) run_gate retain-release "$3" "$4" shell-o8 1 >/dev/null ;;
   transactionTerminalReceipt) run_gate terminal-receipt "$3" "$4" "$5" >/dev/null ;;

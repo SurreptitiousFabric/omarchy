@@ -135,7 +135,7 @@ write_observation() {
   jq -cnS --arg kind "$source_kind" --arg identity "$source_identity" \
     --arg raw "$raw" --arg projection "$projection" --arg state "$reference_state" \
     --argjson active "$active" '
-    {valid:true,status:"observed",schema:"omarchy-plugin-stage-observation/v1",pluginId:"pending",
+    {valid:true,status:"observed",schema:"omarchy-plugin-stage-observation/v1",pluginId:"pending",configurationEpoch:1,
      configurationSource:{kind:$kind,identity:$identity},rawBase64:$raw,
      referenceProjectionBase64:$projection,referenceState:$state,activeDiscovery:$active,
      discoveryDirectory:"pending",transactionStateRoot:"pending"}' \
