@@ -52,7 +52,7 @@ cp -a "$SOURCE_ROOT/native" "$test_root/native"
 # The O-8 terminal handoff mode invokes the production transaction wrapper.
 # Give it a copied package root so package-relative helpers and shell IPC target
 # the same isolated offscreen shell as this harness.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
   rm "$test_root/bin"
   mkdir "$test_root/bin"
   cp "$SOURCE_ROOT/bin/omarchy-plugin-transaction" "$SOURCE_ROOT/bin/omarchy-shell" \
@@ -80,7 +80,7 @@ fi
 mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
   -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
   "$SOURCE_ROOT/native/plugin-transaction/plugin-tree.c" -o "$helper"
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
   cp "$helper" "$test_root/native/plugin-transaction/plugin-tree"
 fi
 
@@ -122,7 +122,7 @@ done
 # This operation is a fresh install: retain the source outside discovery while
 # the active destination is absent.  The ordinary lifecycle cases keep their
 # pre-existing active fixtures.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
   rm -rf "$plugin_dir/$o8_terminal_id"
 fi
 
@@ -222,6 +222,9 @@ export OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME="$TMPDIR/authorize-after-resume"
 export OMARCHY_LIFECYCLE_HOLD_TERMINAL_RECEIPT="$TMPDIR/hold-terminal-receipt"
 export OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_READY="$TMPDIR/terminal-receipt-ready"
 export OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME="$TMPDIR/terminal-receipt-resume"
+if [[ $EXPECTATION == o8-terminal-receipt-failure ]]; then
+  export OMARCHY_LIFECYCLE_FAIL_TERMINAL_RECEIPT=1
+fi
 export OMARCHY_LIFECYCLE_HOLD_SCAN="$TMPDIR/hold-scan"
 export OMARCHY_LIFECYCLE_SCAN_READY="$TMPDIR/scan-ready"
 export OMARCHY_LIFECYCLE_SCAN_RESUME="$TMPDIR/scan-resume"
@@ -231,7 +234,7 @@ mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFO
   "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME" "$OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME" \
   "$OMARCHY_LIFECYCLE_SCAN_RESUME"
 export QT_QPA_PLATFORM=offscreen
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
   # The production wrapper forwards WAYLAND_DISPLAY (but not DISPLAY) to qs;
   # retain the isolated harness's display identity so its real QML process is
   # discoverable without contacting the desktop shell.
@@ -298,7 +301,7 @@ observed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$stage_observa
 [[ $observed_projection == "$initial_service_projection" ]] || fail "production transaction observation bypassed canonical projection"
 pass "production stage observation uses the live accepted O-6 snapshot and canonical projection"
 
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
   o8_source="$TMPDIR/candidate-$o8_terminal_id"
   o8_operation=62000000-0000-4000-8000-000000000001
   o8_identity=$($helper identity "$o8_source")
@@ -330,7 +333,7 @@ if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-correc
   wait_for "real QML release reaches post-authorization barrier" '[[ -e $OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY ]]'
   [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_terminal_id.gate") == RELEASE_AUTHORIZED ]] ||
     fail "native release did not durably produce RELEASE_AUTHORIZED"
-  if [[ $EXPECTATION == o8-terminal-reviewed ]]; then
+    if [[ $EXPECTATION == o8-terminal-reviewed ]]; then
     o8_state=$(state "$o8_terminal_id")
     [[ $(jq -r .gate.state <<<"$o8_state") == RESCAN_ACKNOWLEDGED ]] ||
       fail "reviewed QML unexpectedly stored RELEASE_AUTHORIZED before the negative control"
@@ -347,6 +350,29 @@ if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-correc
     [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_terminal_id.gate") == RELEASE_AUTHORIZED ]] ||
       fail "failed reviewed terminal receipt did not retain durable release authority"
     pass "real QML terminal receipt refusal prevents a false committed result"
+  elif [[ $EXPECTATION == o8-terminal-receipt-failure ]]; then
+    # The helper has durably written TERMINAL_RECEIPT, but the real QML action
+    # receives a failure after publication.  QML must synchronously restore a
+    # blocking authority and wait for lifecycle quiescence before the
+    # coordinator can make any rollback or terminal-journal decision.
+    printf 'resume\n' >"$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME"
+    rm -f "$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER" "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY"
+    wait_for "receipt failure reaches the real QML callback" '[[ $(transaction_status "$o8_operation" 2>/dev/null || true) == terminal-receipt-indeterminate ]]'
+    wait_for "receipt failure restores a blocking durable gate" '[[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_terminal_id.gate" 2>/dev/null || true) == GATED ]]'
+    [[ $(state "$o8_terminal_id" | jq -r .directUrl) == "" ]] ||
+      fail "receipt failure left the candidate eligible in the current shell"
+    [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$o8_operation.journal") == RELEASE_PENDING ]] ||
+      fail "receipt failure advanced the terminal journal"
+    [[ -d "$plugin_dir/$o8_terminal_id" && ! -L "$plugin_dir/$o8_terminal_id" ]] ||
+      fail "receipt failure changed the exposed namespace before re-gating"
+    [[ $($helper identity "$plugin_dir/$o8_terminal_id") == "$o8_identity" ]] ||
+      fail "receipt failure changed the exposed candidate before re-gating"
+    set +e
+    wait "$o8_commit_pid"
+    o8_commit_status=$?
+    set -e
+    (( o8_commit_status != 0 )) || fail "receipt failure falsely completed commit"
+    pass "real QML receipt failure re-gates before any rollback or COMMITTED state"
   else
     # The helper is still paused before QML handles RELEASE_AUTHORIZED.  The
     # blocking map must therefore remain authoritative until the callback runs.

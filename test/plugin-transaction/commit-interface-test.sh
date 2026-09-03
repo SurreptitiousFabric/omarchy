@@ -72,8 +72,20 @@ case "$2" in
     run_gate terminal-receipt "$3" "$4" COMMITTED >/dev/null
     ;;
   releaseRollbackTransactionPlugin) run_gate authorize-rollback-release "$3" "$4" shell-o8 2 2 user omarchy-shell-config:user:v1 sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null ;;
-  retainTransactionPlugin) run_gate retain-release "$3" "$4" shell-o8 1 >/dev/null ;;
+  retainTransactionPlugin) run_gate retain-release "$3" "$4" shell-o8 1 >/dev/null; run_gate acknowledge-unload "$3" "$4" shell-o8 >/dev/null ;;
   transactionTerminalReceipt) run_gate terminal-receipt "$3" "$4" "$5" >/dev/null ;;
+  transactionTerminalReconcile) touch "$HOME/.o8-terminal-reconciled"; printf '%s\n' pending ;;
+  transactionPluginState)
+    plugin_for_state=$(jq -r .pluginId "$XDG_STATE_HOME/omarchy/plugin-transactions-v1/journals/$3.journal" 2>/dev/null || printf unknown)
+    gate_state=$(jq -r .state "$XDG_STATE_HOME/omarchy/plugin-transactions-v1/gates/$plugin_for_state.gate" 2>/dev/null || printf unknown)
+    case "$gate_state" in
+      UNLOAD_ACKNOWLEDGED) result=gate-installed-unload-acknowledged ;;
+      RESCAN_ACKNOWLEDGED) result=gated-rescan-complete ;;
+      RELEASE_AUTHORIZED) result=released ;;
+      TERMINAL_RECEIPT) result=terminal-pair-reconciled ;;
+      *) result=unknown ;;
+    esac
+    jq -cn --arg operation "$3" --arg status "$result" '{operationId:$operation,status:$status}' ;;
   *) exit 64 ;;
 esac
 SH
@@ -187,3 +199,28 @@ jq -e --arg operation "$UPDATE_ROLLBACK_OPERATION" --arg plugin "$UPDATE_PLUGIN"
 [[ $("$INSTALL_ROOT/native/plugin-transaction/plugin-tree" identity "$UPDATE_ACTIVE") == "$UPDATE_IDENTITY" ]]
 [[ $("$INSTALL_ROOT/native/plugin-transaction/plugin-tree" identity "$STATE_HOME/omarchy/plugin-candidates-v1/$UPDATE_ROLLBACK_OPERATION/candidate") == "$UPDATE_ROLLBACK_IDENTITY" ]]
 printf 'ok - update rollback reverses exchange and restores the basename-independent prior tree\n'
+
+# A pre-gate stale candidate must become a complete v2 REJECTED record.
+REJECT_OPERATION=83000000-0000-4000-8000-000000000005
+REJECT_PLUGIN=acme.o8.rejected
+REJECT_SOURCE="$TEST_ROOT/reject-source"
+make_interface_plugin "$ROOT" "$REJECT_SOURCE" "$REJECT_PLUGIN"
+REJECT_IDENTITY=$($INSTALL_ROOT/native/plugin-transaction/plugin-tree identity "$REJECT_SOURCE")
+REJECT_REQUEST=$(jq -cn --arg operation "$REJECT_OPERATION" --arg token "$TOKEN" --arg plugin "$REJECT_PLUGIN" \
+  --arg source "$REJECT_SOURCE" --arg identity "$REJECT_IDENTITY" --arg projection "$PROJECTION" \
+  '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",operationId:$operation,
+    operationToken:$token,operation:"install",pluginId:$plugin,source:{kind:"directory",path:$source},
+    candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:("sha256:"+($identity|sub("^omarchy-runtime-tree-sha256-v1:";"")))},
+    expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+      referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+printf '%s' "$REJECT_REQUEST" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction" >/dev/null
+find "$STATE_HOME/omarchy/plugin-candidates-v1/$REJECT_OPERATION/candidate" -depth -delete
+REJECT_COMMIT=$(jq -cn --arg operation "$REJECT_OPERATION" --arg token "$TOKEN" \
+  '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operation,operationToken:$token}')
+REJECT_RESULT=$(printf '%s' "$REJECT_COMMIT" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction")
+jq -e '.state=="REJECTED" and .status=="rejected" and .reason=="stale-candidate"' <<<"$REJECT_RESULT" >/dev/null
+REJECT_JOURNAL="$STATE_HOME/omarchy/plugin-transactions-v1/journals/$REJECT_OPERATION.journal"
+jq -e '.schema=="omarchy-plugin-transaction-journal/v2" and .state=="REJECTED" and .gate=="not-established" and .namespaceIntent.state=="none" and .rollback=="not-applicable"' "$REJECT_JOURNAL" >/dev/null
+REJECT_RETRY=$(printf '%s' "$REJECT_COMMIT" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction")
+jq -e '.state=="REJECTED" and .status=="rejected" and .reason=="stale-candidate"' <<<"$REJECT_RETRY" >/dev/null
+printf 'ok - pre-gate stale candidate becomes durable v2 REJECTED and exact replay is stable\n'
