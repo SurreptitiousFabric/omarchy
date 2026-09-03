@@ -385,8 +385,11 @@ case $action in
     operation_id=$1; plugin_id=$2; shell_instance=$3
     [[ -n $shell_instance && ${#shell_instance} -le 128 ]] || fail invalid-shell-instance "$shell_instance"
     load_gate "$operation_id" "$plugin_id"
-    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 && $(jq -r .state "$journal") != COMMIT_PREPARED ]]; then
-      fail operation-state-mismatch "$operation_id"
+    if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
+      case $(jq -r .state "$journal") in
+        COMMIT_PREPARED|GATED_RESCAN_COMPLETED|RELEASE_PENDING|ROLLBACK_STARTED) ;;
+        *) fail operation-state-mismatch "$operation_id" ;;
+      esac
     fi
     state=$(jq -r .state "$gate")
     if [[ $state == UNLOAD_ACKNOWLEDGED ]]; then
@@ -607,6 +610,26 @@ case $action in
     gate="$state_root/gates/$plugin_id.gate"
     jq -cS '{status:"terminal-receipt-durable",state:.state,operationBindingSha256:.operationBindingSha256,terminalReceipt:.terminalReceipt,gate:.}' "$gate"
     ;;
+  terminal-reconcile)
+    [[ $# == 2 ]] || fail usage 'terminal-reconcile OPERATION_ID PLUGIN_ID'
+    operation_id=$1; plugin_id=$2
+    load_gate "$operation_id" "$plugin_id"
+    state=$(jq -r .state "$journal")
+    intended_state=$(jq -r '.terminalReceipt.intendedJournalState // ""' "$gate")
+    [[ $(jq -r .state "$gate") == TERMINAL_RECEIPT ]] || fail terminal-receipt-missing "$plugin_id"
+    if [[ $intended_state == COMMITTED ]]; then
+      [[ $state == RELEASE_PENDING ]] || fail operation-state-mismatch "$operation_id"
+    elif [[ $intended_state == ROLLED_BACK ]]; then
+      [[ $state == ROLLBACK_STARTED ]] || fail operation-state-mismatch "$operation_id"
+    else
+      fail terminal-receipt-invalid "$plugin_id"
+    fi
+    jq -e --arg operation "$operation_id" --arg plugin "$plugin_id" --arg intended "$intended_state" \
+      '.terminalReceipt.operationId == $operation and .terminalReceipt.pluginId == $plugin and .terminalReceipt.intendedJournalState == $intended and .terminalReceipt.operationBindingSha256 == .operationBindingSha256 and .terminalReceipt.state == "durable"' "$gate" >/dev/null 2>&1 ||
+      fail terminal-receipt-invalid "$plugin_id"
+    jq -cS --arg intended "$intended_state" \
+      '{status:"terminal-pair-valid",operationId:.operationId,pluginId:.pluginId,intendedJournalState:$intended,operationBindingSha256:.operationBindingSha256,terminalReceipt:.terminalReceipt,gate:.}' "$gate"
+    ;;
   retain-release)
     [[ $# == 4 ]] || fail usage 'retain-release OPERATION_ID PLUGIN_ID SHELL_INSTANCE GENERATION'
     operation_id=$1; plugin_id=$2; shell_instance=$3; generation=$4
@@ -614,16 +637,29 @@ case $action in
     load_gate "$operation_id" "$plugin_id"
     if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
       case $(jq -r .state "$journal") in
-        RELEASE_PENDING|ROLLBACK_STARTED) ;;
+        GATED_RESCAN_COMPLETED|RELEASE_PENDING|ROLLBACK_STARTED) ;;
         *) fail operation-state-mismatch "$operation_id" ;;
       esac
     fi
     state=$(jq -r .state "$gate")
-    if [[ $state == UNLOAD_ACKNOWLEDGED ]]; then
+    if [[ $state == GATED ]]; then
+      # Retaining release authority first re-establishes a blocking gate.  The
+      # shell must complete its real lifecycle quiescence and call
+      # acknowledge-unload separately; this action must never manufacture an
+      # unload acknowledgement.
       emit_gate_result release-retained
       exit 0
     fi
-    if [[ $state == RESCAN_ACKNOWLEDGED ]]; then
+    if [[ $state == TERMINAL_RECEIPT ]]; then
+      # A terminal-receipt helper can fail after the receipt rename but before
+      # the coordinator observes it.  Re-establish a blocking v2 gate and
+      # clear the receipt evidence; the nonterminal journal remains the
+      # authoritative handoff, and QML must still prove lifecycle quiescence.
+      :
+    elif [[ $state == UNLOAD_ACKNOWLEDGED ]]; then
+      emit_gate_result release-retained
+      exit 0
+    elif [[ $state == RESCAN_ACKNOWLEDGED ]]; then
       [[ $(jq -r .rescan.shellInstance "$gate") == "$shell_instance"
         && $(jq -r .rescan.generation "$gate") == "$generation" ]] || fail stale-release-binding "$plugin_id"
     elif [[ $state == RELEASE_AUTHORIZED ]]; then
@@ -634,7 +670,7 @@ case $action in
     fi
     input=$(mktemp "${TMPDIR:-/tmp}/omarchy-gate-record.XXXXXX")
     if [[ $journal_schema == omarchy-plugin-transaction-journal/v2 ]]; then
-      jq -cS '.state="UNLOAD_ACKNOWLEDGED"
+      jq -cS '.state="GATED" | .unload="pending"
         | .rescan={expectedTree:null,generation:null,observedTree:null,outcome:"not-requested",scanEpoch:null,shellInstance:null,sourceDirectory:null,targetRole:"none"}
         | .release={configurationEpoch:null,generation:null,outcome:"not-requested",shellInstance:null}
         | .terminalReceipt={state:"not-requested",intendedJournalState:null,operationBindingSha256:null,operationId:null,pluginId:null,targetRole:"none",target:null,shellInstance:null,generation:null,scanEpoch:null,configurationEpoch:null,outcome:"not-requested"}' "$gate" >"$input"

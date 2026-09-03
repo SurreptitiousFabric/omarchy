@@ -1237,6 +1237,10 @@ ShellRoot {
       return shell.pluginEligibility.terminalReceipt(operationId, pluginId, intendedState)
     }
 
+    function transactionTerminalReconcile(operationId: string, pluginId: string): string {
+      return shell.pluginEligibility.reconcileTerminalPair(operationId, pluginId)
+    }
+
     function transactionPluginState(operationId: string): string {
       return shell.pluginEligibility.transactionState(operationId)
     }

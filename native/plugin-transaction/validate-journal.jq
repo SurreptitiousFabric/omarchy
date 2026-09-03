@@ -129,6 +129,7 @@ def o8_rejected_reason:
   string and (. == "stale-candidate" or . == "stale-active-tree"
     or . == "stale-configuration-source" or . == "stale-reference-projection"
     or . == "stale-reference-state" or . == "require-unreferenced-violation"
+    or . == "registry-source-ambiguous"
     or . == "plugin-gated-by-another-operation");
 def o8_absent: . == {state:"absent",identity:null};
 def o8_present: (.state == "present" and (.identity | o8_tree));
@@ -246,6 +247,7 @@ def o8_recovery_reason:
   or . == "namespace-io-failure"
   or . == "unsupported-atomic-operation"
   or . == "competing-operation-ambiguous"
+  or . == "pre-exposure-gate-indeterminate"
   or test("^pre-exposure-(shell-authority-unavailable|invalid-shell-observation|stale-candidate|stale-active-tree|stale-configuration-source|stale-reference-projection|stale-reference-state|require-unreferenced-violation|registry-source-ambiguous)$");
 def validate_v2($operation_id):
   exact_keys(["candidate","capabilityHash","corruptEvidenceSha256","gate","normalizedRequest","operationBindingSha256","operationId","pluginId","publication","registry","retainedPrior","rollback","rollbackEvidence","namespaceIntent","rescan","release","terminalReceipt","schema","state","reason"])

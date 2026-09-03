@@ -565,6 +565,17 @@ QtObject {
     return "pending"
   }
 
+  // Reconcile a durable terminal receipt with this shell instance after a
+  // restart.  The helper is read-only; only the exact matching block may be
+  // removed from the in-memory authority map.
+  function reconcileTerminalPair(operationId, pluginId) {
+    if (!validOperation(operationId) || !validPlugin(pluginId)) return "invalid-identity"
+    setResult(operationId, pluginId, "terminal-reconcile-pending", "")
+    enqueue({ type: "terminal-reconcile", operationId: operationId, pluginId: pluginId,
+      command: [helperPath, "terminal-reconcile", operationId, pluginId] })
+    return "pending"
+  }
+
   function refreshGateFromResult(command, payload) {
     if (command.type === "install") {
       var installedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
@@ -723,19 +734,48 @@ QtObject {
         eligibilityChanged()
         setResult(command.operationId, command.pluginId, "released", "discovery only; execution not observed")
       }
+    } else if (command.type === "terminal-reconcile") {
+      var pair = payload
+      if (!pair || pair.status !== "terminal-pair-valid"
+          || pair.operationId !== command.operationId || pair.pluginId !== command.pluginId
+          || (pair.intendedJournalState !== "COMMITTED" && pair.intendedJournalState !== "ROLLED_BACK")) {
+        setResult(command.operationId, command.pluginId, "terminal-reconcile-required", "invalid terminal pair")
+      } else {
+        var currentGate = gates[String(command.pluginId)]
+        if (currentGate && currentGate.valid === true && currentGate.operationId !== command.operationId) {
+          setResult(command.operationId, command.pluginId, "terminal-reconcile-required", "another operation still blocks plugin")
+        } else {
+          var reconciled = ({})
+          for (var pairKey in gates) if (pairKey !== String(command.pluginId)) reconciled[pairKey] = gates[pairKey]
+          gates = reconciled
+          eligibilityChanged()
+          setResult(command.operationId, command.pluginId, "terminal-pair-reconciled", "current shell terminal authority acknowledged")
+        }
+      }
     } else if (command.type === "retain-release") {
       var retainedGate = memoryGate(payload.gate, command.operationId, command.pluginId)
-      if (!retainedGate || retainedGate.state !== "UNLOAD_ACKNOWLEDGED") {
+      // O-5/O-6 v1 gates have no pending-unload representation and retain the
+      // historical direct UNLOAD_ACKNOWLEDGED transition.  O-8 v2 gates must
+      // remain GATED until the real lifecycle callback acknowledges unload.
+      var legacyRetained = retainedGate && retainedGate.schema === "omarchy-plugin-transaction-gate/v1"
+        && retainedGate.state === "UNLOAD_ACKNOWLEDGED"
+      if (!retainedGate || (retainedGate.state !== "GATED" && !legacyRetained)) {
         setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })
         setResult(command.operationId, command.pluginId, "release-retained", "invalid helper result")
         return
       }
       setGateRecord(command.pluginId, retainedGate)
+      if (legacyRetained) {
+        clearPendingUnload(command.pluginId)
+        setResult(command.operationId, command.pluginId,
+          command.failureStatus || "release-retained", command.detail || "release authority retained")
+        return
+      }
       setPendingUnload(command.operationId, command.pluginId, false)
       if (unloadCallback) unloadCallback(command.pluginId)
       verifyPendingUnload(command.pluginId)
       setResult(command.operationId, command.pluginId,
-        command.failureStatus || "release-retained", command.detail || "release authority changed")
+        command.failureStatus || "release-retained", command.detail || "release authority changed; unload acknowledgement pending")
     }
   }
 
