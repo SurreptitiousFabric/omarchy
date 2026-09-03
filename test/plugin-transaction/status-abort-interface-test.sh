@@ -69,8 +69,11 @@ if [[ ${1:-} == journal-replace && ${5:-} == staged-to-aborted && -f $directory/
     parent-fsync) export OMARCHY_PLUGIN_TREE_TEST_FAIL_FSYNC=journal-parent:staged-to-aborted ;;
   esac
 fi
-if [[ ${1:-} == journal-read && -f $directory/status-write-negative ]]; then
+if [[ (${1:-} == journal-read || ${1:-} == journal-read-locked || ${1:-} == journal-read-held) && -f $directory/status-write-negative ]]; then
   touch -m -d '2002-01-01 UTC' "$2/journals/$3.journal"
+fi
+if [[ (${1:-} == journal-read-locked || ${1:-} == journal-read-held) && -f $directory/journal-authority-fault ]]; then
+  export OMARCHY_PLUGIN_TREE_TEST_FAIL_FSYNC=journal-reconciliation-parent
 fi
 exec "$real" "$@"
 SH
@@ -141,7 +144,8 @@ public_stage_request() {
 }
 
 source_for() {
-  local operation=$1 plugin=$2 source="$TEST_ROOT/source-$operation"
+  local operation=$1 plugin=$2 source
+  source="$TEST_ROOT/source-$operation"
   make_interface_plugin "$ROOT" "$source" "$plugin"
   printf '%s\n' "$source"
 }
@@ -168,6 +172,7 @@ for durable_state in REQUEST_BOUND PUBLICATION_INTENT STAGED RECOVERY_REQUIRED M
     REQUEST_BOUND)
       jq -cS '.state="REQUEST_BOUND" | .candidate.observed=null | .publication.state="not-started" | .reason=null' \
         "$journal" >"$journal.next"
+      find "$STORE/$operation" -depth -delete
       ;;
     PUBLICATION_INTENT)
       jq -cS '.state="PUBLICATION_INTENT" | .publication.state="intended" | .reason=null' \
@@ -382,18 +387,30 @@ for durable_state in REQUEST_BOUND PUBLICATION_INTENT RECOVERY_REQUIRED MANUAL_A
   set -e
   case $durable_state in
     REQUEST_BOUND|PUBLICATION_INTENT)
-      [[ $code == 0 ]]; jq -e '.reason == "operation-in-progress"' <<<"$output" >/dev/null ;;
+      [[ $code == 0 ]]; jq -e '.state == "STAGED" and .status == "ok"' <<<"$output" >/dev/null ;;
     RECOVERY_REQUIRED)
       [[ $code == 5 ]]; jq -e '.reason == "recovery-required"' <<<"$output" >/dev/null ;;
     MANUAL_ATTENTION)
       [[ $code == 4 ]]; jq -e '.reason == "manual-attention"' <<<"$output" >/dev/null ;;
   esac
-  [[ $(sha256sum "$journal") == "$before" ]]
+  if [[ $durable_state == REQUEST_BOUND || $durable_state == PUBLICATION_INTENT ]]; then
+    [[ $(jq -r .state "$journal") == STAGED ]]
+  else
+    [[ $(sha256sum "$journal") == "$before" ]]
+  fi
 done
-printf 'ok - public stage does not execute recovery for unowned nonterminal journals\n'
+printf 'ok - exact stage replay resumes recoverable nonterminal journals and refuses recovery states\n'
 
-waiting_operation=${state_operations[REQUEST_BOUND]}
+waiting_operation=83100000-0000-4000-8000-000000000099
+waiting_plugin=acme.o7-stage-wait
+waiting_source=$(source_for "$waiting_operation" "$waiting_plugin")
+stage_direct "$waiting_operation" "$waiting_plugin" "$waiting_source"
 waiting_journal="$STATE_ROOT/journals/$waiting_operation.journal"
+jq -cS '.state="REQUEST_BOUND" | .candidate.observed=null | .publication.state="not-started" | .reason=null' \
+  "$waiting_journal" >"$waiting_journal.next"
+chmod 0600 "$waiting_journal.next"
+mv "$waiting_journal.next" "$waiting_journal"
+find "$STORE/$waiting_operation" -depth -delete
 waiting_lock="$STATE_ROOT/locks/operations/$waiting_operation.lock"
 waiting_before=$(sha256sum "$waiting_journal")
 helper_dir=$(dirname -- "$NATIVE")
@@ -410,11 +427,12 @@ kill -0 "$waiting_stage_pid"
 flock -u "$waiting_owner_fd"
 exec {waiting_owner_fd}>&-
 wait "$waiting_stage_pid"
-jq -e '.state == "REQUEST_BOUND" and .reason == "operation-in-progress"' \
+jq -e '.state == "STAGED" and .status == "ok"' \
   "$TEST_ROOT/stage-wait.out" >/dev/null
-[[ $(sha256sum "$waiting_journal") == "$waiting_before" ]]
+[[ $(jq -r .state "$waiting_journal") == STAGED ]]
+[[ $(sha256sum "$waiting_journal") != "$waiting_before" ]]
 rm "$helper_dir/stage-wait-operation" "$helper_dir/stage-wait-ready"
-printf 'ok - a joined stage cannot recover an owner-abandoned nonterminal journal\n'
+printf 'ok - exact stage retry resumes an owner-abandoned REQUEST_BOUND journal\n'
 
 gate_plugin=acme.o7-gated-abort
 gate_operation=83200000-0000-4000-8000-000000000003
@@ -546,6 +564,36 @@ for fault in before-write after-write file-fsync after-file-fsync rename after-r
 done
 printf 'ok - every abort write/file-fsync/rename/parent-fsync fault reconciles as exact old or new state\n'
 printf 'ok - all abort faults retain candidates and leave live tree and configuration untouched\n'
+
+authority_operation=83300000-0000-4000-8000-000000000099
+authority_plugin=acme.o7-journal-authority
+authority_source=$(source_for "$authority_operation" "$authority_plugin")
+stage_direct "$authority_operation" "$authority_plugin" "$authority_source"
+printf 'parent-fsync\n' >"$helper_dir/abort-fault"
+set +e
+authority_first=$(abort_operation "$authority_operation" 2>"$TEST_ROOT/authority-first.err")
+authority_first_code=$?
+set -e
+rm "$helper_dir/abort-fault"
+[[ $authority_first_code == 5 ]]
+: >"$helper_dir/journal-authority-fault"
+set +e
+authority_status=$(status_operation "$authority_operation" 2>"$TEST_ROOT/authority-status.err")
+authority_status_code=$?
+authority_retry=$(abort_operation "$authority_operation" 2>"$TEST_ROOT/authority-retry.err")
+authority_retry_code=$?
+set -e
+[[ $authority_status_code == 5 && $authority_retry_code == 5 ]]
+jq -e '.status == "indeterminate" and .reason == "journal-authority-indeterminate"' \
+  <<<"$authority_status" >/dev/null
+jq -e '.status == "indeterminate" and .reason == "journal-authority-indeterminate"' \
+  <<<"$authority_retry" >/dev/null
+rm "$helper_dir/journal-authority-fault"
+authority_reconciled=$(status_operation "$authority_operation")
+jq -e '.state == "ABORTED" and .status == "aborted"' <<<"$authority_reconciled" >/dev/null
+authority_idempotent=$(abort_operation "$authority_operation")
+jq -e '.state == "ABORTED" and .status == "aborted"' <<<"$authority_idempotent" >/dev/null
+printf 'ok - parent-fsync ambiguity stays indeterminate until status/abort reconciliation sync succeeds\n'
 
 [[ ! -e $HOME_DIR/.o7-shell-calls ]]
 printf 'ok - status and abort never contact the running shell or add candidate collection\n'

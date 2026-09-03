@@ -6,7 +6,7 @@
 
 The protocol is exactly `legacy-schema-v1-transaction/v1`. Input is at most 65,536 bytes. The package native helper validates UTF-8 and complete JSON grammar, rejects literal NUL, trailing bytes, multiple values, and decoded-equivalent duplicate keys at every object depth, and returns the unchanged bytes through an anonymous pipe. The action-specific jq validator then checks exact key sets, types, vocabularies, and bounds. jq is deliberately not treated as a duplicate-key detector.
 
-Capabilities has no side effects. Stage compares caller expectations with one plugin-scoped O-6 accepted snapshot and an independently measured active tree before calling the reviewed inert stage boundary. Status is a descriptor-pinned bounded journal read and does not initialize or synchronize state. Abort applies only to an exact `STAGED`/`ABORTED` operation and retains the candidate.
+Capabilities has no side effects. Stage compares caller expectations with one plugin-scoped O-6 accepted snapshot and an independently measured active tree before calling the reviewed inert stage boundary. The helper's bounded structured result channel is combined with an authoritative durable-journal read; a `rejected` response is never emitted for an operation journal that exists. Exact retries of `REQUEST_BOUND` and `PUBLICATION_INTENT` resume the reviewed stage-candidate reconciliation path. Status is logically read-only: it acquires the existing operation lock, synchronizes the existing journals directory, and then performs a descriptor-pinned bounded journal read without creating or repairing state. A prior parent-fsync ambiguity remains indeterminate until that synchronization succeeds. Abort uses the same no-create synchronization/read seam while its already-held operation-then-plugin locks remain held, applies only to an exact `STAGED`/`ABORTED` operation, and retains the candidate.
 
 ## Responses and exit classes
 
@@ -63,6 +63,8 @@ For stage, the token is written directly to the reviewed `stage-candidate` stdin
 
 The shell observation schema is plugin-scoped. It rejects ambiguous registry IDs and binds a single discovered active source to the package-derived destination before the command hashes that tree. Raw accepted configuration is capped at 32,768 bytes and the canonical projection at 4,096 bytes before base64 transport. The command validates the complete observation under the same 64 KiB JSON syntax bound. It does not parse `shell.json` or evaluate plugin QML. The observation is point-in-time evidence only; later commit work must revalidate it.
 
+Destination authority is operation-specific. An install requires exact absence at the package-owned direct child `discoveryDirectory/pluginId`. An update takes its destination from O-6's authoritative selected active source and accepts any one real, non-symlinked direct child of the canonical discovery directory; the directory basename need not equal the manifest ID. Both rules are rechecked for durable replay, and the caller cannot supply a destination.
+
 ## Side-effect ledger
 
 | Action | Reads | Writes | Locks | Shell IPC | Prohibited effects |
@@ -70,8 +72,8 @@ The shell observation schema is plugin-scoped. It rejects ambiguous registry IDs
 | capabilities | package helper/validator and stdin | none | none | none | all filesystem/config/plugin activity |
 | stage, new | source/candidate, exact live destination or absence, accepted shell observation | transient normalized-request/journal assembly files, then the existing O-5 journal and inert candidate store | operation | one plugin-scoped read | gate, discovery/live tree, config, rescan, plugin execution |
 | stage, exact replay | journal and exact owned candidate | the reviewed helper's transient normalized-request/journal assembly files; stable `STAGED`/`ABORTED` durable evidence is not replaced | waits for any existing operation owner, re-reads while holding that operation lock, then uses the reviewed stage lock | none | external source dependency, recovery command, nonterminal reconciliation, restage after abort |
-| status | one pinned bounded journal and package validator | none | none | none | state initialization, sync, repair, quarantine, candidate reconciliation |
-| abort | journal, candidate identity, gate absence | one mode-0600 transient generated-journal input removed on exit and one atomic `STAGED`→`ABORTED` journal replacement | operation then canonical plugin lifecycle | none | candidate deletion, live/config/registry/gate change |
+| status | existing operation lock, synchronized journals directory, one pinned bounded journal and package validator | no logical state; directory synchronization only | existing operation lock (shared) | none | state initialization, lock/journal creation, repair, quarantine, candidate reconciliation |
+| abort | journal, candidate identity, gate absence | one mode-0600 transient generated-journal input removed on exit and one atomic `STAGED`→`ABORTED` journal replacement | operation then canonical plugin lifecycle; synchronization/read is no-relock while held | none | candidate deletion, live/config/registry/gate change |
 
 Caller `OMARCHY_PATH` and `OMARCHY_PLUGIN_*` variables are removed before processing. Stage invokes package-relative helpers with an explicit minimal environment. HOME and XDG state roots remain the user's standard authority roots; there is no production redirect switch.
 
@@ -86,7 +88,7 @@ Caller `OMARCHY_PATH` and `OMARCHY_PLUGIN_*` variables are removed before proces
 | `MANUAL_ATTENTION` | `manual-attention` | corrupt bytes/hash and capability omitted | status only |
 | `ABORTED` | `aborted` | retained candidate identity is public; internal path omitted | status or idempotent abort/stage replay |
 
-An unowned nonterminal journal is never advanced by the O-7 route. A concurrent caller waits for the current operation owner, reads the resulting durable state while holding that operation lock, and proceeds only for `STAGED` or `ABORTED`; an owner-abandoned nonterminal is returned unchanged. Exact same-operation replay after `ABORTED` returns the durable terminal result and cannot republish the candidate.
+An unowned nonterminal journal is reconciled only by an exact same-operation retry: the caller waits for the current operation owner, releases the read lock, and lets stage-candidate resume its durable `REQUEST_BOUND` or `PUBLICATION_INTENT` path. A concurrent caller reads the resulting durable state while holding the operation lock. Exact same-operation replay after `ABORTED` returns the durable terminal result and cannot republish the candidate.
 
 ## Abort crash matrix
 

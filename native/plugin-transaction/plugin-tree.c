@@ -1496,39 +1496,17 @@ static bool same_timestamp(struct timespec left, struct timespec right) {
   return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
 }
 
-/* Read one atomically installed journal without creating or repairing state. */
-static void read_journal_authority(const char *state_path,
-                                   const char *operation_id) {
+static void journal_authority_indeterminate(const char *operation_id) {
+  fprintf(stderr, "omarchy-plugin-tree: journal-authority-indeterminate: %s\n",
+          operation_id);
+  exit(5);
+}
+
+/* Read one atomically installed journal from an already opened journals dir. */
+static void read_journal_from_directory(int journals,
+                                         const char *operation_id) {
   if (!simple_name(operation_id))
     reject_tree("invalid-operation-id", operation_id);
-  int state = open(state_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
-                                   O_NOATIME);
-  if (state < 0) {
-    if (errno == ENOENT)
-      operation_not_found(operation_id);
-    reject_tree("invalid-state-root", operation_id);
-  }
-  struct stat state_status;
-  if (fstat(state, &state_status) < 0)
-    fail_io("stat read-only state root", state_path);
-  if (!S_ISDIR(state_status.st_mode) || (state_status.st_mode & 0777) != 0700)
-    reject_tree("invalid-state-root", operation_id);
-
-  int journals = openat(state, "journals",
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
-                            O_NOATIME);
-  if (journals < 0) {
-    if (errno == ENOENT)
-      operation_not_found(operation_id);
-    reject_tree("invalid-state-directory", operation_id);
-  }
-  struct stat directory_status;
-  if (fstat(journals, &directory_status) < 0)
-    fail_io("stat read-only journal directory", state_path);
-  if (!S_ISDIR(directory_status.st_mode) ||
-      (directory_status.st_mode & 0777) != 0700)
-    reject_tree("invalid-state-directory", operation_id);
-
   char name[160];
   int name_length =
       snprintf(name, sizeof(name), "%s.journal", operation_id);
@@ -1576,6 +1554,137 @@ static void read_journal_authority(const char *state_path,
       !same_timestamp(before.st_ctim, after.st_ctim))
     reject_tree("journal-changed", operation_id);
   close(journal);
+}
+
+/* Read one atomically installed journal without creating or repairing state. */
+static void read_journal_authority(const char *state_path,
+                                   const char *operation_id) {
+  if (!simple_name(operation_id))
+    reject_tree("invalid-operation-id", operation_id);
+  int state = open(state_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
+                                   O_NOATIME);
+  if (state < 0) {
+    if (errno == ENOENT)
+      operation_not_found(operation_id);
+    reject_tree("invalid-state-root", operation_id);
+  }
+  struct stat state_status;
+  if (fstat(state, &state_status) < 0)
+    fail_io("stat read-only state root", state_path);
+  if (!S_ISDIR(state_status.st_mode) || (state_status.st_mode & 0777) != 0700)
+    reject_tree("invalid-state-root", operation_id);
+
+  int journals = openat(state, "journals",
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
+                            O_NOATIME);
+  if (journals < 0) {
+    if (errno == ENOENT)
+      operation_not_found(operation_id);
+    reject_tree("invalid-state-directory", operation_id);
+  }
+  struct stat directory_status;
+  if (fstat(journals, &directory_status) < 0)
+    fail_io("stat read-only journal directory", state_path);
+  if (!S_ISDIR(directory_status.st_mode) ||
+      (directory_status.st_mode & 0777) != 0700)
+    reject_tree("invalid-state-directory", operation_id);
+  read_journal_from_directory(journals, operation_id);
+  close(journals);
+  close(state);
+}
+
+static int open_existing_state_root(const char *state_path,
+                                    const char *operation_id) {
+  int state = open(state_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC | O_NOATIME);
+  if (state < 0) {
+    if (errno == ENOENT)
+      operation_not_found(operation_id);
+    reject_tree("invalid-state-root", operation_id);
+  }
+  struct stat status;
+  if (fstat(state, &status) < 0)
+    fail_io("stat read-only state root", state_path);
+  if (!S_ISDIR(status.st_mode) || (status.st_mode & 0777) != 0700)
+    reject_tree("invalid-state-root", operation_id);
+  return state;
+}
+
+static int open_existing_directory(int parent, const char *name,
+                                   const char *operation_id,
+                                   const char *description,
+                                   bool missing_is_not_found) {
+  int directory = openat(parent, name,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
+                              O_NOATIME);
+  if (directory < 0) {
+    if (errno == ENOENT && missing_is_not_found)
+      operation_not_found(operation_id);
+    if (errno == ENOENT)
+      reject_tree("invalid-state-directory", operation_id);
+    fail_io(description, name);
+  }
+  struct stat status;
+  if (fstat(directory, &status) < 0)
+    fail_io("stat existing directory", name);
+  if (!S_ISDIR(status.st_mode) || (status.st_mode & 0777) != 0700)
+    reject_tree("invalid-state-directory", operation_id);
+  return directory;
+}
+
+/* Status authority: lock an existing operation, sync journals, then read. */
+static void read_journal_locked(const char *state_path,
+                                const char *operation_id) {
+  if (!simple_name(operation_id))
+    reject_tree("invalid-operation-id", operation_id);
+  int state = open_existing_state_root(state_path, operation_id);
+  int locks = open_existing_directory(state, "locks", operation_id,
+                                      "open existing lock directory", false);
+  int operations = open_existing_directory(locks, "operations", operation_id,
+                                           "open existing operation directory", false);
+  char operation_name[160];
+  int length = snprintf(operation_name, sizeof(operation_name), "%s.lock",
+                        operation_id);
+  if (length < 0 || (size_t)length >= sizeof(operation_name))
+    reject_tree("operation-lock-name-limit", operation_id);
+  int operation = openat(operations, operation_name,
+                         O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (operation < 0)
+    reject_tree("invalid-operation-lock", operation_id);
+  struct stat operation_status;
+  if (fstat(operation, &operation_status) < 0)
+    fail_io("stat operation lock", operation_name);
+  if (!S_ISREG(operation_status.st_mode) || operation_status.st_nlink != 1 ||
+      (operation_status.st_mode & 0777) != 0600)
+    reject_tree("invalid-operation-lock", operation_id);
+  while (flock(operation, LOCK_SH) < 0) {
+    if (errno == EINTR)
+      continue;
+    fail_io("acquire operation lock", operation_name);
+  }
+  int journals = open_existing_directory(state, "journals", operation_id,
+                                         "open existing journal directory", true);
+  if (sync_fd(journals, "journal-reconciliation-parent") < 0)
+    journal_authority_indeterminate(operation_id);
+  read_journal_from_directory(journals, operation_id);
+  close(journals);
+  close(operation);
+  close(operations);
+  close(locks);
+  close(state);
+}
+
+/* Abort authority: caller already owns operation and plugin locks. */
+static void read_journal_held(const char *state_path,
+                              const char *operation_id) {
+  if (!simple_name(operation_id))
+    reject_tree("invalid-operation-id", operation_id);
+  int state = open_existing_state_root(state_path, operation_id);
+  int journals = open_existing_directory(state, "journals", operation_id,
+                                         "open existing journal directory", true);
+  if (sync_fd(journals, "journal-reconciliation-parent") < 0)
+    journal_authority_indeterminate(operation_id);
+  read_journal_from_directory(journals, operation_id);
   close(journals);
   close(state);
 }
@@ -1863,6 +1972,14 @@ int main(int argc, char **argv) {
     read_journal_authority(argv[2], argv[3]);
     return 0;
   }
+  if (argc == 4 && strcmp(argv[1], "journal-read-locked") == 0) {
+    read_journal_locked(argv[2], argv[3]);
+    return 0;
+  }
+  if (argc == 4 && strcmp(argv[1], "journal-read-held") == 0) {
+    read_journal_held(argv[2], argv[3]);
+    return 0;
+  }
   if (argc == 4 && strcmp(argv[1], "plugin-lock") == 0) {
     hold_plugin_lock(argv[2], argv[3]);
     return 0;
@@ -1888,7 +2005,8 @@ int main(int argc, char **argv) {
           "gate-replace STATE PLUGIN INPUT TRANSITION | gate-sync STATE | "
           "domain-hash DOMAIN | sync-directory PATH POINT | "
           "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "
-          "journal-read STATE OPERATION | json-request-check | "
+          "journal-read STATE OPERATION | journal-read-locked STATE OPERATION | "
+          "journal-read-held STATE OPERATION | json-request-check | "
           "operation-lock STATE OPERATION | plugin-lock STATE PLUGIN-ID | "
           "ordered-lock STATE OPERATION PLUGIN-ID | "
           "hash-equal EXPECTED\n",
