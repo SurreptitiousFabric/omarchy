@@ -6,6 +6,7 @@ if (!path) throw new Error('usage: instrument-copy.mjs SHELL_QML')
 let source = fs.readFileSync(path, 'utf8')
 const forgetScreenLoaders = process.env.OMARCHY_LIFECYCLE_FORGET_SCREEN_LOADERS === '1'
 const duplicateScreenLoader = process.env.OMARCHY_LIFECYCLE_DUPLICATE_SCREEN_LOADER === '1'
+const breakTerminalHandoff = process.env.OMARCHY_LIFECYCLE_BREAK_TERMINAL_HANDOFF === '1'
 
 const registryPath = nodePath.join(nodePath.dirname(path), 'services', 'PluginRegistry.qml')
 let registrySource = fs.readFileSync(registryPath, 'utf8')
@@ -83,6 +84,24 @@ if (process.env.OMARCHY_LIFECYCLE_DISABLE_GENERATION_GUARDS === '1') {
 `,
       'central current scan authority guard')
   }
+  fs.writeFileSync(authorityPath, authority)
+}
+
+if (breakTerminalHandoff) {
+  const authorityPath = nodePath.join(nodePath.dirname(path), 'services', 'PluginEligibility.qml')
+  let authority = fs.readFileSync(authorityPath, 'utf8')
+  function replaceBrokenOnce(anchor, replacement, name) {
+    const first = authority.indexOf(anchor)
+    if (first < 0 || authority.indexOf(anchor, first + anchor.length) >= 0)
+      throw new Error(`authority anchor must occur exactly once: ${name}`)
+    authority = authority.slice(0, first) + replacement + authority.slice(first + anchor.length)
+  }
+  replaceBrokenOnce('          beginTerminalHandoff(command, authorizedGate, "COMMITTED")',
+    '          terminalReceipt(command.operationId, command.pluginId, "COMMITTED")',
+    'candidate terminal handoff negative control')
+  replaceBrokenOnce('        beginTerminalHandoff(command, rollbackAuthorizedGate, "ROLLED_BACK")',
+    '        terminalReceipt(command.operationId, command.pluginId, "ROLLED_BACK")',
+    'rollback terminal handoff negative control')
   fs.writeFileSync(authorityPath, authority)
 }
 

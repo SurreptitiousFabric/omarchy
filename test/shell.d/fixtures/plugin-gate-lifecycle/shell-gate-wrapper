@@ -33,4 +33,13 @@ if [[ $action == authorize-release ]]; then
   exit 0
 fi
 
+if [[ $action == terminal-receipt ]]; then
+  output=$($real_helper "$@")
+  hold_at "${OMARCHY_LIFECYCLE_HOLD_TERMINAL_RECEIPT:-/nonexistent}" \
+    "${OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_READY:-/nonexistent}" \
+    "${OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME:-/nonexistent}"
+  printf '%s\n' "$output"
+  exit 0
+fi
+
 exec "$real_helper" "$@"

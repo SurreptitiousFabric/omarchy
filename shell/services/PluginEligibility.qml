@@ -31,6 +31,11 @@ QtObject {
   property var commandQueue: []
   property var activeCommand: null
   property var pendingUnloads: ({})
+  // A terminal receipt is requested only after the blocking map has been
+  // cleared and eligibilityChanged() has been emitted.  Keep the exact
+  // RELEASE_AUTHORIZED evidence private until the durable receipt completes;
+  // terminalReceipt() must not infer authority from the now-unblocked map.
+  property var pendingTerminalHandoffs: ({})
   property var unloadCallback: null
   property var unloadVerifiedCallback: null
   property var rescanCallback: null
@@ -136,6 +141,32 @@ QtObject {
             : !/^[0-9a-f]{64}$/.test(String(record.operationJournalSha256 || "")))
         || ["GATED", "UNLOAD_ACKNOWLEDGED", "RESCAN_ACKNOWLEDGED", "RELEASE_AUTHORIZED"].indexOf(record.state) === -1)
       return null
+    function nonnegativeInteger(value) {
+      return typeof value === "number" && isFinite(value) && Math.floor(value) === value && value >= 0
+    }
+    if (record.schema === "omarchy-plugin-transaction-gate/v2" && record.state === "RELEASE_AUTHORIZED") {
+      var expected = record.expected
+      var rescan = record.rescan
+      var release = record.release
+      var targetRole = String(expected.targetRole || "")
+      var targetTreeOk = targetRole === "absence"
+        ? rescan.expectedTree === null && rescan.observedTree === null
+        : rescan.expectedTree === expected.tree && rescan.observedTree === expected.tree
+      if (rescan.outcome !== "completed"
+          || String(rescan.sourceDirectory || "") !== String(expected.destination || "")
+          || String(rescan.targetRole || "") !== targetRole
+          || !String(rescan.shellInstance || "")
+          || !nonnegativeInteger(rescan.generation)
+          || !nonnegativeInteger(rescan.scanEpoch)
+          || !targetTreeOk
+          || release.outcome !== "authorized"
+          || !String(release.shellInstance || "")
+          || release.shellInstance !== rescan.shellInstance
+          || !nonnegativeInteger(release.generation)
+          || Number(release.generation) !== Number(rescan.generation)
+          || !nonnegativeInteger(release.configurationEpoch))
+        return null
+    }
     return {
       valid: true,
       operationId: record.operationId,
@@ -153,6 +184,42 @@ QtObject {
       releaseShellInstance: String(record.release.shellInstance || ""),
       releaseGeneration: record.release.generation
     }
+  }
+
+  function terminalReceiptMatches(record, operationId, pluginId, intendedState, handoff) {
+    if (!record || record.schema !== "omarchy-plugin-transaction-gate/v2"
+        || record.state !== "TERMINAL_RECEIPT" || !record.expected || !record.rescan
+        || !record.release || !record.terminalReceipt) return false
+    var receipt = record.terminalReceipt
+    var expectedRole = String(record.expected.targetRole || "")
+    var targetMatches = expectedRole === "absence"
+      ? receipt.target && receipt.target.state === "absent" && receipt.target.identity === null
+      : receipt.target && receipt.target.state === "present" && receipt.target.identity === record.expected.tree
+    var intendedOk = intendedState === "COMMITTED"
+      ? receipt.intendedJournalState === "COMMITTED" && receipt.outcome === "authorized" && expectedRole === "candidate"
+      : receipt.intendedJournalState === "ROLLED_BACK" && receipt.outcome === "restored"
+        && (expectedRole === "prior-tree" || expectedRole === "absence")
+    function nonnegativeInteger(value) {
+      return typeof value === "number" && isFinite(value) && Math.floor(value) === value && value >= 0
+    }
+    var matches = receipt.state === "durable"
+      && receipt.operationId === operationId && receipt.pluginId === pluginId
+      && receipt.operationBindingSha256 === record.operationBindingSha256
+      && handoff && handoff.gate && handoff.gate.operationBindingSha256 === record.operationBindingSha256
+      && receipt.targetRole === expectedRole && targetMatches && intendedOk
+      && record.rescan.outcome === "completed"
+      && record.release.outcome === "authorized"
+      && String(record.rescan.sourceDirectory || "") === String(record.expected.destination || "")
+      && record.release.shellInstance === record.rescan.shellInstance
+      && receipt.shellInstance === record.release.shellInstance
+      && String(receipt.shellInstance || "") !== ""
+      && nonnegativeInteger(receipt.generation)
+      && Number(receipt.generation) === Number(record.release.generation)
+      && nonnegativeInteger(receipt.scanEpoch)
+      && Number(receipt.scanEpoch) === Number(record.rescan.scanEpoch)
+      && nonnegativeInteger(receipt.configurationEpoch)
+      && Number(receipt.configurationEpoch) === Number(record.release.configurationEpoch)
+    return matches
   }
 
   function registryBindingCurrent(pluginId, generation, scanEpoch, sourceDirectory) {
@@ -421,6 +488,60 @@ QtObject {
         command.shellInstance, String(command.generation)] })
   }
 
+  function setPendingTerminalHandoff(pluginId, handoff) {
+    var next = ({})
+    for (var key in pendingTerminalHandoffs) next[key] = pendingTerminalHandoffs[key]
+    next[String(pluginId)] = handoff
+    pendingTerminalHandoffs = next
+  }
+
+  function clearPendingTerminalHandoff(pluginId) {
+    var next = ({})
+    for (var key in pendingTerminalHandoffs) if (key !== String(pluginId)) next[key] = pendingTerminalHandoffs[key]
+    pendingTerminalHandoffs = next
+  }
+
+  function restoreAfterTerminalReceiptFailure(command, detail) {
+    var handoff = pendingTerminalHandoffs[String(command.pluginId)]
+    if (!handoff || handoff.operationId !== command.operationId) {
+      setResult(command.operationId, command.pluginId, "terminal-receipt-indeterminate", detail)
+      return
+    }
+    clearPendingTerminalHandoff(command.pluginId)
+    // Re-establish the durable RELEASE_AUTHORIZED evidence in the blocking
+    // map before requesting the existing retain/re-gate action.  This closes
+    // the window in which a failed receipt could leave a candidate eligible.
+    setGateRecord(command.pluginId, handoff.gate)
+    enqueue({ type: "retain-release", operationId: command.operationId, pluginId: command.pluginId,
+      generation: handoff.gate.releaseGeneration, shellInstance: handoff.gate.releaseShellInstance,
+      scanEpoch: handoff.gate.scanEpoch, sourceDirectory: handoff.gate.sourceDirectory,
+      operationJournalSha256: handoff.gate.operationJournalSha256,
+      operationBindingSha256: handoff.gate.operationBindingSha256,
+      detail: "terminal receipt failed: " + String(detail || "indeterminate"),
+      failureStatus: "terminal-receipt-indeterminate",
+      command: [helperPath, "retain-release", command.operationId, command.pluginId,
+        handoff.gate.releaseShellInstance, String(handoff.gate.releaseGeneration)] })
+    setResult(command.operationId, command.pluginId, "terminal-receipt-indeterminate", detail)
+  }
+
+  function beginTerminalHandoff(command, authorizedGate, intendedState) {
+    setGateRecord(command.pluginId, authorizedGate)
+    setPendingTerminalHandoff(command.pluginId, {
+      operationId: command.operationId,
+      pluginId: command.pluginId,
+      intendedState: String(intendedState),
+      gate: authorizedGate
+    })
+    // The signal is synchronous: publication completes before this function
+    // invokes terminalReceipt(), while the private handoff retains the exact
+    // gate required by the helper.
+    var next = ({})
+    for (var key in gates) if (key !== String(command.pluginId)) next[key] = gates[key]
+    gates = next
+    eligibilityChanged()
+    return terminalReceipt(command.operationId, command.pluginId, intendedState)
+  }
+
   function retainTransactionPlugin(operationId, pluginId) {
     var gateRecord = gates[String(pluginId)]
     if (!gateRecord || gateRecord.valid !== true || gateRecord.operationId !== operationId) return "gate-missing"
@@ -434,12 +555,12 @@ QtObject {
   }
 
   function terminalReceipt(operationId, pluginId, intendedState) {
-    var gateRecord = gates[String(pluginId)]
-    if (!gateRecord || gateRecord.valid !== true || gateRecord.operationId !== operationId
-        || gateRecord.state !== "RELEASE_AUTHORIZED")
+    var handoff = pendingTerminalHandoffs[String(pluginId)]
+    if (!handoff || handoff.operationId !== operationId || handoff.intendedState !== String(intendedState))
       return "release-not-authorized"
     setResult(operationId, pluginId, "terminal-receipt-pending", "")
     enqueue({ type: "terminal-receipt", operationId: operationId, pluginId: pluginId,
+      intendedState: String(intendedState),
       command: [helperPath, "terminal-receipt", operationId, pluginId, String(intendedState || "COMMITTED")] })
     return "pending"
   }
@@ -556,7 +677,7 @@ QtObject {
         retainAuthorizedRelease(command, "configuration epoch, registry generation, shell instance, or gate changed")
       } else {
         if (authorizedGate.schema === "omarchy-plugin-transaction-gate/v2") {
-          terminalReceipt(command.operationId, command.pluginId, "COMMITTED")
+          beginTerminalHandoff(command, authorizedGate, "COMMITTED")
         } else {
           var next = ({})
           for (var key in gates) if (key !== command.pluginId) next[key] = gates[key]
@@ -573,7 +694,7 @@ QtObject {
         setGateRecord(command.pluginId, rollbackAuthorizedGate)
         retainAuthorizedRelease(command, "rollback configuration epoch, registry generation, shell instance, or gate changed")
       } else {
-        terminalReceipt(command.operationId, command.pluginId, "ROLLED_BACK")
+        beginTerminalHandoff(command, rollbackAuthorizedGate, "ROLLED_BACK")
       }
     } else if (command.type === "terminal-receipt") {
       var receiptGate = payload.gate
@@ -585,8 +706,17 @@ QtObject {
           || !/^[0-9a-f]{64}$/.test(String(receiptGate.operationBindingSha256 || ""))
           || !receiptGate.terminalReceipt
           || receiptGate.terminalReceipt.state !== "durable") {
-        setResult(command.operationId, command.pluginId, "release-retained", "invalid terminal receipt")
+        restoreAfterTerminalReceiptFailure(command, "invalid terminal receipt")
       } else {
+        var handoff = pendingTerminalHandoffs[String(command.pluginId)]
+        if (!handoff || handoff.operationId !== command.operationId
+            || handoff.intendedState !== String(command.intendedState || "COMMITTED")
+            || !terminalReceiptMatches(receiptGate, command.operationId, command.pluginId,
+              String(command.intendedState || "COMMITTED"), handoff)) {
+          restoreAfterTerminalReceiptFailure(command, "unexpected terminal receipt")
+          return
+        }
+        clearPendingTerminalHandoff(command.pluginId)
         var terminalNext = ({})
         for (var terminalKey in gates) if (terminalKey !== command.pluginId) terminalNext[terminalKey] = gates[terminalKey]
         gates = terminalNext
@@ -604,7 +734,8 @@ QtObject {
       setPendingUnload(command.operationId, command.pluginId, false)
       if (unloadCallback) unloadCallback(command.pluginId)
       verifyPendingUnload(command.pluginId)
-      setResult(command.operationId, command.pluginId, "release-retained", command.detail || "release authority changed")
+      setResult(command.operationId, command.pluginId,
+        command.failureStatus || "release-retained", command.detail || "release authority changed")
     }
   }
 
@@ -619,6 +750,13 @@ QtObject {
       }
       if (exitCode === 0) authority.refreshGateFromResult(command, payload)
       else {
+        if (command.type === "terminal-receipt") {
+          authority.restoreAfterTerminalReceiptFailure(command,
+            String(actionStderr.text || "terminal receipt failed").trim())
+          authority.activeCommand = null
+          authority.runNext()
+          return
+        }
         if (command.type === "unload") authority.setPendingUnload(command.operationId, command.pluginId, false)
         if (command.type === "install" && !command.priorGate)
           authority.setGateRecord(command.pluginId, { operationId: command.operationId, valid: false, state: "INVALID" })

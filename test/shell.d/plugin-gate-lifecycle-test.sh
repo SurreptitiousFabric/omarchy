@@ -49,6 +49,17 @@ cp -a "$SOURCE_ROOT/shell" "$test_root/shell"
 ln -s "$SOURCE_ROOT/config" "$test_root/config"
 ln -s "$SOURCE_ROOT/bin" "$test_root/bin"
 cp -a "$SOURCE_ROOT/native" "$test_root/native"
+# The O-8 terminal handoff mode invokes the production transaction wrapper.
+# Give it a copied package root so package-relative helpers and shell IPC target
+# the same isolated offscreen shell as this harness.
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+  rm "$test_root/bin"
+  mkdir "$test_root/bin"
+  cp "$SOURCE_ROOT/bin/omarchy-plugin-transaction" "$SOURCE_ROOT/bin/omarchy-shell" \
+    "$SOURCE_ROOT/bin/omarchy-plugin-validate" "$test_root/bin/"
+  cp "$FIXTURE_ROOT/omarchy-shell-any-display" "$test_root/bin/omarchy-shell"
+  chmod 0755 "$test_root/bin/omarchy-shell"
+fi
 mv "$test_root/native/plugin-transaction/shell-gate" "$test_root/native/plugin-transaction/shell-gate.real"
 cp "$FIXTURE_ROOT/shell-gate-wrapper" "$test_root/native/plugin-transaction/shell-gate"
 chmod 0755 "$test_root/native/plugin-transaction/shell-gate"
@@ -61,12 +72,17 @@ elif [[ $EXPECTATION == broken-current-generation ]]; then
   OMARCHY_LIFECYCLE_DISABLE_GENERATION_GUARDS=1 mise exec -- node "$FIXTURE_ROOT/instrument-copy.mjs" "$test_root/shell/shell.qml"
 elif [[ $EXPECTATION == duplicate-screen-loader ]]; then
   OMARCHY_LIFECYCLE_DUPLICATE_SCREEN_LOADER=1 mise exec -- node "$FIXTURE_ROOT/instrument-copy.mjs" "$test_root/shell/shell.qml"
+elif [[ $EXPECTATION == o8-terminal-reviewed ]]; then
+  OMARCHY_LIFECYCLE_BREAK_TERMINAL_HANDOFF=1 mise exec -- node "$FIXTURE_ROOT/instrument-copy.mjs" "$test_root/shell/shell.qml"
 else
   mise exec -- node "$FIXTURE_ROOT/instrument-copy.mjs" "$test_root/shell/shell.qml"
 fi
 mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
   -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
   "$SOURCE_ROOT/native/plugin-transaction/plugin-tree.c" -o "$helper"
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+  cp "$helper" "$test_root/native/plugin-transaction/plugin-tree"
+fi
 
 service_id=acme.lifecycle-service
 active_service_id=acme.lifecycle-active-service
@@ -74,7 +90,8 @@ widget_id=acme.lifecycle-widget
 active_widget_id=acme.lifecycle-active-widget
 selected_bar_id=acme.lifecycle-selected-bar
 indeterminate_id=acme.lifecycle-indeterminate
-for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id" "$selected_bar_id" "$indeterminate_id"; do
+o8_terminal_id=acme.lifecycle-o8-terminal
+for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id" "$selected_bar_id" "$indeterminate_id" "$o8_terminal_id"; do
   live="$plugin_dir/$plugin"
   candidate="$TMPDIR/candidate-$plugin"
   mkdir -p "$live" "$candidate"
@@ -82,7 +99,7 @@ for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id
     cp "$FIXTURE_ROOT/ActiveService.qml" "$live/Service.qml"
     jq --arg id "$plugin" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
       "$FIXTURE_ROOT/manifest.json" >"$live/manifest.json"
-  elif [[ $plugin == "$service_id" || $plugin == "$indeterminate_id" ]]; then
+  elif [[ $plugin == "$service_id" || $plugin == "$indeterminate_id" || $plugin == "$o8_terminal_id" ]]; then
     cp "$FIXTURE_ROOT/Service.qml" "$live/Service.qml"
     jq --arg id "$plugin" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
       "$FIXTURE_ROOT/manifest.json" >"$live/manifest.json"
@@ -101,6 +118,13 @@ for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id
   fi
   cp -a "$live/." "$candidate/"
 done
+
+# This operation is a fresh install: retain the source outside discovery while
+# the active destination is absent.  The ordinary lifecycle cases keep their
+# pre-existing active fixtures.
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+  rm -rf "$plugin_dir/$o8_terminal_id"
+fi
 
 jq -n --arg service "$service_id" --arg widget "$widget_id" '{
   version:1,
@@ -195,15 +219,26 @@ export OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME="$TMPDIR/authorize-before-resum
 export OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER="$TMPDIR/hold-authorize-after"
 export OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY="$TMPDIR/authorize-after-ready"
 export OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME="$TMPDIR/authorize-after-resume"
+export OMARCHY_LIFECYCLE_HOLD_TERMINAL_RECEIPT="$TMPDIR/hold-terminal-receipt"
+export OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_READY="$TMPDIR/terminal-receipt-ready"
+export OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME="$TMPDIR/terminal-receipt-resume"
 export OMARCHY_LIFECYCLE_HOLD_SCAN="$TMPDIR/hold-scan"
 export OMARCHY_LIFECYCLE_SCAN_READY="$TMPDIR/scan-ready"
 export OMARCHY_LIFECYCLE_SCAN_RESUME="$TMPDIR/scan-resume"
 export OMARCHY_LIFECYCLE_INDETERMINATE_OPERATION="$indeterminate_operation"
 export OMARCHY_LIFECYCLE_INJECT_INSTALL_PARENT_FSYNC="$TMPDIR/inject-install-parent-fsync"
 mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME" \
-  "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME" "$OMARCHY_LIFECYCLE_SCAN_RESUME"
+  "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME" "$OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME" \
+  "$OMARCHY_LIFECYCLE_SCAN_RESUME"
 export QT_QPA_PLATFORM=offscreen
-export WAYLAND_DISPLAY=
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+  # The production wrapper forwards WAYLAND_DISPLAY (but not DISPLAY) to qs;
+  # retain the isolated harness's display identity so its real QML process is
+  # discoverable without contacting the desktop shell.
+  export WAYLAND_DISPLAY=${OMARCHY_TEST_WAYLAND_DISPLAY:-wayland-1}
+else
+  export WAYLAND_DISPLAY=
+fi
 export HYPRLAND_INSTANCE_SIGNATURE=
 
 quickshell -p "$test_root/shell" --no-color >"$log" 2>&1 &
@@ -220,7 +255,11 @@ marker_count() {
 
 wait_for() {
   local description=$1 command=$2
-  for _ in {1..100}; do
+  # Quickshell startup and the real QML action-process callbacks can be
+  # delayed when this fixture runs after the complete shell aggregate.  Keep
+  # one explicit bounded deadline while retaining deterministic FIFO barriers
+  # as the ordering proof.
+  for _ in {1..500}; do
     if eval "$command"; then return 0; fi
     kill -0 "$QS_PID" 2>/dev/null || { sed -n '1,240p' "$log" >&2; fail "$description"; }
     sleep 0.02
@@ -258,6 +297,88 @@ expected_raw=$(sha256sum "$config_file" | cut -d' ' -f1)
 observed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$stage_observation" | base64 -d | sha256sum | cut -d' ' -f1)
 [[ $observed_projection == "$initial_service_projection" ]] || fail "production transaction observation bypassed canonical projection"
 pass "production stage observation uses the live accepted O-6 snapshot and canonical projection"
+
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected ]]; then
+  o8_source="$TMPDIR/candidate-$o8_terminal_id"
+  o8_operation=62000000-0000-4000-8000-000000000001
+  o8_identity=$($helper identity "$o8_source")
+  o8_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$(shell_ipc shell transactionStageObservation "$o8_terminal_id")" | base64 -d | sha256sum | cut -d' ' -f1)
+  o8_token=$(head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=')
+  o8_request=$(jq -cn --arg operationId "$o8_operation" --arg token "$o8_token" \
+    --arg pluginId "$o8_terminal_id" --arg source "$o8_source" \
+    --arg digest "sha256:${o8_identity#omarchy-runtime-tree-sha256-v1:}" \
+    --arg projection "$o8_projection" '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",
+      operationId:$operationId,operationToken:$token,operation:"install",pluginId:$pluginId,
+      source:{kind:"directory",path:$source},candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest},
+      expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+      referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+  if ! printf '%s' "$o8_request" | "$test_root/bin/omarchy-plugin-transaction" >/dev/null; then
+    fail "real O-8 stage did not accept the authoritative absent observation"
+  fi
+  [[ $(shell_ipc shell testReleaseUnload "$o8_terminal_id") == ok ]] ||
+    fail "real QML harness could not release its deterministic unload barrier"
+  [[ $(shell_ipc shell testStopLocalPluginWatcher) == stopping ]] ||
+    fail "real QML harness could not stop the ordinary watcher before gated rescan"
+  : >"$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER"
+  o8_commit=$(jq -cn --arg operationId "$o8_operation" --arg token "$o8_token" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
+  set +e
+  printf '%s' "$o8_commit" | "$test_root/bin/omarchy-plugin-transaction" \
+    >"$TMPDIR/o8-commit-result" 2>"$TMPDIR/o8-commit-error" &
+  o8_commit_pid=$!
+  set -e
+  wait_for "real QML release reaches post-authorization barrier" '[[ -e $OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY ]]'
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_terminal_id.gate") == RELEASE_AUTHORIZED ]] ||
+    fail "native release did not durably produce RELEASE_AUTHORIZED"
+  if [[ $EXPECTATION == o8-terminal-reviewed ]]; then
+    o8_state=$(state "$o8_terminal_id")
+    [[ $(jq -r .gate.state <<<"$o8_state") == RESCAN_ACKNOWLEDGED ]] ||
+      fail "reviewed QML unexpectedly stored RELEASE_AUTHORIZED before the negative control"
+    [[ $(jq -r .status <<<"$o8_state") != *terminal* ]] ||
+      fail "reviewed QML reported a terminal acknowledgement despite the refused receipt"
+    pass "reviewed head reproduces the real QML RELEASE_AUTHORIZED storage defect"
+    printf 'resume\n' >"$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME"
+    rm -f "$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER" "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY"
+    set +e
+    wait "$o8_commit_pid"
+    o8_commit_status=$?
+    set -e
+    (( o8_commit_status != 0 )) || fail "reviewed head falsely completed commit after terminal receipt refusal"
+    [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_terminal_id.gate") == RELEASE_AUTHORIZED ]] ||
+      fail "failed reviewed terminal receipt did not retain durable release authority"
+    pass "real QML terminal receipt refusal prevents a false committed result"
+  else
+    # The helper is still paused before QML handles RELEASE_AUTHORIZED.  The
+    # blocking map must therefore remain authoritative until the callback runs.
+    pre_release_state=$(state "$o8_terminal_id")
+    [[ $(jq -r .gate.state <<<"$pre_release_state") == RESCAN_ACKNOWLEDGED ]] ||
+      fail "QML released the plugin before handling RELEASE_AUTHORIZED" "$pre_release_state"
+    # Hold the terminal helper after it has durably written TERMINAL_RECEIPT,
+    # so the coordinator cannot race past the QML publication checkpoint.
+    : >"$OMARCHY_LIFECYCLE_HOLD_TERMINAL_RECEIPT"
+    printf 'resume\n' >"$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME"
+    rm -f "$OMARCHY_LIFECYCLE_HOLD_AUTHORIZE_AFTER" "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_READY"
+    wait_for "QML publishes eligibility before requesting terminal receipt" \
+      '[[ -e $OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_READY ]]'
+    corrected_state=$(state "$o8_terminal_id")
+    [[ $(jq -r .gate <<<"$corrected_state") == null ]] ||
+      fail "corrected QML retained a blocking gate after eligibility publication" "$corrected_state"
+    corrected_status=$(jq -r --arg operation "$o8_operation" '.results[$operation].status' <<<"$corrected_state")
+    [[ $corrected_status == terminal-receipt-pending ]] ||
+      fail "corrected QML did not wait on the durable terminal receipt (status=$corrected_status)" "$corrected_state"
+    [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_terminal_id.gate") == TERMINAL_RECEIPT ]] ||
+      fail "terminal receipt was not durable after eligibility publication"
+    pass "real QML publishes eligibility before durable terminal receipt"
+    printf 'resume\n' >"$OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME"
+    rm -f "$OMARCHY_LIFECYCLE_HOLD_TERMINAL_RECEIPT" "$OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_READY"
+    wait_for "coordinator commits only after terminal receipt acknowledgement" \
+      '[[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$o8_operation.journal" 2>/dev/null || true) == COMMITTED ]]'
+    [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$o8_operation.journal") == COMMITTED ]] ||
+      fail "coordinator wrote no final COMMITTED journal after terminal acknowledgement"
+    pass "real QML terminal handoff completes before COMMITTED"
+  fi
+  exit 0
+fi
 wait_for "real service completion reaches deterministic barrier" '(( $(state "$service_id" 2>/dev/null | jq -r .deferredService || echo 0) >= 1 ))'
 wait_for "real widget completion reaches deterministic barrier" '(( $(state "$widget_id" 2>/dev/null | jq -r .deferredWidget || echo 0) >= 1 ))'
 wait_for "active-service completion reaches deterministic barrier" '(( $(state "$active_service_id" 2>/dev/null | jq -r .deferredService || echo 0) >= 1 ))'

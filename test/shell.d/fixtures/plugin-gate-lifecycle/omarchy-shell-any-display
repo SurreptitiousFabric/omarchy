@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+# Isolated offscreen harness selector.  The production helper intentionally
+# filters IPC instances by display; this test-only selector uses the exact
+# copied shell path and --any-display because the offscreen QPA has no desktop
+# display identity.  It still invokes the real QML shell and IPC handlers.
+[[ -n ${OMARCHY_PATH:-} && -f $OMARCHY_PATH/shell/shell.qml ]] || exit 1
+exec timeout --kill-after=1s "${OMARCHY_SHELL_IPC_TIMEOUT:-5s}" \
+  qs ipc -n --any-display -p "$OMARCHY_PATH/shell" call -- "$@"
