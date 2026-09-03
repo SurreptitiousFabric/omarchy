@@ -2,7 +2,7 @@
 
 ## Scope
 
-`omarchy-plugin-transaction-journal/v1` is the authoritative O-5 record for one staged schema-v1 plugin operation. It records inert candidate publication only. It does not represent activation, a shell gate, a rescan, live-tree mutation, rollback, or trust in plugin code.
+`omarchy-plugin-transaction-journal/v1` is the authoritative O-5/O-7 record for one staged schema-v1 plugin operation. It records inert candidate publication and an optional explicit abort while that candidate is still inert. It does not represent activation, a shell gate, a rescan, live-tree mutation, rollback, or trust in plugin code.
 
 ## Storage
 
@@ -24,15 +24,16 @@ The normalized request digest is SHA-256 over `omarchy-plugin-transaction-reques
 
 - `REQUEST_BOUND`: the immutable request, capability hash, and one exact deterministic operation-owned temporary slot are durable; no candidate identity or publication is claimed. Import creates and populates only that slot. A restart may remove and recreate that exact incomplete slot, but never scans for or removes another artifact. It may advance to `PUBLICATION_INTENT` or `MANUAL_ATTENTION`.
 - `PUBLICATION_INTENT`: the exact validated candidate identity and exact temporary/completed slots are durable before publication. It may advance to `STAGED`, `RECOVERY_REQUIRED`, or `MANUAL_ATTENTION`.
-- `STAGED`: the exact candidate is verified at the completed slot, candidate-store parent synchronization succeeded, and this journal state is durable. It has no normal lifecycle transition in O-5. A later verification that proves the record and candidate contradictory may replace it with `MANUAL_ATTENTION`; that fail-closed corruption response is not normal transaction progression.
+- `STAGED`: the exact candidate is verified at the completed slot, candidate-store parent synchronization succeeded, and this journal state is durable. O-7 may advance it to `ABORTED` only while the gate, registry, rollback, and retained-prior dimensions remain at their inert initial values and the exact candidate is still present. A later verification that proves the record and candidate contradictory may replace it with `MANUAL_ATTENTION`; that fail-closed corruption response is not normal transaction progression.
+- `ABORTED`: the owner explicitly aborted an exact still-inert `STAGED` operation. Candidate identity remains recorded, publication remains `completed-durable`, gate remains `not-established`, registry remains `not-requested`, rollback remains `not-applicable`, retained prior remains `not-captured`, and reason is exactly `owner-aborted`. The candidate remains retained. This state has no O-7 transition.
 - `RECOVERY_REQUIRED`: publication outcome is indeterminate and exact reconciliation is required. It may advance to `PUBLICATION_INTENT`, `STAGED`, or `MANUAL_ATTENTION`.
 - `MANUAL_ATTENTION`: exact reconciliation cannot establish a safe O-5 outcome, or corrupt/contradictory evidence was found. It has no automatic O-5 transition.
 
-Only `STAGED` is a successful stage result. A journal claiming `STAGED` without the exact completed candidate is contradictory and becomes transaction-level manual attention; O-5 does not gate the ordinary shell.
+Only `STAGED` is a successful stage result. `ABORTED` is a terminal owner result, not a successful restage. A journal claiming either state without the exact completed candidate is contradictory. O-5/O-7 does not gate the ordinary shell.
 
 ## Locks
 
-The operation lock is `locks/operations/<operation-id>.lock`. It is acquired in blocking mode for stage and exact replay and is held from journal read/create through the response generated from the durable record. The plugin lifecycle lock is `locks/plugins/<sha256("omarchy-plugin-transaction-plugin-lock/v1" || NUL || plugin-id)>`; package-owned native code derives that filename from the canonical plugin ID, so callers never select it. It is acquired nonblocking and returns `plugin-busy` on conflict. When both are required, the universal order is operation lock then plugin lifecycle lock. O-5 does not acquire the plugin lock during inert stage, but provides and tests the primitive for later commit work.
+The operation lock is `locks/operations/<operation-id>.lock`. It is acquired in blocking mode for stage and exact replay and is held from journal read/create through the response generated from the durable record. The plugin lifecycle lock is `locks/plugins/<sha256("omarchy-plugin-transaction-plugin-lock/v1" || NUL || plugin-id)>`; package-owned native code derives that filename from the canonical plugin ID, so callers never select it. It is acquired nonblocking and returns `plugin-busy` on conflict. When both are required, the universal order is operation lock then plugin lifecycle lock. O-7 abort holds both in that order through validation, transition, parent synchronization, readback, and result generation. Inert stage retains the O-5 operation-lock-only behavior.
 
 Locks are advisory and disappear when the holding process exits. Lock-file existence, PID values, timestamps, and deletion are never transaction evidence. The journal plus exact candidate identities determines reconciliation.
 
@@ -42,4 +43,4 @@ Reconciliation inspects only the exact temporary and completed slots recorded by
 
 ## Retention and nonclaims
 
-Staged candidates, indeterminate artifacts, corrupt evidence, and future retained-prior facts are retained. O-5 performs no expiry, garbage collection, age/PID inference, live plugin mutation, configuration parsing, shell coordination, activation, rescan, rollback, signer verification, or safety assessment. Same-UID processes remain able to alter user-owned state; exact revalidation detects changes at the observation point but is not an operating-system security boundary.
+Staged and aborted candidates, indeterminate artifacts, corrupt evidence, and future retained-prior facts are retained. O-5/O-7 performs no expiry, garbage collection, age/PID inference, live plugin mutation, activation, rescan, rollback, signer verification, or safety assessment. O-7 reads the authoritative accepted shell snapshot but does not parse or mutate configuration. Same-UID processes remain able to alter user-owned state; exact revalidation detects changes at the observation point but is not an operating-system security boundary.

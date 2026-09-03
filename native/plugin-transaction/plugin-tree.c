@@ -22,6 +22,8 @@ enum {
   MAX_PATH_BYTES = 1024,
   MAX_FILE_BYTES = 16 * 1024 * 1024,
   COPY_BUFFER_BYTES = 64 * 1024,
+  MAX_REQUEST_BYTES = 64 * 1024,
+  MAX_JSON_DEPTH = 64,
 };
 
 static const uint64_t MAX_TOTAL_BYTES = 64ULL * 1024ULL * 1024ULL;
@@ -46,6 +48,9 @@ typedef struct {
   size_t length;
 } Name;
 
+static void fd_write_all(int fd, const void *buffer, size_t length,
+                         const char *operation, const char *path);
+
 static void fail_io(const char *operation, const char *path) {
   fprintf(stderr, "omarchy-plugin-tree: io: %s: %s: %s\n", operation, path,
           strerror(errno));
@@ -56,6 +61,12 @@ static void reject_tree(const char *code, const char *path) {
   fprintf(stderr, "omarchy-plugin-tree: %s: %s\n", code,
           path[0] ? path : ".");
   exit(2);
+}
+
+static void operation_not_found(const char *operation_id) {
+  fprintf(stderr, "omarchy-plugin-tree: operation-not-found: %s\n",
+          operation_id);
+  exit(3);
 }
 
 static bool valid_utf8(const unsigned char *bytes, size_t length) {
@@ -92,6 +103,360 @@ static bool valid_utf8(const unsigned char *bytes, size_t length) {
       return false;
   }
   return true;
+}
+
+typedef struct {
+  const unsigned char *bytes;
+  size_t length;
+  size_t offset;
+} JsonParser;
+
+typedef struct {
+  unsigned char *bytes;
+  size_t length;
+  size_t capacity;
+} JsonKey;
+
+static void reject_json(const char *reason) {
+  reject_tree("invalid-json-request", reason);
+}
+
+static void json_skip_whitespace(JsonParser *parser) {
+  while (parser->offset < parser->length) {
+    unsigned char value = parser->bytes[parser->offset];
+    if (value != ' ' && value != '\t' && value != '\n' && value != '\r')
+      break;
+    parser->offset++;
+  }
+}
+
+static unsigned int json_hex_digit(unsigned char value) {
+  if (value >= '0' && value <= '9')
+    return (unsigned int)(value - '0');
+  if (value >= 'a' && value <= 'f')
+    return (unsigned int)(value - 'a' + 10);
+  if (value >= 'A' && value <= 'F')
+    return (unsigned int)(value - 'A' + 10);
+  reject_json("invalid-unicode-escape");
+  return 0;
+}
+
+static uint32_t json_unicode_escape(JsonParser *parser) {
+  if (parser->length - parser->offset < 4)
+    reject_json("truncated-unicode-escape");
+  uint32_t value = 0;
+  for (size_t index = 0; index < 4; index++) {
+    value = (value << 4) | json_hex_digit(parser->bytes[parser->offset]);
+    parser->offset++;
+  }
+  return value;
+}
+
+static void json_append_byte(JsonKey *output, unsigned char value) {
+  if (output->length == output->capacity) {
+    size_t next_capacity = output->capacity == 0 ? 16 : output->capacity * 2;
+    if (next_capacity > MAX_REQUEST_BYTES)
+      reject_json("string-size-limit");
+    unsigned char *next = realloc(output->bytes, next_capacity);
+    if (!next)
+      fail_io("allocate JSON string", "stdin");
+    output->bytes = next;
+    output->capacity = next_capacity;
+  }
+  output->bytes[output->length++] = value;
+}
+
+static void json_append_codepoint(JsonKey *output, uint32_t codepoint) {
+  if (codepoint <= 0x7f) {
+    json_append_byte(output, (unsigned char)codepoint);
+  } else if (codepoint <= 0x7ff) {
+    json_append_byte(output, (unsigned char)(0xc0 | (codepoint >> 6)));
+    json_append_byte(output, (unsigned char)(0x80 | (codepoint & 0x3f)));
+  } else if (codepoint <= 0xffff) {
+    json_append_byte(output, (unsigned char)(0xe0 | (codepoint >> 12)));
+    json_append_byte(output,
+                     (unsigned char)(0x80 | ((codepoint >> 6) & 0x3f)));
+    json_append_byte(output, (unsigned char)(0x80 | (codepoint & 0x3f)));
+  } else {
+    json_append_byte(output, (unsigned char)(0xf0 | (codepoint >> 18)));
+    json_append_byte(output,
+                     (unsigned char)(0x80 | ((codepoint >> 12) & 0x3f)));
+    json_append_byte(output,
+                     (unsigned char)(0x80 | ((codepoint >> 6) & 0x3f)));
+    json_append_byte(output, (unsigned char)(0x80 | (codepoint & 0x3f)));
+  }
+}
+
+static JsonKey json_parse_string(JsonParser *parser) {
+  if (parser->offset >= parser->length || parser->bytes[parser->offset] != '"')
+    reject_json("expected-string");
+  parser->offset++;
+  JsonKey decoded = {0};
+
+  while (parser->offset < parser->length) {
+    unsigned char value = parser->bytes[parser->offset++];
+    if (value == '"')
+      return decoded;
+    if (value < 0x20)
+      reject_json("unescaped-control-character");
+    if (value != '\\') {
+      json_append_byte(&decoded, value);
+      continue;
+    }
+    if (parser->offset >= parser->length)
+      reject_json("truncated-string-escape");
+    unsigned char escaped = parser->bytes[parser->offset++];
+    switch (escaped) {
+    case '"':
+    case '\\':
+    case '/':
+      json_append_byte(&decoded, escaped);
+      break;
+    case 'b':
+      json_append_byte(&decoded, '\b');
+      break;
+    case 'f':
+      json_append_byte(&decoded, '\f');
+      break;
+    case 'n':
+      json_append_byte(&decoded, '\n');
+      break;
+    case 'r':
+      json_append_byte(&decoded, '\r');
+      break;
+    case 't':
+      json_append_byte(&decoded, '\t');
+      break;
+    case 'u': {
+      uint32_t codepoint = json_unicode_escape(parser);
+      if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+        if (parser->length - parser->offset < 6 ||
+            parser->bytes[parser->offset] != '\\' ||
+            parser->bytes[parser->offset + 1] != 'u')
+          reject_json("unpaired-high-surrogate");
+        parser->offset += 2;
+        uint32_t low = json_unicode_escape(parser);
+        if (low < 0xdc00 || low > 0xdfff)
+          reject_json("unpaired-high-surrogate");
+        codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + (low - 0xdc00);
+      } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+        reject_json("unpaired-low-surrogate");
+      }
+      json_append_codepoint(&decoded, codepoint);
+      break;
+    }
+    default:
+      reject_json("invalid-string-escape");
+    }
+  }
+  reject_json("unterminated-string");
+  return decoded;
+}
+
+static bool json_key_equal(const JsonKey *left, const JsonKey *right) {
+  return left->length == right->length &&
+         (left->length == 0 ||
+          memcmp(left->bytes, right->bytes, left->length) == 0);
+}
+
+static bool allow_duplicate_json_keys(void) {
+#ifdef OMARCHY_PLUGIN_TREE_TEST_HOOKS
+  return getenv("OMARCHY_PLUGIN_TREE_TEST_ALLOW_DUPLICATE_KEYS") != NULL;
+#else
+  return false;
+#endif
+}
+
+static void json_parse_value(JsonParser *parser, unsigned int depth);
+
+static void json_parse_object(JsonParser *parser, unsigned int depth) {
+  parser->offset++;
+  json_skip_whitespace(parser);
+  JsonKey *keys = NULL;
+  size_t key_count = 0;
+  size_t key_capacity = 0;
+  if (parser->offset < parser->length && parser->bytes[parser->offset] == '}') {
+    parser->offset++;
+    return;
+  }
+  for (;;) {
+    JsonKey candidate = json_parse_string(parser);
+    if (!allow_duplicate_json_keys()) {
+      for (size_t index = 0; index < key_count; index++)
+        if (json_key_equal(&keys[index], &candidate))
+          reject_json("duplicate-object-key");
+    }
+    if (key_count == key_capacity) {
+      size_t next_capacity = key_capacity == 0 ? 8 : key_capacity * 2;
+      JsonKey *next = realloc(keys, next_capacity * sizeof(*next));
+      if (!next)
+        fail_io("allocate JSON object keys", "stdin");
+      keys = next;
+      key_capacity = next_capacity;
+    }
+    keys[key_count++] = candidate;
+    json_skip_whitespace(parser);
+    if (parser->offset >= parser->length || parser->bytes[parser->offset] != ':')
+      reject_json("expected-object-colon");
+    parser->offset++;
+    json_skip_whitespace(parser);
+    json_parse_value(parser, depth + 1);
+    json_skip_whitespace(parser);
+    if (parser->offset >= parser->length)
+      reject_json("unterminated-object");
+    unsigned char separator = parser->bytes[parser->offset++];
+    if (separator == '}')
+      break;
+    if (separator != ',')
+      reject_json("expected-object-separator");
+    json_skip_whitespace(parser);
+  }
+  for (size_t index = 0; index < key_count; index++)
+    free(keys[index].bytes);
+  free(keys);
+}
+
+static void json_parse_array(JsonParser *parser, unsigned int depth) {
+  parser->offset++;
+  json_skip_whitespace(parser);
+  if (parser->offset < parser->length && parser->bytes[parser->offset] == ']') {
+    parser->offset++;
+    return;
+  }
+  for (;;) {
+    json_parse_value(parser, depth + 1);
+    json_skip_whitespace(parser);
+    if (parser->offset >= parser->length)
+      reject_json("unterminated-array");
+    unsigned char separator = parser->bytes[parser->offset++];
+    if (separator == ']')
+      return;
+    if (separator != ',')
+      reject_json("expected-array-separator");
+    json_skip_whitespace(parser);
+  }
+}
+
+static void json_parse_literal(JsonParser *parser, const char *literal) {
+  size_t length = strlen(literal);
+  if (length > parser->length - parser->offset ||
+      memcmp(parser->bytes + parser->offset, literal, length) != 0)
+    reject_json("invalid-literal");
+  parser->offset += length;
+}
+
+static void json_parse_number(JsonParser *parser) {
+  size_t offset = parser->offset;
+  if (parser->bytes[offset] == '-') {
+    offset++;
+    if (offset >= parser->length)
+      reject_json("invalid-number");
+  }
+  if (parser->bytes[offset] == '0') {
+    offset++;
+    if (offset < parser->length && parser->bytes[offset] >= '0' &&
+        parser->bytes[offset] <= '9')
+      reject_json("invalid-number-leading-zero");
+  } else {
+    if (parser->bytes[offset] < '1' || parser->bytes[offset] > '9')
+      reject_json("invalid-number");
+    do {
+      offset++;
+    } while (offset < parser->length && parser->bytes[offset] >= '0' &&
+             parser->bytes[offset] <= '9');
+  }
+  if (offset < parser->length && parser->bytes[offset] == '.') {
+    offset++;
+    if (offset >= parser->length || parser->bytes[offset] < '0' ||
+        parser->bytes[offset] > '9')
+      reject_json("invalid-number-fraction");
+    do {
+      offset++;
+    } while (offset < parser->length && parser->bytes[offset] >= '0' &&
+             parser->bytes[offset] <= '9');
+  }
+  if (offset < parser->length &&
+      (parser->bytes[offset] == 'e' || parser->bytes[offset] == 'E')) {
+    offset++;
+    if (offset < parser->length &&
+        (parser->bytes[offset] == '+' || parser->bytes[offset] == '-'))
+      offset++;
+    if (offset >= parser->length || parser->bytes[offset] < '0' ||
+        parser->bytes[offset] > '9')
+      reject_json("invalid-number-exponent");
+    do {
+      offset++;
+    } while (offset < parser->length && parser->bytes[offset] >= '0' &&
+             parser->bytes[offset] <= '9');
+  }
+  parser->offset = offset;
+}
+
+static void json_parse_value(JsonParser *parser, unsigned int depth) {
+  if (depth > MAX_JSON_DEPTH)
+    reject_json("depth-limit");
+  if (parser->offset >= parser->length)
+    reject_json("missing-value");
+  switch (parser->bytes[parser->offset]) {
+  case '{':
+    json_parse_object(parser, depth);
+    break;
+  case '[':
+    json_parse_array(parser, depth);
+    break;
+  case '"': {
+    JsonKey value = json_parse_string(parser);
+    free(value.bytes);
+    break;
+  }
+  case 't':
+    json_parse_literal(parser, "true");
+    break;
+  case 'f':
+    json_parse_literal(parser, "false");
+    break;
+  case 'n':
+    json_parse_literal(parser, "null");
+    break;
+  default:
+    json_parse_number(parser);
+  }
+}
+
+static void validate_json_request(void) {
+  unsigned char *buffer = malloc((size_t)MAX_REQUEST_BYTES + 1);
+  if (!buffer)
+    fail_io("allocate JSON request", "stdin");
+  size_t length = 0;
+  while (length < (size_t)MAX_REQUEST_BYTES + 1) {
+    ssize_t received = read(STDIN_FILENO, buffer + length,
+                            (size_t)MAX_REQUEST_BYTES + 1 - length);
+    if (received < 0) {
+      if (errno == EINTR)
+        continue;
+      fail_io("read JSON request", "stdin");
+    }
+    if (received == 0)
+      break;
+    length += (size_t)received;
+  }
+  if (length > MAX_REQUEST_BYTES)
+    reject_tree("request-size-limit", "stdin");
+  if (length == 0)
+    reject_tree("empty-request", "stdin");
+  if (memchr(buffer, 0, length))
+    reject_tree("literal-nul", "stdin");
+  if (!valid_utf8(buffer, length))
+    reject_tree("invalid-utf8", "stdin");
+
+  JsonParser parser = {.bytes = buffer, .length = length, .offset = 0};
+  json_skip_whitespace(&parser);
+  json_parse_value(&parser, 0);
+  json_skip_whitespace(&parser);
+  if (parser.offset != parser.length)
+    reject_json("trailing-data");
+  fd_write_all(STDOUT_FILENO, buffer, length, "write JSON request", "stdout");
+  free(buffer);
 }
 
 #ifdef OMARCHY_PLUGIN_TREE_TEST_HOOKS
@@ -861,7 +1226,13 @@ static void replace_journal(const char *state_path, const char *operation_id,
     fail_io("sync journal file", temporary_name);
   transition_hook("after-journal-file-sync", transition);
   close(temporary);
-  if (renameat(journals, temporary_name, journals, final_name) < 0)
+  char rename_point[192];
+  int rename_length = snprintf(rename_point, sizeof(rename_point),
+                               "journal-rename:%s", transition);
+  if (rename_length < 0 || (size_t)rename_length >= sizeof(rename_point))
+    reject_tree("transition-name-limit", transition);
+  if (test_rename_failure(rename_point) ||
+      renameat(journals, temporary_name, journals, final_name) < 0)
     fail_io("replace journal", final_name);
   transition_hook("after-journal-rename", transition);
   if (transition_sync_fd(journals, "journal-parent", transition) < 0)
@@ -1121,6 +1492,94 @@ static void sync_journal_authority(const char *state_path,
   close(state);
 }
 
+static bool same_timestamp(struct timespec left, struct timespec right) {
+  return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
+}
+
+/* Read one atomically installed journal without creating or repairing state. */
+static void read_journal_authority(const char *state_path,
+                                   const char *operation_id) {
+  if (!simple_name(operation_id))
+    reject_tree("invalid-operation-id", operation_id);
+  int state = open(state_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
+                                   O_NOATIME);
+  if (state < 0) {
+    if (errno == ENOENT)
+      operation_not_found(operation_id);
+    reject_tree("invalid-state-root", operation_id);
+  }
+  struct stat state_status;
+  if (fstat(state, &state_status) < 0)
+    fail_io("stat read-only state root", state_path);
+  if (!S_ISDIR(state_status.st_mode) || (state_status.st_mode & 0777) != 0700)
+    reject_tree("invalid-state-root", operation_id);
+
+  int journals = openat(state, "journals",
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC |
+                            O_NOATIME);
+  if (journals < 0) {
+    if (errno == ENOENT)
+      operation_not_found(operation_id);
+    reject_tree("invalid-state-directory", operation_id);
+  }
+  struct stat directory_status;
+  if (fstat(journals, &directory_status) < 0)
+    fail_io("stat read-only journal directory", state_path);
+  if (!S_ISDIR(directory_status.st_mode) ||
+      (directory_status.st_mode & 0777) != 0700)
+    reject_tree("invalid-state-directory", operation_id);
+
+  char name[160];
+  int name_length =
+      snprintf(name, sizeof(name), "%s.journal", operation_id);
+  if (name_length < 0 || (size_t)name_length >= sizeof(name))
+    reject_tree("journal-name-limit", operation_id);
+  int journal = openat(journals, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC |
+                                           O_NOATIME);
+  if (journal < 0) {
+    if (errno == ENOENT)
+      operation_not_found(operation_id);
+    reject_tree("invalid-authoritative-journal", operation_id);
+  }
+  struct stat before;
+  if (fstat(journal, &before) < 0)
+    fail_io("stat read-only journal", operation_id);
+  if (!S_ISREG(before.st_mode) || before.st_nlink != 1 ||
+      (before.st_mode & 0777) != 0600 || before.st_size <= 0 ||
+      before.st_size > 1024 * 1024)
+    reject_tree("invalid-authoritative-journal", operation_id);
+
+  unsigned char buffer[64 * 1024];
+  off_t total = 0;
+  for (;;) {
+    ssize_t received = read(journal, buffer, sizeof(buffer));
+    if (received < 0) {
+      if (errno == EINTR)
+        continue;
+      fail_io("read authoritative journal", operation_id);
+    }
+    if (received == 0)
+      break;
+    if (received > before.st_size - total)
+      reject_tree("journal-changed", operation_id);
+    fd_write_all(STDOUT_FILENO, buffer, (size_t)received,
+                 "write authoritative journal", "stdout");
+    total += received;
+  }
+  struct stat after;
+  if (fstat(journal, &after) < 0)
+    fail_io("restat read-only journal", operation_id);
+  if (total != before.st_size || before.st_dev != after.st_dev ||
+      before.st_ino != after.st_ino || before.st_size != after.st_size ||
+      before.st_mode != after.st_mode || before.st_nlink != after.st_nlink ||
+      !same_timestamp(before.st_mtim, after.st_mtim) ||
+      !same_timestamp(before.st_ctim, after.st_ctim))
+    reject_tree("journal-changed", operation_id);
+  close(journal);
+  close(journals);
+  close(state);
+}
+
 static void derive_plugin_lock_name(const char *plugin_id, char output[65]) {
   if (!third_party_plugin_id(plugin_id))
     reject_tree("invalid-plugin-id", plugin_id);
@@ -1196,6 +1655,79 @@ static int open_lock_file(int directory, const char *name,
   if (fchmod(lock, 0600) < 0)
     fail_io("set lock mode", name);
   return lock;
+}
+
+static void hold_operation_lock(const char *state_path,
+                                const char *operation_id) {
+  if (!simple_name(operation_id))
+    reject_tree("invalid-operation-id", operation_id);
+  int state = open(state_path,
+                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (state < 0)
+    reject_tree("invalid-state-root", operation_id);
+  struct stat state_status;
+  if (fstat(state, &state_status) < 0)
+    fail_io("stat operation-lock state root", state_path);
+  if (!S_ISDIR(state_status.st_mode) ||
+      (state_status.st_mode & 0777) != 0700)
+    reject_tree("invalid-state-root", operation_id);
+  int locks = openat(state, "locks",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (locks < 0)
+    fail_io("open lock directory", state_path);
+  struct stat locks_status;
+  if (fstat(locks, &locks_status) < 0)
+    fail_io("stat lock directory", state_path);
+  if (!S_ISDIR(locks_status.st_mode) ||
+      (locks_status.st_mode & 0777) != 0700)
+    reject_tree("invalid-lock-directory", operation_id);
+  int operations = openat(locks, "operations",
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (operations < 0)
+    fail_io("open operation lock directory", state_path);
+  struct stat operations_status;
+  if (fstat(operations, &operations_status) < 0)
+    fail_io("stat operation lock directory", state_path);
+  if (!S_ISDIR(operations_status.st_mode) ||
+      (operations_status.st_mode & 0777) != 0700)
+    reject_tree("invalid-operation-lock-directory", operation_id);
+  char operation_name[160];
+  int length = snprintf(operation_name, sizeof(operation_name), "%s.lock",
+                        operation_id);
+  if (length < 0 || (size_t)length >= sizeof(operation_name))
+    reject_tree("operation-lock-name-limit", operation_id);
+  int operation = openat(operations, operation_name,
+                         O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (operation < 0)
+    reject_tree("invalid-operation-lock", operation_id);
+  struct stat operation_status;
+  if (fstat(operation, &operation_status) < 0)
+    fail_io("stat operation lock", operation_name);
+  if (!S_ISREG(operation_status.st_mode) || operation_status.st_nlink != 1 ||
+      (operation_status.st_mode & 0777) != 0600)
+    reject_tree("invalid-operation-lock", operation_id);
+  while (flock(operation, LOCK_EX) < 0) {
+    if (errno == EINTR)
+      continue;
+    fail_io("acquire operation lock", operation_name);
+  }
+  fputs("locked-operation\n", stdout);
+  fflush(stdout);
+  unsigned char buffer[256];
+  for (;;) {
+    ssize_t count = read_lock_input(STDIN_FILENO, buffer, sizeof(buffer));
+    if (count > 0)
+      continue;
+    if (count == 0)
+      break;
+    if (errno == EINTR)
+      continue;
+    fail_io("hold operation lock", operation_name);
+  }
+  close(operation);
+  close(operations);
+  close(locks);
+  close(state);
 }
 
 /* O-5's proof seam for the universal operation-before-plugin lock order. */
@@ -1327,8 +1859,16 @@ int main(int argc, char **argv) {
     sync_journal_authority(argv[2], argv[3]);
     return 0;
   }
+  if (argc == 4 && strcmp(argv[1], "journal-read") == 0) {
+    read_journal_authority(argv[2], argv[3]);
+    return 0;
+  }
   if (argc == 4 && strcmp(argv[1], "plugin-lock") == 0) {
     hold_plugin_lock(argv[2], argv[3]);
+    return 0;
+  }
+  if (argc == 4 && strcmp(argv[1], "operation-lock") == 0) {
+    hold_operation_lock(argv[2], argv[3]);
     return 0;
   }
   if (argc == 5 && strcmp(argv[1], "ordered-lock") == 0) {
@@ -1337,6 +1877,10 @@ int main(int argc, char **argv) {
   }
   if (argc == 3 && strcmp(argv[1], "hash-equal") == 0)
     return constant_time_hash_equal(argv[2]);
+  if (argc == 2 && strcmp(argv[1], "json-request-check") == 0) {
+    validate_json_request();
+    return 0;
+  }
   fprintf(stderr,
           "usage: %s identity ROOT | copy SOURCE PARENT NAME | prepare-import SOURCE STORE TEMPORARY | "
           "publish PARENT TEMPORARY COMPLETED | "
@@ -1344,7 +1888,9 @@ int main(int argc, char **argv) {
           "gate-replace STATE PLUGIN INPUT TRANSITION | gate-sync STATE | "
           "domain-hash DOMAIN | sync-directory PATH POINT | "
           "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "
-          "plugin-lock STATE PLUGIN-ID | ordered-lock STATE OPERATION PLUGIN-ID | "
+          "journal-read STATE OPERATION | json-request-check | "
+          "operation-lock STATE OPERATION | plugin-lock STATE PLUGIN-ID | "
+          "ordered-lock STATE OPERATION PLUGIN-ID | "
           "hash-equal EXPECTED\n",
           argv[0]);
   return 64;

@@ -37,7 +37,7 @@ def request_facts($operation_id; $plugin_id):
        else true end)
   and (if .operation == "install" then .expectedConfiguration.referencePolicy == "require-unreferenced" else true end)
   and (.stageObservation | exact_keys(["provenance", "rawSha256", "referenceProjection", "referenceState"]))
-  and (.stageObservation.provenance == "test-injected-o4" or .stageObservation.provenance == "test-injected-o5" or .stageObservation.provenance == "internal-unestablished")
+  and (.stageObservation.provenance == "test-injected-o4" or .stageObservation.provenance == "test-injected-o5" or .stageObservation.provenance == "internal-unestablished" or .stageObservation.provenance == "shell-authoritative-o7")
   and (.stageObservation.rawSha256 | sha_digest)
   and (.stageObservation.referenceProjection | sha_digest)
   and (.stageObservation.referenceState == "referenced" or .stageObservation.referenceState == "unreferenced")
@@ -87,6 +87,11 @@ and (
     and (.candidate.observed | tree_identity)
     and .publication.state == "completed-durable"
     and .reason == null
+  elif .state == "ABORTED" then
+    normal_record($operation_id)
+    and (.candidate.observed | tree_identity)
+    and .publication.state == "completed-durable"
+    and .reason == "owner-aborted"
   elif .state == "RECOVERY_REQUIRED" then
     normal_record($operation_id)
     and (.candidate.observed | tree_identity)

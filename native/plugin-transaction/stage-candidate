@@ -195,7 +195,7 @@ if ! $journal_exists; then
 fi
 
 stored_state=$(jq -r .state "$journal")
-if [[ $stored_state == STAGED ]]; then
+if [[ $stored_state == STAGED || $stored_state == ABORTED ]]; then
   [[ -d $store/$completed_slot && ! -L $store/$completed_slot ]] || {
     write_normal_journal MANUAL_ATTENTION missing-or-invalid-completed "$(jq -r .candidate.observed "$journal")" contradictory staged-to-manual
     fail manual-attention "$operation_id"

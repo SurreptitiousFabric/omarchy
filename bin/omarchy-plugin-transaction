@@ -1,0 +1,743 @@
+#!/bin/bash
+
+# omarchy:group=plugin
+# omarchy:name=transaction
+# omarchy:summary=Use the hidden versioned inert plugin transaction interface
+# omarchy:hidden=true
+
+set +x
+set -euo pipefail
+umask 077
+
+export LC_ALL=C
+export PATH=/usr/bin:/bin
+unset BASH_XTRACEFD OMARCHY_PATH OMARCHY_SHELL_IPC_TIMEOUT
+while IFS= read -r variable; do
+  unset "$variable" || true
+done < <(compgen -v OMARCHY_PLUGIN_ || true)
+
+jq_bin=/usr/bin/jq
+base64_bin=/usr/bin/base64
+sha256_bin=/usr/bin/sha256sum
+script_directory=$(/usr/bin/realpath -e -- "$(/usr/bin/dirname -- "${BASH_SOURCE[0]}")")
+if [[ $script_directory == /usr/bin ]]; then
+  package_root=/usr/share/omarchy
+else
+  package_root=$(/usr/bin/realpath -e -- "$script_directory/..")
+fi
+request_validator=$package_root/native/plugin-transaction/validate-request.jq
+observation_validator=$package_root/native/plugin-transaction/validate-stage-observation.jq
+journal_validator=$package_root/native/plugin-transaction/validate-journal.jq
+stage_helper=$package_root/native/plugin-transaction/stage-candidate
+shell_client=$package_root/bin/omarchy-shell
+native_helper=$package_root/native/plugin-transaction/plugin-tree
+if [[ ! -x $native_helper && $package_root == */share/omarchy ]]; then
+  install_prefix=${package_root%/share/omarchy}
+  [[ -n $install_prefix ]] || install_prefix=/
+  native_helper=$install_prefix/lib/omarchy/plugin-tree
+fi
+
+request_protocol=""
+request_action=""
+request_operation_id=""
+request_plugin_id=""
+journal_input=""
+
+cleanup() {
+  [[ -z $journal_input ]] || /usr/bin/rm -f -- "$journal_input"
+}
+trap cleanup EXIT
+
+emit_error() {
+  local response_status=$1 response_reason=$2 exit_code=$3
+  local response_state=${4:-}
+  "$jq_bin" -cnS \
+    --arg protocol "$request_protocol" \
+    --arg action "$request_action" \
+    --arg operationId "$request_operation_id" \
+    --arg pluginId "$request_plugin_id" \
+    --arg state "$response_state" \
+    --arg status "$response_status" \
+    --arg reason "$response_reason" \
+    '{protocol:(if $protocol == "" then null else $protocol end),
+      action:(if $action == "" then null else $action end),
+      operationId:(if $operationId == "" then null else $operationId end),
+      pluginId:(if $pluginId == "" then null else $pluginId end),
+      state:(if $state == "" then null else $state end),status:$status,reason:$reason}'
+  printf 'omarchy-plugin-transaction: %s\n' "$response_reason" >&2
+  exit "$exit_code"
+}
+
+native_run() {
+  /usr/bin/env -i PATH="$PATH" LC_ALL=C "$native_helper" "$@"
+}
+
+json_field() {
+  local filter=$1
+  printf '%s' "$request" | "$jq_bin" -r "$filter"
+}
+
+validate_operation_token() {
+  local padding padded_token decoded_length reencoded
+  padding=$(( (4 - ${#operation_token} % 4) % 4 ))
+  padded_token=${operation_token//-/+}
+  padded_token=${padded_token//_/\/}
+  padded_token+=$(printf '%*s' "$padding" '' | /usr/bin/tr ' ' '=')
+  if ! decoded_length=$(printf '%s' "$padded_token" | "$base64_bin" -d 2>/dev/null | /usr/bin/wc -c); then
+    unset padded_token
+    return 1
+  fi
+  if ! reencoded=$(printf '%s' "$padded_token" | "$base64_bin" -d 2>/dev/null |
+      "$base64_bin" -w0 | /usr/bin/tr '+/' '-_' | /usr/bin/tr -d '='); then
+    unset padded_token reencoded
+    return 1
+  fi
+  unset padded_token
+  (( decoded_length >= 32 && decoded_length <= 128 )) || {
+    unset reencoded
+    return 1
+  }
+  [[ $reencoded == "$operation_token" ]] || {
+    unset reencoded
+    return 1
+  }
+  unset reencoded
+}
+
+journal=""
+journal_read_error=""
+read_journal() {
+  local output canonical facts computed_digest stored_digest read_status
+  if output=$(native_run journal-read "$state_root" "$request_operation_id" 2>&1); then
+    if ! printf '%s' "$output" | "$jq_bin" -eS \
+        --arg operation_id "$request_operation_id" -f "$journal_validator" >/dev/null 2>&1; then
+      journal_read_error=invalid-state
+      return 2
+    fi
+    if ! canonical=$(printf '%s' "$output" | "$jq_bin" -cS . 2>/dev/null); then
+      journal_read_error=invalid-state
+      return 2
+    fi
+    if [[ $output != "$canonical" ]]; then
+      journal_read_error=invalid-state
+      return 2
+    fi
+    if [[ $(printf '%s' "$output" | "$jq_bin" -r '.normalizedRequest | type') == object ]]; then
+      if ! facts=$(printf '%s' "$output" | "$jq_bin" -cS '.normalizedRequest.facts' 2>/dev/null); then
+        journal_read_error=invalid-state
+        return 2
+      fi
+      computed_digest=$(printf '%s\n' "$facts" | native_run domain-hash \
+        omarchy-plugin-transaction-request/v1 2>/dev/null || true)
+      stored_digest=$(printf '%s' "$output" | "$jq_bin" -r '.normalizedRequest.digest')
+      if [[ -z $computed_digest || $computed_digest != "$stored_digest" ]]; then
+        journal_read_error=invalid-state
+        return 2
+      fi
+    fi
+    journal=$output
+    journal_read_error=""
+    return 0
+  else
+    read_status=$?
+  fi
+  if (( read_status == 3 )); then
+    journal_read_error=operation-not-found
+    return 1
+  fi
+  journal_read_error=invalid-state
+  return 2
+}
+
+emit_journal_response() {
+  local response_action=$1 output
+  if ! output=$(printf '%s' "$journal" | "$jq_bin" -cS --arg action "$response_action" '
+    def public_tree($identity):
+      if $identity == null or $identity == "" then null
+      else {algorithm:"omarchy-runtime-tree-sha256-v1",
+        digest:("sha256:" + ($identity | sub("^omarchy-runtime-tree-sha256-v1:"; "")))} end;
+    def public_active($facts):
+      if $facts == null then null
+      elif $facts.expectedActive.state == "absent" then {state:"absent"}
+      else {state:"present",tree:public_tree($facts.expectedActive.identity)} end;
+    def public_source($facts):
+      if $facts == null then null
+      elif $facts.stageObservation.provenance == "shell-authoritative-o7"
+          and (($facts.expectedConfiguration.source.kind == "user"
+                and $facts.expectedConfiguration.source.identity == "omarchy-shell-config:user:v1")
+            or ($facts.expectedConfiguration.source.kind == "default"
+                and ($facts.expectedConfiguration.source.identity == "omarchy-shell-config:packaged-default:v1"
+                  or $facts.expectedConfiguration.source.identity == "omarchy-shell-config:builtin-default:v1")))
+        then $facts.expectedConfiguration.source
+      else {kind:$facts.expectedConfiguration.source.kind,identity:null} end;
+    def public_configuration($facts):
+      if $facts == null then null else {
+        source:public_source($facts),
+        rawSha256:$facts.stageObservation.rawSha256,
+        referenceProjectionSha256:$facts.stageObservation.referenceProjection,
+        referenceState:$facts.stageObservation.referenceState
+      } end;
+    .normalizedRequest.facts as $facts
+    | {protocol:"legacy-schema-v1-transaction/v1",action:$action,
+       operationId,pluginId,state,
+       status:(if .state == "STAGED" then "ok"
+         elif .state == "ABORTED" then "aborted"
+         elif .state == "RECOVERY_REQUIRED" then "indeterminate"
+         elif .state == "MANUAL_ATTENTION" then "manual-attention"
+         else "in-progress" end),
+       reason:(if .state == "ABORTED" then "owner-aborted"
+         elif .state == "RECOVERY_REQUIRED" then "recovery-required"
+         elif .state == "MANUAL_ATTENTION" then "manual-attention"
+         elif .state == "REQUEST_BOUND" then "request-bound"
+         elif .state == "PUBLICATION_INTENT" then "publication-intent"
+         else null end),
+       operation:($facts.operation // null),
+       candidateTree:public_tree(.candidate.observed),
+       observedActive:public_active($facts),
+       observedConfiguration:public_configuration($facts)}
+  ' 2>/dev/null); then
+    emit_error manual-attention invalid-state 4
+  fi
+  printf '%s\n' "$output"
+}
+
+stage_failure() {
+  local helper_output=$1
+  if [[ $helper_output == *"omarchy-plugin-candidate-stage: invalid-operation-token:"* ]]; then
+    emit_error rejected invalid-operation-token 3
+  elif [[ $helper_output == *"omarchy-plugin-candidate-stage: operation-conflict:"* ]]; then
+    emit_error rejected operation-id-conflict 3
+  elif [[ $helper_output == *"omarchy-plugin-candidate-stage: stale-candidate:"* ]]; then
+    emit_error rejected stale-candidate 0
+  elif [[ $helper_output == *"omarchy-plugin-candidate-stage: validation-failed:"* ||
+      $helper_output == *"omarchy-plugin-candidate-stage: manifest-id-mismatch:"* ||
+      $helper_output == *"omarchy-plugin-candidate-stage: invalid-manifest-id:"* ]]; then
+    emit_error rejected invalid-candidate 0
+  elif [[ $helper_output == *"omarchy-plugin-candidate-stage: recovery-required:"* ||
+      $helper_output == *"omarchy-plugin-candidate-stage: journal-indeterminate:"* ]]; then
+    emit_error indeterminate durable-outcome-indeterminate 5 RECOVERY_REQUIRED
+  elif [[ $helper_output == *"omarchy-plugin-candidate-stage: manual-attention:"* ]]; then
+    emit_error manual-attention manual-attention 4 MANUAL_ATTENTION
+  else
+    emit_error unavailable local-io-failure 4
+  fi
+}
+
+invoke_stage_candidate() {
+  local -a stage_environment
+  stage_environment=(/usr/bin/env -i "HOME=$HOME" "PATH=$PATH" "LC_ALL=C"
+    "OMARCHY_PATH=$package_root"
+    "OMARCHY_PLUGIN_TREE_HELPER=$native_helper"
+    "OMARCHY_PLUGIN_VALIDATOR=$package_root/bin/omarchy-plugin-validate"
+    "OMARCHY_PLUGIN_JOURNAL_VALIDATOR=$journal_validator"
+    "OMARCHY_PLUGIN_CANDIDATE_STORE=$candidate_store"
+    "OMARCHY_PLUGIN_TRANSACTION_STATE=$state_root"
+    "OMARCHY_PLUGIN_DISCOVERY_DIR=$discovery_dir"
+    "OMARCHY_PLUGIN_OPERATION_KIND=$operation_kind"
+    "OMARCHY_PLUGIN_SOURCE_KIND=directory"
+    "OMARCHY_PLUGIN_CALLER_CANDIDATE_IDENTITY=$candidate_identity"
+    "OMARCHY_PLUGIN_EXPECTED_ACTIVE_STATE=$active_state"
+    "OMARCHY_PLUGIN_EXPECTED_ACTIVE_IDENTITY=$active_identity"
+    "OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_KIND=$expected_config_kind"
+    "OMARCHY_PLUGIN_EXPECTED_CONFIG_SOURCE_IDENTITY=$expected_config_identity"
+    "OMARCHY_PLUGIN_EXPECTED_REFERENCE_PROJECTION=$expected_projection"
+    "OMARCHY_PLUGIN_EXPECTED_REFERENCE_STATE=$expected_reference_state"
+    "OMARCHY_PLUGIN_REFERENCE_POLICY=$reference_policy"
+    "OMARCHY_PLUGIN_STAGE_OBSERVATION_SOURCE=$observation_source"
+    "OMARCHY_PLUGIN_STAGE_OBSERVATION_RAW_SHA256=$observed_raw"
+    "OMARCHY_PLUGIN_STAGE_OBSERVATION_REFERENCE_PROJECTION=$observed_projection"
+    "OMARCHY_PLUGIN_STAGE_OBSERVATION_REFERENCE_STATE=$observed_reference_state"
+    "OMARCHY_PLUGIN_DESTINATION=$destination")
+  [[ -z ${XDG_STATE_HOME:-} ]] || stage_environment+=("XDG_STATE_HOME=$XDG_STATE_HOME")
+  local output
+  if output=$(printf '%s\n' "$operation_token" |
+      "${stage_environment[@]}" "$stage_helper" "$request_operation_id" \
+        "$request_plugin_id" "$source_path" 2>&1); then
+    unset operation_token
+    return 0
+  fi
+  unset operation_token
+  stage_failure "$output"
+}
+
+[[ -x $jq_bin && -x $base64_bin && -x $sha256_bin ]] || {
+  printf '%s\n' '{"action":null,"operationId":null,"pluginId":null,"protocol":null,"reason":"unavailable-runtime","state":null,"status":"unavailable"}'
+  printf 'omarchy-plugin-transaction: unavailable-runtime\n' >&2
+  exit 4
+}
+[[ -x $native_helper && -f $request_validator && -f $journal_validator ]] ||
+  emit_error unavailable unavailable-implementation 4
+[[ $# == 0 ]] || emit_error invalid-request argv-not-accepted 2
+
+request=""
+if ! request=$(native_run json-request-check 2>/dev/null); then
+  emit_error invalid-request malformed-request 2
+fi
+if ! printf '%s' "$request" | "$jq_bin" -e 'type == "object"' >/dev/null 2>&1; then
+  emit_error invalid-request non-object-request 2
+fi
+
+request_protocol=$(json_field 'if (.protocol | type) == "string" and (.protocol | test("^[ -~]{1,128}$")) then .protocol else "" end')
+request_action=$(json_field 'if (.action | type) == "string" and (.action | test("^[a-z-]{1,32}$")) then .action else "" end')
+request_operation_id=$(json_field 'if (.operationId | type) == "string" and (.operationId | test("^[0-9A-Fa-f-]{1,64}$")) then .operationId else "" end')
+request_plugin_id=$(json_field 'if (.pluginId | type) == "string" and (.pluginId | test("^[A-Za-z0-9._-]{1,128}$")) then .pluginId else "" end')
+
+[[ $request_protocol == legacy-schema-v1-transaction/v1 ]] ||
+  emit_error incompatible-request unsupported-protocol 2
+case $request_action in
+  capabilities|stage|status|abort) ;;
+  *) emit_error incompatible-request unsupported-action 2 ;;
+esac
+if ! printf '%s' "$request" | "$jq_bin" -e -f "$request_validator" >/dev/null 2>&1; then
+  emit_error invalid-request invalid-request-schema 2
+fi
+
+if [[ $request_action == capabilities ]]; then
+  unset request
+  "$jq_bin" -cnS '{protocol:"legacy-schema-v1-transaction/v1",
+    capabilities:["legacy-schema-v1-transaction/v1"],
+    actions:["capabilities","stage","status","abort"],
+    treeIdentityAlgorithms:["omarchy-runtime-tree-sha256-v1"],
+    operations:["install","update"],
+    referencePolicies:["require-unreferenced","preserve-observed"]}'
+  exit 0
+fi
+
+[[ -n ${HOME:-} && $HOME == /* ]] || emit_error unavailable invalid-home-authority 4
+if [[ -n ${XDG_STATE_HOME:-} && $XDG_STATE_HOME != /* ]]; then
+  emit_error unavailable invalid-state-authority 4
+fi
+if ! state_root=$(/usr/bin/realpath -m -- \
+    "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugin-transactions-v1" 2>/dev/null); then
+  emit_error unavailable invalid-state-authority 4
+fi
+
+if [[ $request_action == status ]]; then
+  unset request
+  if read_journal; then
+    emit_journal_response status
+    exit 0
+  fi
+  if [[ $journal_read_error == operation-not-found ]]; then
+    emit_error not-found operation-not-found 0
+  fi
+  emit_error manual-attention invalid-state 4
+fi
+
+if ! candidate_store=$(/usr/bin/realpath -m -- \
+    "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plugin-candidates-v1" 2>/dev/null) ||
+    ! discovery_dir=$(/usr/bin/realpath -m -- "$HOME/.config/omarchy/plugins" 2>/dev/null); then
+  emit_error unavailable invalid-path-authority 4
+fi
+
+operation_token=$(json_field '.operationToken')
+validate_operation_token || {
+  unset operation_token request
+  emit_error invalid-request invalid-operation-token-encoding 2
+}
+
+if [[ $request_action == stage ]]; then
+  [[ -x $stage_helper && -x $package_root/bin/omarchy-plugin-validate &&
+      -f $observation_validator && -x $shell_client ]] || {
+    unset operation_token request
+    emit_error unavailable unavailable-implementation 4
+  }
+  operation_kind=$(json_field '.operation')
+  source_path=$(json_field '.source.path')
+  request_plugin_id=$(json_field '.pluginId')
+  candidate_digest=$(json_field '.candidateTree.digest')
+  candidate_identity=omarchy-runtime-tree-sha256-v1:${candidate_digest#sha256:}
+  active_state=$(json_field '.expectedActive.state')
+  if [[ $active_state == present ]]; then
+    active_digest=$(json_field '.expectedActive.tree.digest')
+    active_identity=omarchy-runtime-tree-sha256-v1:${active_digest#sha256:}
+  else
+    active_identity=""
+  fi
+  expected_config_kind=$(json_field '.expectedConfiguration.source.kind')
+  expected_config_identity=$(json_field '.expectedConfiguration.source.identity')
+  expected_projection=$(json_field '.expectedConfiguration.referenceProjectionSha256')
+  expected_reference_state=$(json_field '.expectedConfiguration.referenceState')
+  reference_policy=$(json_field '.expectedConfiguration.referencePolicy')
+  if ! source_path=$(/usr/bin/realpath -m -- "$source_path" 2>/dev/null); then
+    unset operation_token request
+    emit_error rejected invalid-source 0
+  fi
+  destination=$discovery_dir/$request_plugin_id
+  unset request
+
+  if read_journal; then
+    existing_capability=$(printf '%s' "$journal" | "$jq_bin" -r '.capabilityHash // ""')
+    if [[ ! $existing_capability =~ ^[0-9a-f]{64}$ ]]; then
+      unset operation_token existing_capability
+      emit_error manual-attention manual-attention 4 MANUAL_ATTENTION
+    fi
+    if ! supplied_capability=$(printf '%s' "$operation_token" | native_run domain-hash \
+        omarchy-plugin-transaction-capability/v1 2>/dev/null); then
+      unset operation_token existing_capability supplied_capability
+      emit_error unavailable local-io-failure 4
+    fi
+    if ! printf '%s' "$supplied_capability" | native_run hash-equal "$existing_capability"; then
+      unset operation_token existing_capability supplied_capability
+      emit_error rejected invalid-operation-token 3
+    fi
+    unset existing_capability supplied_capability
+    existing_state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
+    case $existing_state in
+      STAGED|ABORTED) ;;
+      REQUEST_BOUND|PUBLICATION_INTENT)
+        operation_lock_path=$state_root/locks/operations/$request_operation_id.lock
+        if [[ ! -f $operation_lock_path || -L $operation_lock_path ||
+            $(stat -c '%h:%a' "$operation_lock_path" 2>/dev/null || true) != 1:600 ]]; then
+          unset operation_token
+          emit_error manual-attention invalid-state 4 "$existing_state"
+        fi
+        coproc STAGE_OPERATION_LOCK {
+          native_run operation-lock "$state_root" "$request_operation_id" 2>/dev/null
+        }
+        stage_lock_read_fd=${STAGE_OPERATION_LOCK[0]}
+        stage_lock_write_fd=${STAGE_OPERATION_LOCK[1]}
+        stage_lock_pid=$STAGE_OPERATION_LOCK_PID
+        if ! IFS= read -r stage_lock_ready <&"$stage_lock_read_fd"; then
+          exec {stage_lock_read_fd}<&-
+          exec {stage_lock_write_fd}>&-
+          wait "$stage_lock_pid" 2>/dev/null || true
+          unset operation_token
+          emit_error unavailable lock-failure 4 "$existing_state"
+        fi
+        exec {stage_lock_read_fd}<&-
+        if [[ $stage_lock_ready != locked-operation ]]; then
+          exec {stage_lock_write_fd}>&-
+          wait "$stage_lock_pid" 2>/dev/null || true
+          unset operation_token
+          emit_error unavailable lock-failure 4 "$existing_state"
+        fi
+        if ! read_journal; then
+          exec {stage_lock_write_fd}>&-
+          wait "$stage_lock_pid" 2>/dev/null || true
+          unset operation_token
+          emit_error manual-attention invalid-state 4 "$existing_state"
+        fi
+        existing_state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
+        exec {stage_lock_write_fd}>&-
+        if ! wait "$stage_lock_pid"; then
+          unset operation_token
+          emit_error unavailable lock-failure 4 "$existing_state"
+        fi
+        case $existing_state in
+          STAGED|ABORTED) ;;
+          REQUEST_BOUND|PUBLICATION_INTENT)
+            unset operation_token
+            emit_error in-progress operation-in-progress 0 "$existing_state"
+            ;;
+          RECOVERY_REQUIRED)
+            unset operation_token
+            emit_error indeterminate recovery-required 5 "$existing_state"
+            ;;
+          MANUAL_ATTENTION)
+            unset operation_token
+            emit_error manual-attention manual-attention 4 "$existing_state"
+            ;;
+          *)
+            unset operation_token
+            emit_error manual-attention invalid-state 4
+            ;;
+        esac
+        ;;
+      RECOVERY_REQUIRED)
+        unset operation_token
+        emit_error indeterminate recovery-required 5 "$existing_state"
+        ;;
+      MANUAL_ATTENTION)
+        unset operation_token
+        emit_error manual-attention manual-attention 4 "$existing_state"
+        ;;
+      *)
+        unset operation_token
+        emit_error manual-attention invalid-state 4
+        ;;
+    esac
+    stored_plugin=$(printf '%s' "$journal" | "$jq_bin" -r '.pluginId')
+    stored_destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
+    stored_source_kind=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.kind')
+    stored_source_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.identity')
+    [[ $stored_destination == "$discovery_dir/$stored_plugin" ]] || {
+      unset operation_token
+      emit_error manual-attention invalid-state 4 "$existing_state"
+    }
+    if [[ $stored_source_kind == user ]]; then
+      [[ $stored_source_identity == omarchy-shell-config:user:v1 ]] || {
+        unset operation_token
+        emit_error manual-attention invalid-state 4 "$existing_state"
+      }
+    elif [[ $stored_source_kind == default ]]; then
+      [[ $stored_source_identity == omarchy-shell-config:packaged-default:v1 ||
+          $stored_source_identity == omarchy-shell-config:builtin-default:v1 ]] || {
+        unset operation_token
+        emit_error manual-attention invalid-state 4 "$existing_state"
+      }
+    else
+      unset operation_token
+      emit_error manual-attention invalid-state 4 "$existing_state"
+    fi
+    observation_source=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.stageObservation.provenance')
+    [[ $observation_source == shell-authoritative-o7 ]] || {
+      unset operation_token
+      emit_error manual-attention invalid-state 4 "$existing_state"
+    }
+    observed_raw=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.stageObservation.rawSha256')
+    observed_projection=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.stageObservation.referenceProjection')
+    observed_reference_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.stageObservation.referenceState')
+    invoke_stage_candidate
+    if ! read_journal; then
+      emit_error manual-attention invalid-state 4
+    fi
+    emit_journal_response stage
+    exit 0
+  elif [[ $journal_read_error != operation-not-found ]]; then
+    unset operation_token
+    emit_error manual-attention invalid-state 4
+  fi
+
+  local_source=$(/usr/bin/realpath -e -- "$source_path" 2>/dev/null || true)
+  if [[ -z $local_source || $local_source != "$source_path" || ! -d $source_path || -L $source_path ]]; then
+    unset operation_token
+    emit_error rejected invalid-source 0
+  fi
+  observed_candidate=$(native_run identity "$source_path" 2>/dev/null || true)
+  if [[ $observed_candidate != "$candidate_identity" ]]; then
+    unset operation_token
+    emit_error rejected stale-candidate 0
+  fi
+
+  shell_environment=(/usr/bin/env -i "HOME=$HOME" "PATH=$PATH" "LC_ALL=C"
+    "OMARCHY_PATH=$package_root" "OMARCHY_SHELL_IPC_TIMEOUT=5")
+  for environment_name in XDG_CONFIG_HOME XDG_CACHE_HOME XDG_STATE_HOME XDG_RUNTIME_DIR; do
+    [[ -z ${!environment_name:-} ]] || shell_environment+=("$environment_name=${!environment_name}")
+  done
+  if ! observation=$("${shell_environment[@]}" "$shell_client" shell \
+      transactionStageObservation "$request_plugin_id" 2>/dev/null); then
+    unset operation_token
+    emit_error unavailable shell-authority-unavailable 4
+  fi
+  if ! observation=$(printf '%s' "$observation" | native_run json-request-check 2>/dev/null); then
+    unset operation_token observation
+    emit_error unavailable malformed-shell-observation 4
+  fi
+  if ! printf '%s' "$observation" | "$jq_bin" -e --arg plugin_id "$request_plugin_id" \
+      -f "$observation_validator" >/dev/null 2>&1; then
+    unset operation_token observation
+    emit_error unavailable malformed-shell-observation 4
+  fi
+  if [[ $(printf '%s' "$observation" | "$jq_bin" -r '.valid') != true ]]; then
+    unset operation_token observation
+    emit_error unavailable shell-authority-not-ready 4
+  fi
+
+  observed_config_kind=$(printf '%s' "$observation" | "$jq_bin" -r '.configurationSource.kind')
+  observed_config_identity=$(printf '%s' "$observation" | "$jq_bin" -r '.configurationSource.identity')
+  observed_reference_state=$(printf '%s' "$observation" | "$jq_bin" -r '.referenceState')
+  observed_active_state=$(printf '%s' "$observation" | "$jq_bin" -r '.activeDiscovery.state')
+  observed_active_source=$(printf '%s' "$observation" | "$jq_bin" -r '.activeDiscovery.sourceDirectory // ""')
+  raw_base64=$(printf '%s' "$observation" | "$jq_bin" -r '.rawBase64')
+  projection_base64=$(printf '%s' "$observation" | "$jq_bin" -r '.referenceProjectionBase64')
+  observed_discovery=$(printf '%s' "$observation" | "$jq_bin" -r '.discoveryDirectory')
+  observed_state_root=$(printf '%s' "$observation" | "$jq_bin" -r '.transactionStateRoot')
+  unset observation
+
+  if ! raw_reencoded=$(printf '%s' "$raw_base64" | "$base64_bin" -d 2>/dev/null | "$base64_bin" -w0) ||
+      [[ $raw_reencoded != "$raw_base64" ]]; then
+    unset operation_token raw_base64 projection_base64 raw_reencoded
+    emit_error unavailable malformed-shell-observation 4
+  fi
+  if ! projection_reencoded=$(printf '%s' "$projection_base64" | "$base64_bin" -d 2>/dev/null | "$base64_bin" -w0) ||
+      [[ $projection_reencoded != "$projection_base64" ]]; then
+    unset operation_token raw_base64 projection_base64 projection_reencoded
+    emit_error unavailable malformed-shell-observation 4
+  fi
+  observed_raw=sha256:$(printf '%s' "$raw_base64" | "$base64_bin" -d | "$sha256_bin" | /usr/bin/cut -d' ' -f1)
+  observed_projection=sha256:$(printf '%s' "$projection_base64" | "$base64_bin" -d | "$sha256_bin" | /usr/bin/cut -d' ' -f1)
+  unset raw_base64 projection_base64 raw_reencoded projection_reencoded
+
+  [[ $observed_config_kind == "$expected_config_kind" &&
+      $observed_config_identity == "$expected_config_identity" ]] || {
+    unset operation_token
+    emit_error rejected stale-configuration-source 0
+  }
+  [[ $observed_reference_state == "$expected_reference_state" ]] || {
+    unset operation_token
+    if [[ $reference_policy == require-unreferenced ]]; then
+      emit_error rejected require-unreferenced-violation 0
+    fi
+    emit_error rejected stale-reference-state 0
+  }
+  [[ $observed_projection == "$expected_projection" ]] || {
+    unset operation_token
+    emit_error rejected stale-reference-projection 0
+  }
+  observed_discovery=$(/usr/bin/realpath -e -- "$observed_discovery" 2>/dev/null || true)
+  observed_state_root=$(/usr/bin/realpath -e -- "$observed_state_root" 2>/dev/null || true)
+  [[ -n $observed_discovery && -d $observed_discovery && ! -L $observed_discovery &&
+      $observed_discovery == "$discovery_dir" && -n $observed_state_root &&
+      -d $observed_state_root && ! -L $observed_state_root && $observed_state_root == "$state_root" ]] || {
+    unset operation_token
+    emit_error unavailable shell-authority-mismatch 4
+  }
+  destination=$observed_discovery/$request_plugin_id
+
+  if [[ $active_state == absent ]]; then
+    if [[ $observed_active_state != absent || -e $destination || -L $destination ]]; then
+      unset operation_token
+      emit_error rejected stale-active-tree 0
+    fi
+  else
+    if [[ $observed_active_state != present || ! -d $destination || -L $destination ]]; then
+      unset operation_token
+      emit_error rejected stale-active-tree 0
+    fi
+    observed_active_source=$(/usr/bin/realpath -e -- "$observed_active_source" 2>/dev/null || true)
+    if [[ -z $observed_active_source || $observed_active_source != "$destination" ]]; then
+      unset operation_token
+      emit_error rejected stale-active-tree 0
+    fi
+    observed_active=$(native_run identity "$destination" 2>/dev/null || true)
+    if [[ $observed_active != "$active_identity" ]]; then
+      unset operation_token
+      emit_error rejected stale-active-tree 0
+    fi
+  fi
+
+  observation_source=shell-authoritative-o7
+  invoke_stage_candidate
+  if ! read_journal; then
+    emit_error manual-attention invalid-state 4
+  fi
+  emit_journal_response stage
+  exit 0
+fi
+
+# The remaining action is abort. Read the exact journal before deriving its
+# package-owned plugin lock, but reveal no journal fact until capability check.
+unset request
+if ! read_journal; then
+  unset operation_token
+  if [[ $journal_read_error == operation-not-found ]]; then
+    emit_error not-found operation-not-found 0
+  fi
+  emit_error manual-attention invalid-state 4
+fi
+stored_capability=$(printf '%s' "$journal" | "$jq_bin" -r '.capabilityHash // ""')
+if [[ ! $stored_capability =~ ^[0-9a-f]{64}$ ]]; then
+  unset operation_token stored_capability
+  emit_error manual-attention manual-attention 4 MANUAL_ATTENTION
+fi
+if ! capability_hash=$(printf '%s' "$operation_token" | native_run domain-hash \
+    omarchy-plugin-transaction-capability/v1 2>/dev/null); then
+  unset operation_token stored_capability capability_hash
+  emit_error unavailable local-io-failure 4
+fi
+unset operation_token
+if ! printf '%s' "$capability_hash" | native_run hash-equal "$stored_capability"; then
+  unset capability_hash stored_capability
+  emit_error rejected invalid-operation-token 3
+fi
+request_plugin_id=$(printf '%s' "$journal" | "$jq_bin" -r '.pluginId // ""')
+[[ -n $request_plugin_id ]] || {
+  unset capability_hash stored_capability
+  emit_error manual-attention manual-attention 4 MANUAL_ATTENTION
+}
+
+coproc TRANSACTION_LOCK {
+  native_run ordered-lock "$state_root" "$request_operation_id" "$request_plugin_id" 2>/dev/null
+}
+lock_read_fd=${TRANSACTION_LOCK[0]}
+lock_write_fd=${TRANSACTION_LOCK[1]}
+lock_pid=$TRANSACTION_LOCK_PID
+if ! IFS= read -r lock_ready <&"$lock_read_fd"; then
+  exec {lock_read_fd}<&-
+  exec {lock_write_fd}>&-
+  wait "$lock_pid" 2>/dev/null || true
+  unset capability_hash stored_capability
+  emit_error in-progress operation-in-progress 0
+fi
+exec {lock_read_fd}<&-
+[[ $lock_ready == locked-operation-then-plugin ]] || {
+  exec {lock_write_fd}>&-
+  wait "$lock_pid" 2>/dev/null || true
+  unset capability_hash stored_capability
+  emit_error unavailable lock-failure 4
+}
+
+if ! read_journal; then
+  unset capability_hash stored_capability
+  emit_error manual-attention invalid-state 4
+fi
+[[ $(printf '%s' "$journal" | "$jq_bin" -r '.pluginId // ""') == "$request_plugin_id" ]] || {
+  unset capability_hash stored_capability
+  emit_error manual-attention invalid-state 4
+}
+current_capability=$(printf '%s' "$journal" | "$jq_bin" -r '.capabilityHash // ""')
+if ! printf '%s' "$capability_hash" | native_run hash-equal "$current_capability"; then
+  unset capability_hash stored_capability current_capability
+  emit_error manual-attention invalid-state 4
+fi
+unset capability_hash stored_capability current_capability
+
+durable_state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
+case $durable_state in
+  STAGED|ABORTED) ;;
+  REQUEST_BOUND|PUBLICATION_INTENT)
+    emit_error in-progress operation-in-progress 0 "$durable_state"
+    ;;
+  RECOVERY_REQUIRED)
+    emit_error indeterminate recovery-required 5 "$durable_state"
+    ;;
+  MANUAL_ATTENTION)
+    emit_error manual-attention manual-attention 4 "$durable_state"
+    ;;
+  *) emit_error manual-attention invalid-state 4 ;;
+esac
+
+gate_path=$state_root/gates/$request_plugin_id.gate
+if [[ -e $gate_path || -L $gate_path ]]; then
+  emit_error in-progress operation-in-progress 0 "$durable_state"
+fi
+case "$candidate_store/" in
+  "$discovery_dir/"*) emit_error manual-attention invalid-state 4 "$durable_state" ;;
+esac
+candidate_path=$candidate_store/$request_operation_id/candidate
+expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed // ""')
+if [[ ! -d $candidate_path || -L $candidate_path ||
+    $(native_run identity "$candidate_path" 2>/dev/null || true) != "$expected_candidate" ]]; then
+  emit_error manual-attention invalid-state 4 "$durable_state"
+fi
+
+if [[ $durable_state == ABORTED ]]; then
+  emit_journal_response abort
+  exec {lock_write_fd}>&-
+  wait "$lock_pid"
+  exit 0
+fi
+
+if ! journal_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-abort-journal.XXXXXX); then
+  emit_error unavailable local-io-failure 4 "$durable_state"
+fi
+if ! printf '%s' "$journal" | "$jq_bin" -cS \
+    '.state="ABORTED" | .reason="owner-aborted"' >"$journal_input" ||
+    ! chmod 0600 "$journal_input"; then
+  emit_error unavailable local-io-failure 4 "$durable_state"
+fi
+if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" \
+    -f "$journal_validator" "$journal_input" >/dev/null; then
+  emit_error manual-attention invalid-generated-state 4 "$durable_state"
+fi
+if ! native_run journal-replace "$state_root" "$request_operation_id" \
+    "$journal_input" staged-to-aborted >/dev/null 2>&1; then
+  emit_error indeterminate abort-indeterminate 5
+fi
+if ! read_journal || [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') != ABORTED ]]; then
+  emit_error indeterminate abort-indeterminate 5
+fi
+emit_journal_response abort
+exec {lock_write_fd}>&-
+wait "$lock_pid"
