@@ -78,6 +78,21 @@ pass "commands --check passes"
 "$CLI" commands --all >/dev/null
 pass "commands --all does not crash"
 
+if "$CLI" commands --json | jq -e \
+    '.commands[] | select(.binary == "omarchy-plugin-transaction")' >/dev/null; then
+  fail "hidden plugin transaction command stays out of ordinary listings"
+fi
+"$CLI" commands --all --json | jq -e '
+  .commands[]
+  | select(.binary == "omarchy-plugin-transaction"
+      and .route == "omarchy plugin transaction"
+      and .hidden == true)
+' >/dev/null || fail "hidden plugin transaction metadata is discoverable with --all"
+pass "hidden plugin transaction command stays out of ordinary listings"
+
+output=$("$CLI" plugin transaction --help)
+assert_output_contains "plugin transaction route resolves without execution" "$output" "omarchy-plugin-transaction"
+
 "$CLI" commands --all --json | jq -e '.commands[] | select(.route == "omarchy hyprland window gaps toggle" and .summary != "undocumented")' >/dev/null
 pass "fallback commands are inferred and documented"
 
