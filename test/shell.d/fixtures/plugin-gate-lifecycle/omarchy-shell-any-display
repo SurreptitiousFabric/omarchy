@@ -25,5 +25,10 @@ if [[ -e $replay_root/hold-before-release && ${2:-} == releaseTransactionPlugin 
   : >"$replay_root/before-release-ready"
   IFS= read -r _ <"$replay_root/before-release-resume"
 fi
+fail_gated_rescan=${OMARCHY_LIFECYCLE_FAIL_GATED_RESCAN:-${XDG_RUNTIME_DIR:-}/omarchy-fail-gated-rescan}
+if [[ ${2:-} == rescanGatedPlugin && -e $fail_gated_rescan ]]; then
+  rm -f -- "$fail_gated_rescan"
+  exit 70
+fi
 exec timeout --kill-after=1s "${OMARCHY_SHELL_IPC_TIMEOUT:-5s}" \
   qs ipc -n --any-display -p "$OMARCHY_PATH/shell" call -- "$@"

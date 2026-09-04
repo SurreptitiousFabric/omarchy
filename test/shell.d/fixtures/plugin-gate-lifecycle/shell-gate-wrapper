@@ -38,7 +38,8 @@ if [[ $action == terminal-receipt ]]; then
   hold_at "${OMARCHY_LIFECYCLE_HOLD_TERMINAL_RECEIPT:-/nonexistent}" \
     "${OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_READY:-/nonexistent}" \
     "${OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME:-/nonexistent}"
-  if [[ ${OMARCHY_LIFECYCLE_FAIL_TERMINAL_RECEIPT:-0} == 1 ]]; then
+  if [[ ${OMARCHY_LIFECYCLE_FAIL_TERMINAL_RECEIPT:-0} == 1 ||
+        -e ${OMARCHY_LIFECYCLE_FAIL_TERMINAL_RECEIPT_MARKER:-/nonexistent} ]]; then
     printf 'injected terminal receipt acknowledgement failure\n' >&2
     exit 1
   fi

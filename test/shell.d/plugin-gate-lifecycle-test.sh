@@ -61,7 +61,7 @@ cp -a "$SOURCE_ROOT/native" "$test_root/native"
 # The O-8 terminal handoff mode invokes the production transaction wrapper.
 # Give it a copied package root so package-relative helpers and shell IPC target
 # the same isolated offscreen shell as this harness.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
   rm "$test_root/bin"
   mkdir "$test_root/bin"
   cp "$SOURCE_ROOT/bin/omarchy-plugin-transaction" "$SOURCE_ROOT/bin/omarchy-shell" \
@@ -89,7 +89,7 @@ fi
 mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
   -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
   "$SOURCE_ROOT/native/plugin-transaction/plugin-tree.c" -o "$helper"
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
   cp "$helper" "$test_root/native/plugin-transaction/plugin-tree"
 fi
 
@@ -145,7 +145,7 @@ done
 # This operation is a fresh install: retain the source outside discovery while
 # the active destination is absent.  The ordinary lifecycle cases keep their
 # pre-existing active fixtures.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
   rm -rf "$plugin_dir/$o8_terminal_id"
 fi
 
@@ -267,13 +267,15 @@ export OMARCHY_LIFECYCLE_REPLAY_OPERATION=
 export OMARCHY_LIFECYCLE_REPLAY_PLUGIN=
 export OMARCHY_LIFECYCLE_INDETERMINATE_OPERATION="$indeterminate_operation"
 export OMARCHY_LIFECYCLE_INJECT_INSTALL_PARENT_FSYNC="$TMPDIR/inject-install-parent-fsync"
+export OMARCHY_LIFECYCLE_FAIL_GATED_RESCAN="$runtime_dir/omarchy-fail-gated-rescan"
+export OMARCHY_LIFECYCLE_FAIL_TERMINAL_RECEIPT_MARKER="$runtime_dir/omarchy-fail-terminal-receipt"
 mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME" \
   "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME" "$OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME" \
   "$OMARCHY_LIFECYCLE_SCAN_RESUME"
 mkfifo "$OMARCHY_LIFECYCLE_BEFORE_RESCAN_RESUME" "$OMARCHY_LIFECYCLE_AFTER_RESCAN_RESUME" \
   "$OMARCHY_LIFECYCLE_BEFORE_RELEASE_RESUME"
 export QT_QPA_PLATFORM=offscreen
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
   # The production wrapper forwards WAYLAND_DISPLAY (but not DISPLAY) to qs;
   # retain the isolated harness's display identity so its real QML process is
   # discoverable without contacting the desktop shell.
@@ -395,7 +397,7 @@ if [[ $EXPECTATION == o8-dispatch-replay ]]; then
       fail "$phase fresh commit replay failed"
     fi
     jq -e --arg op "$operation" --arg plugin "$plugin" \
-      '.operationId==$op and .pluginId==$plugin and .state=="COMMITTED" and .status=="committed" and .eligibility=="released"' \
+      '.operationId==$op and .pluginId==$plugin and .state=="COMMITTED" and .status=="committed" and .eligibility.durableOutcome=="authorized"' \
       <<<"$result" >/dev/null || fail "$phase fresh replay did not produce a released COMMITTED result"
     [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$operation.journal") == COMMITTED ]] ||
       fail "$phase fresh replay did not durably reach COMMITTED"
@@ -474,6 +476,137 @@ if [[ $EXPECTATION == o8-dispatch-replay ]]; then
   # and current-shell terminal-pair reconciliation without repeating release,
   # receipt, rescan, or namespace work.
   fresh_commit_replay release "$o8_replay_release_id"
+  exit 0
+fi
+
+if [[ $EXPECTATION == o8-rollback ]]; then
+  # Materialize the prior update target before the rollback scenario starts.
+  # The real shell intentionally defers this service's completion so the
+  # later update gate can prove actual unload acknowledgement.
+  shell_ipc shell testResumeDeferredService "$active_service_id" 0 >/dev/null
+  wait_for "real QML update target becomes active" '[[ $(state "$active_service_id" 2>/dev/null | jq -r .serviceActive || true) == true ]]'
+
+  o8_source="$TMPDIR/candidate-$o8_terminal_id"
+  o8_operation=62000000-0000-4000-8000-000000000004
+  o8_identity=$($helper identity "$o8_source")
+  o8_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$(shell_ipc shell transactionStageObservation "$o8_terminal_id")" | base64 -d | sha256sum | cut -d' ' -f1)
+  o8_token=$(head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=')
+  o8_request=$(jq -cn --arg operationId "$o8_operation" --arg token "$o8_token" \
+    --arg pluginId "$o8_terminal_id" --arg source "$o8_source" \
+    --arg digest "sha256:${o8_identity#omarchy-runtime-tree-sha256-v1:}" \
+    --arg projection "$o8_projection" '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",
+      operationId:$operationId,operationToken:$token,operation:"install",pluginId:$pluginId,
+      source:{kind:"directory",path:$source},candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest},
+      expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+      referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+  printf '%s' "$o8_request" | "$test_root/bin/omarchy-plugin-transaction" >/dev/null ||
+    fail "real QML install rollback stage was not accepted"
+  [[ $(shell_ipc shell testStopLocalPluginWatcher) == stopping ]] ||
+    fail "real QML rollback harness could not stop the ordinary watcher"
+  : >"$OMARCHY_LIFECYCLE_FAIL_GATED_RESCAN"
+  o8_commit=$(jq -cn --arg operationId "$o8_operation" --arg token "$o8_token" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
+  set +e
+  printf '%s' "$o8_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/o8-rollback-install-result" 2>"$TMPDIR/o8-rollback-install-error"
+  o8_commit_status=$?
+  set -e
+  (( o8_commit_status == 0 )) || { sed -n '1,160p' "$TMPDIR/o8-rollback-install-error" >&2; cat "$TMPDIR/o8-rollback-install-result" >&2; fail "real QML install rollback did not complete"; }
+  jq -e --arg operation "$o8_operation" \
+    '.action=="commit" and .operationId==$operation and .state=="ROLLED_BACK" and .status=="rolled-back" and .eligibility.durableOutcome=="restored"' \
+    "$TMPDIR/o8-rollback-install-result" >/dev/null || fail "install rollback result was not state-true"
+  [[ ! -e "$plugin_dir/$o8_terminal_id" && -d "$state_dir/omarchy/plugin-candidates-v1/$o8_operation/candidate" ]] ||
+    fail "install rollback did not restore exact absence and retain candidate"
+  [[ ! -e "$marker.service" ]] || fail "install rollback evaluated the candidate entry point"
+  [[ $(state "$o8_terminal_id" | jq -r .directUrl) == "" ]] || fail "install rollback left current shell eligibility released"
+  pass "actual QML install rollback restores absence, retains candidate, and never evaluates it"
+
+  update_operation=62000000-0000-4000-8000-000000000005
+  update_candidate="$TMPDIR/o8-update-candidate"
+  mkdir -p "$update_candidate"
+  cp "$FIXTURE_ROOT/Service.qml" "$update_candidate/Service.qml"
+  jq --arg id "$active_service_id" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
+    "$FIXTURE_ROOT/manifest.json" >"$update_candidate/manifest.json"
+  update_identity=$($helper identity "$update_candidate")
+  update_active_identity=$($helper identity "$plugin_dir/$active_service_id")
+  update_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$(shell_ipc shell transactionStageObservation "$active_service_id")" | base64 -d | sha256sum | cut -d' ' -f1)
+  update_token=$(head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=')
+  update_request=$(jq -cn --arg operationId "$update_operation" --arg token "$update_token" \
+    --arg pluginId "$active_service_id" --arg source "$update_candidate" \
+    --arg digest "sha256:${update_identity#omarchy-runtime-tree-sha256-v1:}" \
+    --arg active "sha256:${update_active_identity#omarchy-runtime-tree-sha256-v1:}" --arg projection "$update_projection" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",operationId:$operationId,operationToken:$token,
+      operation:"update",pluginId:$pluginId,source:{kind:"directory",path:$source},candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest},
+      expectedActive:{state:"present",tree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$active}},
+      expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},referenceProjectionSha256:$projection,
+      referenceState:"referenced",referencePolicy:"preserve-observed"}}')
+  printf '%s' "$update_request" | "$test_root/bin/omarchy-plugin-transaction" >/dev/null ||
+    fail "real QML update rollback stage was not accepted"
+  : >"$OMARCHY_LIFECYCLE_FAIL_GATED_RESCAN"
+  update_commit=$(jq -cn --arg operationId "$update_operation" --arg token "$update_token" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
+  set +e
+  printf '%s' "$update_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/o8-rollback-update-result" 2>"$TMPDIR/o8-rollback-update-error"
+  update_status=$?
+  set -e
+  (( update_status == 0 )) || { sed -n '1,160p' "$TMPDIR/o8-rollback-update-error" >&2; cat "$TMPDIR/o8-rollback-update-result" >&2; fail "real QML update rollback did not complete"; }
+  if [[ $(jq -r .state "$TMPDIR/o8-rollback-update-result") != ROLLED_BACK ]]; then
+    [[ $(shell_ipc shell testReleaseUnload "$active_service_id") == ok ]] ||
+      fail "real QML rollback harness could not release the held prior service"
+    wait_for "real QML update unload acknowledgement" \
+      '[[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$active_service_id.gate" 2>/dev/null || true) == UNLOAD_ACKNOWLEDGED ]]'
+    printf '%s' "$update_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/o8-rollback-update-result" 2>"$TMPDIR/o8-rollback-update-error" || {
+      sed -n '1,160p' "$TMPDIR/o8-rollback-update-error" >&2; cat "$TMPDIR/o8-rollback-update-result" >&2; fail "real QML update rollback retry did not complete";
+    }
+  fi
+  jq -e --arg operation "$update_operation" \
+    '.action=="commit" and .operationId==$operation and .state=="ROLLED_BACK" and .status=="rolled-back" and .eligibility.durableOutcome=="restored"' \
+    "$TMPDIR/o8-rollback-update-result" >/dev/null || fail "update rollback result was not state-true"
+  [[ -d "$plugin_dir/$active_service_id" && $($helper identity "$plugin_dir/$active_service_id") == "$update_active_identity" ]] ||
+    fail "update rollback did not restore the prior tree"
+  [[ -d "$state_dir/omarchy/plugin-candidates-v1/$update_operation/candidate" && $($helper identity "$state_dir/omarchy/plugin-candidates-v1/$update_operation/candidate") == "$update_identity" ]] ||
+    fail "update rollback did not retain the candidate"
+  [[ ! -e "$marker.service" ]] || fail "update rollback evaluated the candidate entry point"
+  pass "actual QML update rollback restores basename-independent prior tree and retains candidate"
+
+  # A real QML rollback-release receipt failure must retain blocking authority
+  # and stop before the terminal journal handoff.
+  failed_operation=62000000-0000-4000-8000-000000000006
+  failed_source="$TMPDIR/o8-failed-rollback-candidate"
+  mkdir -p "$failed_source"
+  cp "$FIXTURE_ROOT/Service.qml" "$failed_source/Service.qml"
+  jq --arg id "$o8_terminal_id" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
+    "$FIXTURE_ROOT/manifest.json" >"$failed_source/manifest.json"
+  failed_identity=$($helper identity "$failed_source")
+  failed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$(shell_ipc shell transactionStageObservation "$o8_terminal_id")" | base64 -d | sha256sum | cut -d' ' -f1)
+  failed_token=$(head -c 32 /dev/urandom | base64 -w0 | tr '+/' '-_' | tr -d '=')
+  failed_request=$(jq -cn --arg operationId "$failed_operation" --arg token "$failed_token" \
+    --arg pluginId "$o8_terminal_id" --arg source "$failed_source" \
+    --arg digest "sha256:${failed_identity#omarchy-runtime-tree-sha256-v1:}" \
+    --arg projection "$failed_projection" '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",
+      operationId:$operationId,operationToken:$token,operation:"install",pluginId:$pluginId,
+      source:{kind:"directory",path:$source},candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest},
+      expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+      referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+  printf '%s' "$failed_request" | "$test_root/bin/omarchy-plugin-transaction" >/dev/null ||
+    fail "real QML fail-closed rollback stage was not accepted"
+  : >"$OMARCHY_LIFECYCLE_FAIL_GATED_RESCAN"
+  : >"$OMARCHY_LIFECYCLE_FAIL_TERMINAL_RECEIPT_MARKER"
+  failed_commit=$(jq -cn --arg operationId "$failed_operation" --arg token "$failed_token" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
+  set +e
+  printf '%s' "$failed_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/o8-rollback-failure-result" 2>"$TMPDIR/o8-rollback-failure-error"
+  failed_status=$?
+  set -e
+  rm -f "$OMARCHY_LIFECYCLE_FAIL_TERMINAL_RECEIPT_MARKER"
+  (( failed_status != 0 )) || fail "rollback receipt failure falsely completed"
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$failed_operation.journal") == ROLLBACK_STARTED ]] ||
+    fail "rollback receipt failure did not retain the rollback journal"
+  failed_gate_state=$(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_terminal_id.gate")
+  [[ $failed_gate_state == GATED || $failed_gate_state == UNLOAD_ACKNOWLEDGED || $failed_gate_state == RESCAN_ACKNOWLEDGED ]] ||
+    fail "rollback receipt failure did not retain a blocking gate (state=$failed_gate_state)"
+  [[ ! -e "$plugin_dir/$o8_terminal_id" && ! -e "$marker.service" ]] ||
+    fail "failed rollback released or evaluated the candidate"
+  pass "actual QML rollback receipt failure remains gated and nonterminal"
   exit 0
 fi
 

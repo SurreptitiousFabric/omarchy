@@ -46,6 +46,14 @@ replaceRegistryOnce(
   function ensureUserDir() {
 `,
   'test-copy watcher control')
+replaceRegistryOnce(
+  '  property Process localPluginWatcher: Process {\n',
+  '  property bool testWatcherDisabled: false\n\n  property Process localPluginWatcher: Process {\n',
+  'test-copy persistent watcher control')
+replaceRegistryOnce(
+  '    onExited: localPluginWatcherRestart.restart()\n',
+  '    onExited: if (!registry.testWatcherDisabled) localPluginWatcherRestart.restart()\n',
+  'test-copy watcher restart guard')
 fs.writeFileSync(registryPath, registrySource)
 
 if (process.env.OMARCHY_LIFECYCLE_DISABLE_GENERATION_GUARDS === '1') {
@@ -425,6 +433,8 @@ replaceOnce(
     }
 
     function testStopLocalPluginWatcher(): string {
+      shell.pluginRegistry.testWatcherDisabled = true
+      shell.pluginRegistry.localPluginWatcherRestart.stop()
       shell.pluginRegistry.testSetLocalWatcherRunning(false)
       return "stopping"
     }
