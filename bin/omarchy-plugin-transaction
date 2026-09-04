@@ -447,10 +447,11 @@ emit_journal_response() {
         referenceState:.release.referenceState,
         referencePolicy:.release.referencePolicy
       } end;
-    def public_previous:
-      if .retainedPrior == null or .retainedPrior.state == "not-captured" then null
-      elif .retainedPrior.state == "absent" then {state:"absent"}
-      elif .retainedPrior.identity != null then {state:"present",tree:public_tree(.retainedPrior.identity)}
+    def public_previous($facts):
+      if .retainedPrior != null and .retainedPrior.state == "absent" then {state:"absent"}
+      elif .retainedPrior != null and .retainedPrior.identity != null then {state:"present",tree:public_tree(.retainedPrior.identity)}
+      elif $facts.expectedActive.state == "absent" then {state:"absent"}
+      elif $facts.expectedActive.state == "present" and $facts.expectedActive.identity != null then {state:"present",tree:public_tree($facts.expectedActive.identity)}
       else null end;
     def public_registry:
       {state:(.registry // "not-requested"),rescan:(.rescan.outcome // "not-requested"),
@@ -485,9 +486,9 @@ emit_journal_response() {
          else null end),
        operation:($facts.operation // null),
        candidateTree:public_tree(.candidate.observed),
-       previousTree:public_previous,
+       previousTree:public_previous($facts),
        observedActive:public_active($facts),
-       filesystem:{live:public_active($facts),previous:public_previous},
+       filesystem:{live:public_active($facts),previous:public_previous($facts)},
        observedConfiguration:public_configuration($facts),
        configuration:{before:public_configuration($facts),after:(if .state == "COMMITTED" or .state == "ROLLED_BACK" then public_after_configuration else null end)},
        registry:public_registry,
@@ -503,6 +504,23 @@ emit_journal_response() {
     emit_error manual-attention invalid-state 4
   fi
   printf '%s\n' "$output"
+}
+
+# Render a result from the already-authoritative durable journal.  Durable
+# states must never lose their state-derived dimensions merely because the
+# follow-up shell reconciliation failed.  Callers may still hold the ordered
+# coordinator locks; release them exactly once before emitting the response.
+emit_authoritative_journal_result() {
+  local response_action=${1:-commit} exit_code=${2:-5} shell_state=${3:-not-observed}
+  [[ -n ${journal:-} ]] || {
+    emit_error unavailable invalid-state 4
+  }
+  current_shell_eligibility=$shell_state
+  if (( locks_held != 0 )); then
+    release_ordered_locks
+  fi
+  emit_journal_response "$response_action"
+  exit "$exit_code"
 }
 
 stage_result_code=""
@@ -880,8 +898,8 @@ commit_result_from_journal() {
       emit_journal_response commit
       exit 0
       ;;
-    RECOVERY_REQUIRED) emit_error indeterminate recovery-required 5 "$state" ;;
-    MANUAL_ATTENTION) emit_error manual-attention manual-attention 4 "$state" ;;
+    RECOVERY_REQUIRED) emit_authoritative_journal_result commit 5 not-observed ;;
+    MANUAL_ATTENTION) emit_authoritative_journal_result commit 4 not-observed ;;
     *) emit_journal_response commit; exit 0 ;;
   esac
 }
@@ -997,7 +1015,7 @@ mark_recovery() {
     emit_error indeterminate journal-indeterminate 5 "$response_state"
   fi
   if (( acquired == 1 )); then release_ordered_locks; fi
-  emit_error indeterminate "$reason" 5 RECOVERY_REQUIRED
+  emit_authoritative_journal_result commit 5 not-observed
 }
 
 # Direct rollback is deliberately narrow: it is entered only after a durable
@@ -1295,8 +1313,9 @@ rollback_operation() {
   # The terminal journal must exist before the current shell is asked to
   # reconcile the terminal receipt.  A receipt paired with ROLLBACK_STARTED
   # is still blocking authority.
-  reconcile_terminal_shell ||
-    emit_error indeterminate terminal-shell-reconciliation-required 5 ROLLED_BACK
+  if ! reconcile_terminal_shell; then
+    emit_authoritative_journal_result commit 5 reconciliation-required
+  fi
   commit_result_from_journal ROLLED_BACK
 }
 
@@ -1885,7 +1904,9 @@ o8_handle_release_pending() {
   /usr/bin/rm -f -- "$committed_input"
   read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 COMMITTED; }
   release_ordered_locks
-  reconcile_terminal_shell || emit_error indeterminate terminal-shell-reconciliation-required 5 COMMITTED
+  if ! reconcile_terminal_shell; then
+    emit_authoritative_journal_result commit 5 reconciliation-required
+  fi
   commit_result_from_journal COMMITTED
 }
 
@@ -1899,7 +1920,7 @@ o8_handle_terminal_state() {
   o8_require_unlocked "$terminal_state"
   if [[ $terminal_state == COMMITTED || $terminal_state == ROLLED_BACK ]]; then
     if ! reconcile_terminal_shell; then
-      emit_error indeterminate terminal-shell-reconciliation-required 5 "$terminal_state"
+      emit_authoritative_journal_result commit 5 reconciliation-required
     fi
   fi
   commit_result_from_journal "$terminal_state"
@@ -1945,8 +1966,7 @@ commit_operation() {
       ROLLBACK_STARTED) o8_handle_rollback_started ;;
       COMMITTED|ROLLED_BACK) o8_handle_terminal_state "$state" ;;
       REJECTED|ABORTED) commit_result_from_journal "$state" ;;
-      RECOVERY_REQUIRED) emit_error indeterminate recovery-required 5 "$state" ;;
-      MANUAL_ATTENTION) emit_error manual-attention manual-attention 4 "$state" ;;
+      RECOVERY_REQUIRED|MANUAL_ATTENTION) commit_result_from_journal "$state" ;;
       REQUEST_BOUND|PUBLICATION_INTENT) emit_error in-progress operation-in-progress 0 "$state" ;;
       *) emit_error manual-attention invalid-state 4 "$state" ;;
     esac
