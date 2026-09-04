@@ -593,6 +593,10 @@ invoke_stage_candidate() {
 shell_call() {
   local method=$1
   shift
+  if (( locks_held != 0 )); then
+    printf 'omarchy-plugin-transaction: internal shell call while locks held (%s)\n' "$method" >&2
+    return 125
+  fi
   local -a environment
   environment=(/usr/bin/env -i "HOME=$HOME" "PATH=$PATH" "LC_ALL=C"
     "OMARCHY_PATH=$package_root" "OMARCHY_SHELL_IPC_TIMEOUT=5")
@@ -621,6 +625,42 @@ wait_shell_transaction_status() {
       return 0
     fi
     (( SECONDS >= deadline )) && break
+    /usr/bin/sleep 0.1
+  done
+  return 1
+}
+
+wait_shell_release_result() {
+  local output status deadline=$((SECONDS + lock_timeout_seconds))
+  while (( SECONDS < deadline )); do
+    if output=$(shell_call transactionPluginState "$request_operation_id" 2>/dev/null) &&
+       status=$(printf '%s' "$output" | "$jq_bin" -r --arg op "$request_operation_id" \
+         '. as $result | select(type == "object" and .operationId == $op) | .status' 2>/dev/null) &&
+       [[ $status == released || $status == terminal-pair-reconciled ]]; then
+      return 0
+    fi
+    /usr/bin/sleep 0.1
+  done
+  return 1
+}
+
+request_shell_rescan() {
+  local method=$1 deadline=$((SECONDS + lock_timeout_seconds)) output
+  # Registry callbacks can report a transient busy result while an ordinary
+  # watcher scan is draining.  Retry that typed result within one bounded
+  # shell-wait interval; it is not evidence that the operation failed.
+  while (( SECONDS < deadline )); do
+    if output=$(shell_call "$method" "$request_operation_id" "$request_plugin_id" 2>/dev/null); then
+      case "$output" in
+        pending) return 0 ;;
+        busy) : ;;
+        gate-missing|unload-incomplete|rollback-rescan-missing|gated-rescan-missing)
+          return 2 ;;
+        *) return 2 ;;
+      esac
+    else
+      return 2
+    fi
     /usr/bin/sleep 0.1
   done
   return 1
@@ -850,7 +890,11 @@ reject_staged() {
 
 mark_recovery() {
   local reason=$1 response_state=${2:-RECOVERY_REQUIRED}
-  if ! write_journal_transition o8-to-recovery ".state=\"RECOVERY_REQUIRED\" | .reason=\"$reason\" | .gate=\"established\""; then
+  # RECOVERY_REQUIRED is a v2 state with an established blocking authority.
+  # Keep the state-conditioned evidence explicit when the predecessor was a
+  # pre-gate reservation (where the old record still says not-established),
+  # and never manufacture a terminal or namespace-complete claim.
+  if ! write_journal_transition o8-to-recovery ".schema=\"omarchy-plugin-transaction-journal/v2\" | .state=\"RECOVERY_REQUIRED\" | .reason=\"$reason\" | .gate=\"established\" | .registry=(if .registry == null then \"not-requested\" else .registry end) | .rollback=(if .rollback == null then \"not-applicable\" else .rollback end) | .namespaceIntent=(if .namespaceIntent == null then {kind:(if .normalizedRequest.facts.operation == \"install\" then \"install\" else \"exchange\" end),state:\"none\",sourceSlot:.candidate.completedSlot,destination:.normalizedRequest.facts.destination,candidate:.candidate.observed,prior:(if .normalizedRequest.facts.expectedActive.state == \"present\" then .normalizedRequest.facts.expectedActive.identity else null end)} else .namespaceIntent end) | .terminalReceipt=(if .terminalReceipt == null then {state:\"not-requested\",intendedJournalState:null,operationBindingSha256:null,operationId:null,pluginId:null,targetRole:\"none\",target:null,shellInstance:null,generation:null,scanEpoch:null,configurationEpoch:null,outcome:\"not-requested\"} else .terminalReceipt end)"; then
     release_ordered_locks
     emit_error indeterminate journal-indeterminate 5 "$response_state"
   fi
@@ -993,8 +1037,14 @@ rollback_operation() {
   fi
   release_ordered_locks
   if [[ $rollback_rescan_outcome != completed ]]; then
-    shell_call rescanRollbackPlugin "$request_operation_id" "$request_plugin_id" >/dev/null 2>&1 ||
+    set +e
+    request_shell_rescan rescanRollbackPlugin
+    shell_status=$?
+    set -e
+    (( shell_status == 0 )) || {
+      (( shell_status == 1 )) && emit_error indeterminate rollback-rescan-timeout 5 ROLLBACK_STARTED
       emit_error indeterminate rollback-rescan-indeterminate 5 ROLLBACK_STARTED
+    }
     wait_shell_transaction_status rollback-rescan-complete || true
     wait_gate_state RESCAN_ACKNOWLEDGED ||
       emit_error indeterminate rollback-rescan-indeterminate 5 ROLLBACK_STARTED
@@ -1057,16 +1107,19 @@ rollback_operation() {
     read_journal_authoritative || emit_error indeterminate rollback-release-authority-indeterminate 5 ROLLBACK_STARTED
     shell_call releaseRollbackTransactionPlugin "$request_operation_id" "$request_plugin_id" >/dev/null 2>&1 ||
       emit_error indeterminate rollback-release-indeterminate 5 ROLLBACK_STARTED
-    wait_shell_transaction_status released || true
-    wait_gate_state RELEASE_AUTHORIZED ||
-      emit_error indeterminate rollback-release-indeterminate 5 ROLLBACK_STARTED
-    shell_call transactionTerminalReceipt "$request_operation_id" "$request_plugin_id" ROLLED_BACK >/dev/null 2>&1 ||
-      emit_error indeterminate rollback-release-indeterminate 5 ROLLBACK_STARTED
-    wait_gate_state TERMINAL_RECEIPT ||
-      emit_error indeterminate rollback-release-indeterminate 5 ROLLBACK_STARTED
+    # Real PluginEligibility performs RELEASE_AUTHORIZED, publishes restored
+    # eligibility, and requests the terminal receipt before reporting
+    # `released`.  Do not wait for the transient authorization or issue a
+    # duplicate terminal-receipt request after that final result.
+    wait_shell_release_result || true
+    terminal_gate_state=$(read_gate_state "$request_plugin_id" 2>/dev/null || true)
+    if [[ $terminal_gate_state != TERMINAL_RECEIPT ]]; then
+      wait_gate_state RELEASE_AUTHORIZED ||
+        emit_error indeterminate rollback-release-indeterminate 5 ROLLBACK_STARTED
+      wait_gate_state TERMINAL_RECEIPT ||
+        emit_error indeterminate rollback-release-indeterminate 5 ROLLBACK_STARTED
+    fi
   fi
-  reconcile_terminal_shell ||
-    emit_error indeterminate terminal-shell-reconciliation-required 5 ROLLBACK_STARTED
   if ! acquire_ordered_locks || ! read_journal_held; then
     release_ordered_locks
     emit_error indeterminate rollback-authority-indeterminate 5 ROLLBACK_STARTED
@@ -1093,119 +1146,554 @@ rollback_operation() {
   /usr/bin/rm -f -- "$rollback_input"
   read_journal_held || { release_ordered_locks; emit_error indeterminate rollback-journal-indeterminate 5 ROLLBACK_STARTED; }
   release_ordered_locks
+  # The terminal journal must exist before the current shell is asked to
+  # reconcile the terminal receipt.  A receipt paired with ROLLBACK_STARTED
+  # is still blocking authority.
+  reconcile_terminal_shell ||
+    emit_error indeterminate terminal-shell-reconciliation-required 5 ROLLED_BACK
   commit_result_from_journal ROLLED_BACK
 }
 
-reject_competing_operation() {
-  local other_operation=$1 op_read op_write op_pid ready input gate_path gate_operation gate_plugin read_status
-  local gate_binding other_journal other_binding candidate_path expected_candidate operation destination
-  local active_state active_identity
-  gate_path=$state_root/gates/$request_plugin_id.gate
-  [[ -f $gate_path && ! -L $gate_path ]] || return 1
-  # A visible gate is not enough evidence after a possible interrupted rename.
-  # Reconcile the existing gate directory before treating it as another
-  # operation's durable authority.
-  native_run gate-sync "$state_root" >/dev/null 2>&1 || return 2
-  "$jq_bin" -e --arg plugin_id "$request_plugin_id" -f "$gate_validator" "$gate_path" >/dev/null 2>&1 || return 2
-  gate_operation=$("$jq_bin" -r '.operationId // ""' "$gate_path")
-  gate_plugin=$("$jq_bin" -r '.pluginId // ""' "$gate_path")
-  gate_binding=$("$jq_bin" -r '.operationBindingSha256 // ""' "$gate_path")
-  [[ $gate_operation != "$request_operation_id" && $gate_plugin == "$request_plugin_id" &&
-      $gate_operation =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ &&
-      $gate_binding =~ ^[0-9a-f]{64}$ ]] || return 2
-  # Bind the observed gate to the other operation's authoritative journal;
-  # a gate with no readable matching journal is ambiguous, never a rejection.
-  if ! other_journal=$(native_run journal-read-locked "$state_root" "$gate_operation" 2>/dev/null); then
-    return 2
-  fi
-  [[ $(printf '%s' "$other_journal" | "$jq_bin" -r '.schema // ""') == omarchy-plugin-transaction-journal/v2 ]] || return 2
-  "$jq_bin" -eS --arg operation_id "$gate_operation" -f "$journal_validator" \
-    <(printf '%s' "$other_journal") >/dev/null 2>&1 || return 2
-  other_binding=$(printf '%s' "$other_journal" | "$jq_bin" -cS '
-    {operationId,pluginId,
-     operation: .normalizedRequest.facts.operation,
-     requestDigest: .normalizedRequest.digest,
-     candidateExpected: .candidate.expected,
-     candidateObserved: .candidate.observed,
-     candidateSlot: .candidate.completedSlot,
-     expectedActive: .normalizedRequest.facts.expectedActive,
-     destination: .normalizedRequest.facts.destination}' |
-    native_run domain-hash omarchy-plugin-transaction-operation-binding/v1 2>/dev/null) || return 2
-  [[ $other_binding == "$gate_binding" ]] || return 2
 
-  coproc O8_OPERATION_LOCK { native_run operation-lock "$state_root" "$request_operation_id"; }
-  op_pid=$O8_OPERATION_LOCK_PID
-  op_read=${O8_OPERATION_LOCK[0]}
-  op_write=${O8_OPERATION_LOCK[1]}
-  if IFS= read -r -t "$lock_timeout_seconds" ready <&"$op_read"; then
-    :
-  else
-    read_status=$?
-    exec {op_read}<&- || true; exec {op_write}>&- || true; wait "$op_pid" 2>/dev/null || true
-    (( read_status == 142 )) && return 2
-    return 1
-  fi
-  [[ $ready == locked-operation ]] || {
-    exec {op_write}>&- || true; wait "$op_pid" 2>/dev/null || true
-    return 1
+reject_competing_operation() {
+  local other_operation other_gate other_journal other_binding
+  local other_lock_pid other_read_fd other_write_fd other_ready other_read_status
+  local own_gate_status input
+  o8_require_unlocked COMMIT_PREPARED
+  set +e
+  o8_gate_status_unlocked
+  own_gate_status=$?
+  set -e
+  (( own_gate_status == 0 )) || return 2
+  other_operation=$(printf '%s' "$gate_record" | "$jq_bin" -r '.operationId // ""')
+  [[ -n $other_operation && $other_operation != "$request_operation_id" ]] || return 2
+  other_gate=$gate_record
+
+  # Establish the other operation's authority with its operation lock followed
+  # by the shared plugin lifecycle lock.  Release both before acquiring this
+  # operation's locks; two operation locks are never held simultaneously.
+  coproc O8_OTHER_LOCK {
+    native_run ordered-lock "$state_root" "$other_operation" "$request_plugin_id"
   }
-  exec {op_read}<&-
-  if ! read_journal_held; then
-    exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
+  other_lock_pid=$O8_OTHER_LOCK_PID
+  other_read_fd=${O8_OTHER_LOCK[0]}
+  other_write_fd=${O8_OTHER_LOCK[1]}
+  if ! IFS= read -r -t "$lock_timeout_seconds" other_ready <&"$other_read_fd"; then
+    other_read_status=$?
+    exec {other_read_fd}<&- || true
+    exec {other_write_fd}>&- || true
+    kill "$other_lock_pid" 2>/dev/null || true
+    wait "$other_lock_pid" 2>/dev/null || true
+    (( other_read_status == 142 )) && return 2
     return 1
   fi
+  exec {other_read_fd}<&-
+  [[ $other_ready == locked-operation-then-plugin ]] || {
+    exec {other_write_fd}>&- || true; wait "$other_lock_pid" 2>/dev/null || true; return 2;
+  }
+  if ! other_journal=$(native_run journal-read-held "$state_root" "$other_operation" 2>/dev/null); then
+    exec {other_write_fd}>&-; wait "$other_lock_pid" 2>/dev/null || true; return 2
+  fi
+  if ! printf '%s' "$other_journal" | "$jq_bin" -eS --arg operation_id "$other_operation" -f "$journal_validator" >/dev/null 2>&1; then
+    exec {other_write_fd}>&-; wait "$other_lock_pid" 2>/dev/null || true; return 2
+  fi
+  other_binding=$(printf '%s' "$other_journal" | "$jq_bin" -cS '{operationId,pluginId,operation:.normalizedRequest.facts.operation,requestDigest:.normalizedRequest.digest,candidateExpected:.candidate.expected,candidateObserved:.candidate.observed,candidateSlot:.candidate.completedSlot,expectedActive:.normalizedRequest.facts.expectedActive,destination:.normalizedRequest.facts.destination}' | native_run domain-hash omarchy-plugin-transaction-operation-binding/v1 2>/dev/null) || {
+    exec {other_write_fd}>&-; wait "$other_lock_pid" 2>/dev/null || true; return 2;
+  }
+  if ! printf '%s' "$other_gate" | "$jq_bin" -e --arg op "$other_operation" --arg plugin "$request_plugin_id" --arg binding "$other_binding" '.operationId==$op and .pluginId==$plugin and .operationBindingSha256==$binding and (.state=="GATED" or .state=="UNLOAD_ACKNOWLEDGED" or .state=="RESCAN_ACKNOWLEDGED" or .state=="RELEASE_AUTHORIZED" or .state=="TERMINAL_RECEIPT")' >/dev/null 2>&1; then
+    exec {other_write_fd}>&-; wait "$other_lock_pid" 2>/dev/null || true; return 2
+  fi
+  exec {other_write_fd}>&-
+  wait "$other_lock_pid" 2>/dev/null || true
+
+  require_ordered_locks COMMIT_PREPARED
+  read_journal_held || { release_ordered_locks; return 2; }
   if [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') != COMMIT_PREPARED ||
-        $(printf '%s' "$journal" | "$jq_bin" -r '.namespaceIntent.state') != none ||
         $(printf '%s' "$journal" | "$jq_bin" -r '.gate') != not-established ||
-        $(printf '%s' "$journal" | "$jq_bin" -r '.rollback') != not-applicable ]]; then
-    exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
+        $(printf '%s' "$journal" | "$jq_bin" -r '.namespaceIntent.state') != none ||
+        $(printf '%s' "$journal" | "$jq_bin" -r '.rollback') != not-applicable ]] ||
+     ! o8_commit_candidate_ok; then
+    release_ordered_locks
     return 2
   fi
-  candidate_path=$candidate_store/$request_operation_id/candidate
-  expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed // ""')
-  [[ -d $candidate_path && ! -L $candidate_path &&
-      $(native_run identity "$candidate_path" 2>/dev/null || true) == "$expected_candidate" ]] || {
-    exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
-    return 2
-  }
-  operation=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.operation')
-  destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
-  active_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.state')
-  active_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.identity // ""')
-  if [[ $operation == install ]]; then
-    [[ $destination == "$discovery_dir/$request_plugin_id" && ! -e $destination && ! -L $destination ]] || {
-      exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
-      return 2
-    }
-  elif [[ $operation == update ]]; then
-    validate_update_destination "$destination" && [[ $active_state == present && -d $destination && ! -L $destination &&
-      $(native_run identity "$destination" 2>/dev/null || true) == "$active_identity" ]] || {
-      exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
-      return 2
-    }
-  else
-    exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
+  # Re-read the gate while our ordered locks are held.  A changed owner or an
+  # unreadable gate is ambiguity, never a guessed rejection.
+  set +e
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1
+  own_gate_status=$?
+  set -e
+  if (( own_gate_status != 0 )) || [[ $(printf '%s' "$gate_record" | "$jq_bin" -r '.operationId // ""') != "$other_operation" ]]; then
+    release_ordered_locks
     return 2
   fi
   input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-rejected.XXXXXX)
-  printf '%s' "$journal" | "$jq_bin" -cS '.state="REJECTED" | .reason="plugin-gated-by-another-operation"' >"$input"
+  printf '%s' "$journal" | "$jq_bin" -cS '.state="REJECTED" | .reason="plugin-gated-by-another-operation" | .gate="not-established" | .namespaceIntent.state="none" | .rollback="not-applicable"' >"$input"
   chmod 0600 "$input"
-  if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$input" >/dev/null 2>&1 || ! native_run journal-replace "$state_root" "$request_operation_id" "$input" commit-prepared-to-rejected >/dev/null 2>&1; then
-    /usr/bin/rm -f -- "$input"; exec {op_write}>&-; wait "$op_pid" 2>/dev/null || true
-    return 1
+  if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$input" >/dev/null 2>&1 ||
+     ! native_run journal-replace "$state_root" "$request_operation_id" "$input" commit-prepared-to-rejected >/dev/null 2>&1; then
+    /usr/bin/rm -f -- "$input"; release_ordered_locks; return 1
   fi
   /usr/bin/rm -f -- "$input"
-  exec {op_write}>&-
-  wait "$op_pid" 2>/dev/null || true
-  read_journal_authoritative || return 1
+  read_journal_held || { release_ordered_locks; return 1; }
+  release_ordered_locks
   emit_journal_response commit
   exit 0
 }
 
+o8_gate_status_unlocked() {
+  local status
+  gate_record=""
+  if read_gate_state "$request_plugin_id" >/dev/null 2>/dev/null; then
+    gate_state=$(printf '%s' "$gate_record" | "$jq_bin" -r '.state')
+    return 0
+  else
+    status=$?
+  fi
+  gate_state=""
+  return "$status"
+}
+
+o8_require_unlocked() {
+  (( locks_held == 0 )) || emit_error indeterminate internal-lock-held 5 "${1:-}"
+}
+
+o8_commit_candidate_ok() {
+  [[ -d $candidate_path && ! -L $candidate_path ]] || return 1
+  [[ $(native_run identity "$candidate_path" 2>/dev/null || true) == "$expected_candidate" ]]
+}
+
+o8_gate_matches() {
+  local expected_state=$1 stored_binding computed_binding
+  [[ -n ${gate_record:-} ]] || return 1
+  stored_binding=$(printf '%s' "$journal" | "$jq_bin" -r '.operationBindingSha256 // ""')
+  computed_binding=$(operation_binding_for_journal) || return 1
+  if [[ -z $stored_binding || $computed_binding != "$stored_binding" ]]; then
+    printf 'omarchy-plugin-transaction: binding mismatch expected=%s computed=%s\n' "$stored_binding" "$computed_binding" >&2
+    return 1
+  fi
+  printf '%s' "$gate_record" | "$jq_bin" -e --arg state "$expected_state" \
+    --arg op "$request_operation_id" --arg plugin "$request_plugin_id" \
+    --arg binding "$computed_binding" \
+    '.schema == "omarchy-plugin-transaction-gate/v2"
+     and .state == $state and .operationId == $op and .pluginId == $plugin
+     and .operationBindingSha256 == $binding' >/dev/null 2>&1
+}
+
+o8_write_load_gated() {
+  o8_require_unlocked COMMIT_PREPARED
+  authority_phase=pre
+  set +e
+  commit_validate_authority
+  authority_status=$?
+  set -e
+  if (( authority_status != 0 )); then
+    [[ $authority_status == 1 ]] && emit_error unavailable "${authority_reason:-shell-authority-unavailable}" 4 COMMIT_PREPARED
+    require_ordered_locks COMMIT_PREPARED
+    read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 COMMIT_PREPARED; }
+    mark_recovery "pre-exposure-${authority_reason:-authority-indeterminate}" COMMIT_PREPARED
+  fi
+  require_ordered_locks COMMIT_PREPARED
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 COMMIT_PREPARED; }
+  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == COMMIT_PREPARED ]] || {
+    release_ordered_locks
+    emit_error manual-attention operation-state-mismatch 4 COMMIT_PREPARED
+  }
+  set +e
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1
+  gate_status=$?
+  set -e
+  if (( gate_status == 0 )); then
+    gate_state=$(printf '%s' "$gate_record" | "$jq_bin" -r '.state')
+  fi
+  (( gate_status == 0 )) && o8_gate_matches UNLOAD_ACKNOWLEDGED || {
+    release_ordered_locks
+    (( gate_status == 3 )) && emit_error indeterminate gate-missing 5 COMMIT_PREPARED
+    emit_error indeterminate unload-acknowledgement-indeterminate 5 COMMIT_PREPARED
+  }
+  if ! write_journal_transition commit-prepared-to-load-gated \
+      '.state="LOAD_GATED" | .gate="established" | .namespaceIntent.state="intended"'; then
+    release_ordered_locks
+    emit_error indeterminate journal-indeterminate 5 COMMIT_PREPARED
+  fi
+  release_ordered_locks
+}
+
+o8_handle_staged() {
+  o8_require_unlocked STAGED
+  if ! o8_commit_candidate_ok; then
+    reject_staged stale-candidate
+  fi
+  authority_phase=pre
+  set +e
+  commit_validate_authority
+  authority_status=$?
+  set -e
+  if (( authority_status != 0 )); then
+    [[ $authority_status == 1 ]] && emit_error unavailable "${authority_reason:-shell-authority-unavailable}" 4 STAGED
+    reject_staged "${authority_reason:-precondition-indeterminate}"
+  fi
+  require_ordered_locks STAGED
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 STAGED; }
+  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == STAGED ]] || {
+    release_ordered_locks
+    return 0
+  }
+  o8_commit_candidate_ok || { release_ordered_locks; reject_staged stale-candidate; }
+  set +e
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1
+  gate_status=$?
+  set -e
+  if (( gate_status == 0 )); then
+    gate_state=$(printf '%s' "$gate_record" | "$jq_bin" -r '.state')
+  fi
+  # A retained terminal receipt is non-blocking authority for a completed
+  # predecessor and may be replaced by shell-gate for this new operation.
+  if (( gate_status == 0 )) && [[ $gate_state == TERMINAL_RECEIPT ]]; then
+    gate_status=3
+  fi
+  if (( gate_status == 0 )); then
+    release_ordered_locks
+    emit_error indeterminate gate-state-mismatch 5 STAGED
+  fi
+  (( gate_status == 3 )) || { release_ordered_locks; emit_error indeterminate gate-authority-indeterminate 5 STAGED; }
+  make_commit_prepared || { release_ordered_locks; emit_error unavailable commit-preparation-failed 4 STAGED; }
+  release_ordered_locks
+}
+
+o8_handle_commit_prepared() {
+  o8_require_unlocked COMMIT_PREPARED
+  set +e
+  o8_gate_status_unlocked
+  gate_status=$?
+  set -e
+  if (( gate_status != 0 && gate_status != 3 )); then
+    (( gate_status == 5 )) && emit_error indeterminate gate-authority-indeterminate 5 COMMIT_PREPARED
+    emit_error manual-attention invalid-gate 4 COMMIT_PREPARED
+  fi
+  if (( gate_status == 0 )) && [[ $gate_state == TERMINAL_RECEIPT ]]; then
+    gate_status=3
+  fi
+  if (( gate_status == 0 )); then
+    case "$gate_state" in
+      GATED)
+        shell_result=""
+        set +e
+        shell_result=$(shell_call gateTransactionPlugin "$request_operation_id" "$request_plugin_id" 2>/dev/null)
+        shell_status=$?
+        set -e
+        [[ $shell_result == conflict ]] && reject_competing_operation
+        (( shell_status == 0 )) || emit_error indeterminate gate-action-indeterminate 5 COMMIT_PREPARED
+        wait_shell_transaction_status gate-installed-unload-acknowledged || {
+          set +e; o8_gate_status_unlocked; gate_status=$?; set -e
+          [[ $gate_status == 0 && $gate_state == GATED ]] && emit_error in-progress unload-pending 0 COMMIT_PREPARED
+          emit_error indeterminate unload-acknowledgement-indeterminate 5 COMMIT_PREPARED
+        }
+        return 0
+        ;;
+      UNLOAD_ACKNOWLEDGED)
+        o8_write_load_gated
+        return 0
+        ;;
+      RESCAN_ACKNOWLEDGED|RELEASE_AUTHORIZED|TERMINAL_RECEIPT)
+        emit_error manual-attention operation-state-gate-mismatch 4 COMMIT_PREPARED
+        ;;
+      *) emit_error indeterminate invalid-gate-state 5 COMMIT_PREPARED ;;
+    esac
+  fi
+  # No gate is authoritative.  Recheck the reservation under both locks, then
+  # release them before asking QML to install and unload the plugin.
+  authority_phase=pre
+  set +e
+  commit_validate_authority
+  authority_status=$?
+  set -e
+  if (( authority_status != 0 )); then
+    [[ $authority_status == 1 ]] && emit_error unavailable "${authority_reason:-shell-authority-unavailable}" 4 COMMIT_PREPARED
+    reject_prepared "${authority_reason:-precondition-indeterminate}"
+  fi
+  require_ordered_locks COMMIT_PREPARED
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 COMMIT_PREPARED; }
+  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == COMMIT_PREPARED ]] || { release_ordered_locks; return 0; }
+  set +e
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1
+  gate_status=$?
+  set -e
+  if (( gate_status == 0 )) && [[ $gate_state == TERMINAL_RECEIPT ]]; then
+    gate_status=3
+  fi
+  if (( gate_status == 0 )); then
+    release_ordered_locks
+    return 0
+  fi
+  (( gate_status == 3 )) || { release_ordered_locks; emit_error indeterminate gate-authority-indeterminate 5 COMMIT_PREPARED; }
+  o8_commit_candidate_ok || { release_ordered_locks; reject_prepared stale-candidate; }
+  if [[ $operation_kind == install ]]; then
+    [[ $destination == "$discovery_dir/$request_plugin_id" && ! -e $destination && ! -L $destination ]] || { release_ordered_locks; reject_prepared stale-active-tree; }
+  else
+    validate_update_destination "$destination" && [[ -d $destination && ! -L $destination ]] || { release_ordered_locks; reject_prepared stale-active-tree; }
+    [[ $(native_run identity "$destination" 2>/dev/null || true) == "$active_identity" ]] || { release_ordered_locks; reject_prepared stale-active-tree; }
+  fi
+  if ! native_run atomic-support >/dev/null 2>&1; then
+    # Atomic support is an environment precondition, not a rejected
+    # transaction.  Return the durable reservation to STAGED before exposing
+    # the typed unsupported result; never report a state that the journal does
+    # not contain.
+    if ! write_journal_transition commit-prepared-to-staged '.state="STAGED" | .reason=null'; then
+      release_ordered_locks
+      emit_error indeterminate journal-indeterminate 5 COMMIT_PREPARED
+    fi
+    release_ordered_locks
+    emit_error unavailable unsupported-atomic-operation 4 STAGED
+  fi
+  if [[ $(stat -c %d "$candidate_store/$request_operation_id" 2>/dev/null || true) != "$(stat -c %d "$discovery_dir" 2>/dev/null || true)" ]]; then
+    if ! write_journal_transition commit-prepared-to-staged '.state="STAGED" | .reason=null'; then
+      release_ordered_locks
+      emit_error indeterminate journal-indeterminate 5 COMMIT_PREPARED
+    fi
+    release_ordered_locks
+    emit_error unavailable unsupported-filesystem 4 STAGED
+  fi
+  release_ordered_locks
+  shell_result=""
+  set +e
+  shell_result=$(shell_call gateTransactionPlugin "$request_operation_id" "$request_plugin_id" 2>/dev/null)
+  shell_status=$?
+  set -e
+  [[ $shell_result == conflict ]] && reject_competing_operation
+  (( shell_status == 0 )) || emit_error unavailable shell-authority-unavailable 4 COMMIT_PREPARED
+  wait_shell_transaction_status gate-installed-unload-acknowledged || {
+    set +e; o8_gate_status_unlocked; gate_status=$?; set -e
+    [[ $gate_status == 0 && $gate_state == GATED ]] && emit_error in-progress unload-pending 0 COMMIT_PREPARED
+    emit_error indeterminate unload-acknowledgement-indeterminate 5 COMMIT_PREPARED
+  }
+}
+
+o8_handle_load_gated() {
+  o8_require_unlocked LOAD_GATED
+  require_ordered_locks LOAD_GATED
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 LOAD_GATED; }
+  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == LOAD_GATED ]] || { release_ordered_locks; return 0; }
+  set +e
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1
+  gate_status=$?
+  set -e
+  (( gate_status == 0 )) && o8_gate_matches UNLOAD_ACKNOWLEDGED || {
+    release_ordered_locks
+    emit_error indeterminate unload-acknowledgement-indeterminate 5 LOAD_GATED
+  }
+  local namespace_layout=ambiguous mutation_result mutation_status mutation_outcome
+  if [[ $operation_kind == install ]]; then
+    if o8_commit_candidate_ok && [[ ! -e $destination && ! -L $destination ]]; then
+      namespace_layout=pre
+    elif [[ ! -e $candidate_path && -d $destination && ! -L $destination &&
+            $(native_run identity "$destination" 2>/dev/null || true) == "$expected_candidate" ]]; then
+      namespace_layout=post
+    fi
+  else
+    if o8_commit_candidate_ok && [[ -d $destination && ! -L $destination &&
+            $(native_run identity "$destination" 2>/dev/null || true) == "$active_identity" ]]; then
+      namespace_layout=pre
+    elif [[ -d $candidate_path && ! -L $candidate_path &&
+            $(native_run identity "$candidate_path" 2>/dev/null || true) == "$active_identity" &&
+            -d $destination && ! -L $destination &&
+            $(native_run identity "$destination" 2>/dev/null || true) == "$expected_candidate" ]]; then
+      namespace_layout=post
+    fi
+  fi
+  case "$namespace_layout" in
+    pre)
+      mutation_status=0
+      if [[ $operation_kind == install ]]; then
+        mutation_result=$(native_run namespace-mutate install "$candidate_store/$request_operation_id" candidate \
+          "$(/usr/bin/dirname -- "$destination")" "$(/usr/bin/basename -- "$destination")" "$expected_candidate" "$expected_candidate" 2>/dev/null) || mutation_status=$?
+      else
+        mutation_result=$(native_run namespace-mutate exchange "$candidate_store/$request_operation_id" candidate \
+          "$(/usr/bin/dirname -- "$destination")" "$(/usr/bin/basename -- "$destination")" "$expected_candidate" "$active_identity" 2>/dev/null) || mutation_status=$?
+      fi
+      mutation_outcome=$(printf '%s' "$mutation_result" | "$jq_bin" -r '.status // "invalid-result"' 2>/dev/null || printf invalid-result)
+      (( mutation_status == 0 )) && [[ $mutation_outcome == completed-durable ]] || {
+        release_ordered_locks
+        emit_error indeterminate "namespace-${mutation_outcome}" 5 LOAD_GATED
+      }
+      ;;
+    post) : ;;
+    *)
+      release_ordered_locks
+      emit_error indeterminate namespace-layout-ambiguous 5 LOAD_GATED
+      ;;
+  esac
+  if [[ $operation_kind == update ]]; then
+    live_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-live.XXXXXX)
+    printf '%s' "$journal" | "$jq_bin" -cS --arg prior "$active_identity" --arg slot "$request_operation_id" \
+      '.namespaceIntent.state="completed" | .state="LIVE_TREE_EXCHANGED" | .retainedPrior={state:"captured",identity:$prior,slot:$slot}' >"$live_input"
+  else
+    live_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-live.XXXXXX)
+    printf '%s' "$journal" | "$jq_bin" -cS \
+      '.namespaceIntent.state="completed" | .state="LIVE_TREE_EXCHANGED" | .retainedPrior={state:"absent",identity:null,slot:null}' >"$live_input"
+  fi
+  chmod 0600 "$live_input"
+  if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$live_input" >/dev/null 2>&1 ||
+     ! native_run journal-replace "$state_root" "$request_operation_id" "$live_input" load-gated-to-live-tree-exchanged >/dev/null 2>&1; then
+    /usr/bin/rm -f -- "$live_input"
+    release_ordered_locks
+    emit_error indeterminate journal-indeterminate 5 LIVE_TREE_EXCHANGED
+  fi
+  /usr/bin/rm -f -- "$live_input"
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 LIVE_TREE_EXCHANGED; }
+  release_ordered_locks
+}
+
+o8_handle_live_tree_exchanged() {
+  o8_require_unlocked LIVE_TREE_EXCHANGED
+  set +e
+  o8_gate_status_unlocked
+  gate_status=$?
+  set -e
+  if (( gate_status != 0 )); then emit_error indeterminate gated-rescan-authority-indeterminate 5 LIVE_TREE_EXCHANGED; fi
+  if [[ $gate_state != RESCAN_ACKNOWLEDGED ]]; then
+    shell_result=""
+    set +e
+    request_shell_rescan rescanGatedPlugin
+    shell_status=$?
+    set -e
+    (( shell_status == 0 )) || {
+      (( shell_status == 1 )) && rollback_operation rescan-acknowledgement-timeout
+      rollback_operation rescan-request-failed
+    }
+    wait_shell_transaction_status gated-rescan-complete || rollback_operation rescan-acknowledgement-indeterminate
+    o8_gate_status_unlocked || rollback_operation gated-rescan-authority-indeterminate
+    [[ $gate_state == RESCAN_ACKNOWLEDGED ]] || rollback_operation gated-rescan-authority-indeterminate
+  fi
+  require_ordered_locks LIVE_TREE_EXCHANGED
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 LIVE_TREE_EXCHANGED; }
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1 || {
+    release_ordered_locks
+    emit_error indeterminate gated-rescan-authority-indeterminate 5 LIVE_TREE_EXCHANGED
+  }
+  if ! o8_gate_matches RESCAN_ACKNOWLEDGED; then
+    release_ordered_locks
+    emit_error indeterminate gated-rescan-authority-indeterminate 5 LIVE_TREE_EXCHANGED
+  fi
+  rescan_shell=$(printf '%s' "$gate_record" | "$jq_bin" -r '.rescan.shellInstance')
+  rescan_generation=$(printf '%s' "$gate_record" | "$jq_bin" -r '.rescan.generation')
+  rescan_epoch=$(printf '%s' "$gate_record" | "$jq_bin" -r '.rescan.scanEpoch')
+  rescan_source=$(printf '%s' "$gate_record" | "$jq_bin" -r '.rescan.sourceDirectory')
+  rescan_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-rescan.XXXXXX)
+  printf '%s' "$journal" | "$jq_bin" -cS --arg shell "$rescan_shell" --argjson generation "$rescan_generation" --argjson scanEpoch "$rescan_epoch" --arg source "$rescan_source" \
+    '.rescan={outcome:"completed",shellInstance:$shell,generation:$generation,scanEpoch:$scanEpoch,sourceDirectory:$source,expectedTree:.candidate.observed,observedTree:.candidate.observed} | .state="GATED_RESCAN_COMPLETED"' >"$rescan_input"
+  chmod 0600 "$rescan_input"
+  if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$rescan_input" >/dev/null 2>&1 ||
+     ! native_run journal-replace "$state_root" "$request_operation_id" "$rescan_input" live-tree-to-gated-rescan >/dev/null 2>&1; then
+    /usr/bin/rm -f -- "$rescan_input"; release_ordered_locks; emit_error indeterminate journal-indeterminate 5 LIVE_TREE_EXCHANGED
+  fi
+  /usr/bin/rm -f -- "$rescan_input"
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 GATED_RESCAN_COMPLETED; }
+  release_ordered_locks
+}
+
+o8_handle_gated_rescan_completed() {
+  o8_require_unlocked GATED_RESCAN_COMPLETED
+  authority_phase=post
+  set +e
+  commit_validate_authority
+  authority_status=$?
+  set -e
+  if (( authority_status != 0 )); then
+    [[ $authority_status == 1 ]] && emit_error unavailable "${authority_reason:-shell-authority-unavailable}" 4 GATED_RESCAN_COMPLETED
+    rollback_operation "release-precondition-${authority_reason:-indeterminate}"
+  fi
+  require_ordered_locks GATED_RESCAN_COMPLETED
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 GATED_RESCAN_COMPLETED; }
+  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == GATED_RESCAN_COMPLETED ]] || { release_ordered_locks; return 0; }
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1 || {
+    release_ordered_locks
+    emit_error indeterminate gated-rescan-authority-indeterminate 5 GATED_RESCAN_COMPLETED
+  }
+  if ! o8_gate_matches RESCAN_ACKNOWLEDGED; then
+    release_ordered_locks
+    emit_error indeterminate gated-rescan-authority-indeterminate 5 GATED_RESCAN_COMPLETED
+  fi
+  release_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-release.XXXXXX)
+  printf '%s' "$journal" | "$jq_bin" -cS --arg kind "$authority_observed_kind" --arg identity "$authority_observed_identity" --arg raw "$authority_observed_raw_hash" --arg projection "$authority_observed_projection_hash" --arg referenceState "$authority_observed_reference_state" --argjson epoch "$authority_observed_epoch" \
+    '.state="RELEASE_PENDING" | .release={outcome:"not-requested",shellInstance:null,generation:null,configurationEpoch:$epoch,source:{kind:$kind,identity:$identity},rawSha256:$raw,referenceProjection:$projection,referenceState:$referenceState,referencePolicy:.normalizedRequest.facts.expectedConfiguration.referencePolicy}' >"$release_input"
+  chmod 0600 "$release_input"
+  if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$release_input" >/dev/null 2>&1 ||
+     ! native_run journal-replace "$state_root" "$request_operation_id" "$release_input" gated-rescan-to-release-pending >/dev/null 2>&1; then
+    /usr/bin/rm -f -- "$release_input"; release_ordered_locks; emit_error indeterminate journal-indeterminate 5 GATED_RESCAN_COMPLETED
+  fi
+  /usr/bin/rm -f -- "$release_input"
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 RELEASE_PENDING; }
+  release_ordered_locks
+}
+
+o8_handle_release_pending() {
+  o8_require_unlocked RELEASE_PENDING
+  set +e
+  o8_gate_status_unlocked
+  gate_status=$?
+  set -e
+  (( gate_status == 0 )) || emit_error indeterminate release-acknowledgement-indeterminate 5 RELEASE_PENDING
+  case "$gate_state" in
+    RESCAN_ACKNOWLEDGED)
+      shell_result=""
+      set +e
+      shell_result=$(shell_call releaseTransactionPlugin "$request_operation_id" "$request_plugin_id" 2>/dev/null)
+      shell_status=$?
+      set -e
+      (( shell_status == 0 )) || rollback_operation release-request-failed
+      wait_shell_release_result || rollback_operation release-acknowledgement-indeterminate
+      o8_gate_status_unlocked || rollback_operation terminal-receipt-indeterminate
+      ;;
+    RELEASE_AUTHORIZED)
+      wait_shell_release_result || emit_error indeterminate release-acknowledgement-indeterminate 5 RELEASE_PENDING
+      o8_gate_status_unlocked || emit_error indeterminate terminal-receipt-indeterminate 5 RELEASE_PENDING
+      ;;
+    TERMINAL_RECEIPT) : ;;
+    GATED|UNLOAD_ACKNOWLEDGED) rollback_operation release-retained ;;
+    *) emit_error indeterminate release-gate-state-invalid 5 RELEASE_PENDING ;;
+  esac
+  [[ $gate_state == TERMINAL_RECEIPT ]] || emit_error indeterminate terminal-receipt-indeterminate 5 RELEASE_PENDING
+  require_ordered_locks RELEASE_PENDING
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 RELEASE_PENDING; }
+  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == RELEASE_PENDING ]] || { release_ordered_locks; return 0; }
+  o8_gate_matches TERMINAL_RECEIPT || { release_ordered_locks; emit_error indeterminate terminal-receipt-mismatch 5 RELEASE_PENDING; }
+  terminal_shell=$(printf '%s' "$gate_record" | "$jq_bin" -r '.terminalReceipt.shellInstance // .release.shellInstance')
+  terminal_generation=$(printf '%s' "$gate_record" | "$jq_bin" -r '.terminalReceipt.generation // .release.generation')
+  terminal_configuration_epoch=$(printf '%s' "$gate_record" | "$jq_bin" -r '.terminalReceipt.configurationEpoch // .release.configurationEpoch')
+  committed_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-committed.XXXXXX)
+  printf '%s' "$journal" | "$jq_bin" -cS --slurpfile receipt <(printf '%s' "$gate_record") --arg shell "$terminal_shell" --argjson generation "$terminal_generation" --argjson configurationEpoch "$terminal_configuration_epoch" \
+    '.state="COMMITTED" | .terminalReceipt=$receipt[0].terminalReceipt | .release={outcome:"authorized",shellInstance:$shell,generation:$generation,configurationEpoch:$configurationEpoch,source:.release.source,rawSha256:.release.rawSha256,referenceProjection:.release.referenceProjection,referenceState:.release.referenceState,referencePolicy:.release.referencePolicy}' >"$committed_input"
+  chmod 0600 "$committed_input"
+  if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$committed_input" >/dev/null 2>&1 ||
+     ! native_run journal-replace "$state_root" "$request_operation_id" "$committed_input" release-pending-to-committed >/dev/null 2>&1; then
+    /usr/bin/rm -f -- "$committed_input"; release_ordered_locks; emit_error indeterminate journal-indeterminate 5 RELEASE_PENDING
+  fi
+  /usr/bin/rm -f -- "$committed_input"
+  read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 COMMITTED; }
+  release_ordered_locks
+  reconcile_terminal_shell || emit_error indeterminate terminal-shell-reconciliation-required 5 COMMITTED
+  commit_result_from_journal COMMITTED
+}
+
+o8_handle_rollback_started() {
+  o8_require_unlocked ROLLBACK_STARTED
+  rollback_operation exact-rollback-retry
+}
+
+o8_handle_terminal_state() {
+  local terminal_state=$1
+  o8_require_unlocked "$terminal_state"
+  if [[ $terminal_state == COMMITTED || $terminal_state == ROLLED_BACK ]]; then
+    if ! reconcile_terminal_shell; then
+      emit_error indeterminate terminal-shell-reconciliation-required 5 "$terminal_state"
+    fi
+  fi
+  commit_result_from_journal "$terminal_state"
+}
+
 commit_operation() {
-  local stored_capability supplied_capability state operation destination candidate_path source_parent source_name dest_parent dest_name
-  local expected_candidate expected_active active_state active_identity mutation_result mutation_status
-  local competing_status
+  local stored_capability supplied_capability state dispatch_count=0
+  o8_require_unlocked commit
   if ! read_journal_authoritative; then
     [[ $journal_read_error == operation-not-found ]] && emit_error not-found operation-not-found 0
     [[ $journal_read_error == durability-indeterminate ]] && emit_error indeterminate journal-authority-indeterminate 5
@@ -1214,7 +1702,7 @@ commit_operation() {
   stored_capability=$(printf '%s' "$journal" | "$jq_bin" -r '.capabilityHash // ""')
   [[ $stored_capability =~ ^[0-9a-f]{64}$ ]] || emit_error manual-attention invalid-state 4
   if ! supplied_capability=$(printf '%s' "$operation_token" | native_run domain-hash omarchy-plugin-transaction-capability/v1 2>/dev/null); then
-    unset operation_token
+    unset operation_token stored_capability
     emit_error unavailable local-io-failure 4
   fi
   unset operation_token
@@ -1225,424 +1713,31 @@ commit_operation() {
   unset supplied_capability stored_capability
   request_plugin_id=$(printf '%s' "$journal" | "$jq_bin" -r '.pluginId // ""')
   [[ -n $request_plugin_id ]] || emit_error manual-attention invalid-state 4
-  state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
-  if ! load_commit_context_from_journal; then
-    emit_error manual-attention invalid-state 4 "$state"
-  fi
-  if [[ $(printf '%s' "$journal" | "$jq_bin" -r '.schema') == omarchy-plugin-transaction-journal/v1 ]]; then
-    [[ $state == STAGED ]] || commit_result_from_journal "$state"
-  else
-    case $state in
-      COMMITTED|ROLLED_BACK|REJECTED|RECOVERY_REQUIRED|MANUAL_ATTENTION) commit_result_from_journal "$state" ;;
-      ABORTED) emit_error rejected operation-aborted 3 "$state" ;;
-      STAGED) : ;;
-      COMMIT_PREPARED|LOAD_GATED|LIVE_TREE_EXCHANGED|GATED_RESCAN_COMPLETED|RELEASE_PENDING) : ;;
-      ROLLBACK_STARTED) rollback_operation exact-rollback-retry ;;
+  while (( dispatch_count < 24 )); do
+    dispatch_count=$((dispatch_count + 1))
+    read_journal_authoritative || {
+      [[ $journal_read_error == durability-indeterminate ]] && emit_error indeterminate journal-authority-indeterminate 5
+      emit_error manual-attention invalid-state 4
+    }
+    load_commit_context_from_journal || emit_error manual-attention invalid-state 4
+    state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
+    case "$state" in
+      STAGED) o8_handle_staged ;;
+      COMMIT_PREPARED) o8_handle_commit_prepared ;;
+      LOAD_GATED) o8_handle_load_gated ;;
+      LIVE_TREE_EXCHANGED) o8_handle_live_tree_exchanged ;;
+      GATED_RESCAN_COMPLETED) o8_handle_gated_rescan_completed ;;
+      RELEASE_PENDING) o8_handle_release_pending ;;
+      ROLLBACK_STARTED) o8_handle_rollback_started ;;
+      COMMITTED|ROLLED_BACK) o8_handle_terminal_state "$state" ;;
+      REJECTED|ABORTED) commit_result_from_journal "$state" ;;
+      RECOVERY_REQUIRED) emit_error indeterminate recovery-required 5 "$state" ;;
+      MANUAL_ATTENTION) emit_error manual-attention manual-attention 4 "$state" ;;
+      REQUEST_BOUND|PUBLICATION_INTENT) emit_error in-progress operation-in-progress 0 "$state" ;;
       *) emit_error manual-attention invalid-state 4 "$state" ;;
     esac
-  fi
-
-  # COMMIT_PREPARED is only a reservation. Before installing a gate, obtain
-  # one fresh O-6 shell observation and compare every immutable precondition.
-  # A journal already exists at this point, so stale facts are reported as an
-  # in-progress durable operation rather than a fabricated terminal rejection.
-  if [[ $state == STAGED || $state == COMMIT_PREPARED ]]; then
-    request_plugin_id=$(printf '%s' "$journal" | "$jq_bin" -r '.pluginId')
-    operation_kind=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.operation')
-    destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
-    active_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.state')
-    active_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.identity // ""')
-    expected_config_kind=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.kind')
-    expected_config_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.identity')
-    expected_projection=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referenceProjection')
-    expected_reference_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referenceState')
-    reference_policy=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referencePolicy')
-    set +e
-    commit_validate_authority
-    authority_status=$?
-    set -e
-    if (( authority_status != 0 )); then
-      if (( authority_status == 1 )); then
-        emit_error unavailable "${authority_reason:-shell-authority-unavailable}" 4 "$state"
-      fi
-      if [[ -n ${authority_reason:-} ]]; then
-        if [[ $state == STAGED ]]; then
-          reject_staged "$authority_reason"
-        else
-          reject_prepared "$authority_reason"
-        fi
-      fi
-      emit_error indeterminate "${authority_reason:-precondition-indeterminate}" 5 "$state"
-    fi
-  fi
-
-  set +e
-  acquire_ordered_locks
-  lock_status=$?
-  set -e
-  if (( lock_status != 0 )); then
-    (( lock_status == 5 )) && emit_error indeterminate lock-timeout 5 COMMIT_PREPARED
-    if (( lock_status == 3 )); then
-      if reject_competing_operation other; then
-        :
-      else
-        competing_status=$?
-        if (( competing_status == 2 )); then
-          emit_error indeterminate competing-operation-ambiguous 5 COMMIT_PREPARED
-        fi
-        emit_error unavailable lock-failure 4 COMMIT_PREPARED
-      fi
-    fi
-    emit_error unavailable lock-failure 4
-  fi
-  if ! read_journal_held; then
-    release_ordered_locks
-    emit_error indeterminate journal-authority-indeterminate 5
-  fi
-  state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
-  if [[ $state == STAGED ]]; then
-    if ! make_commit_prepared; then
-      release_ordered_locks
-      emit_error unavailable commit-preparation-failed 4
-    fi
-    state=COMMIT_PREPARED
-  fi
-  if [[ $state == LOAD_GATED ]]; then
-    expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed')
-    destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
-    operation=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.operation')
-    active_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.identity // ""')
-  fi
-  if [[ $state == COMMIT_PREPARED || $state == LOAD_GATED ]]; then
-    if [[ $state == COMMIT_PREPARED ]]; then
-    candidate_path=$candidate_store/$request_operation_id/candidate
-    expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed')
-    [[ -d $candidate_path && ! -L $candidate_path ]] || reject_prepared stale-candidate
-    [[ $(native_run identity "$candidate_path" 2>/dev/null || true) == "$expected_candidate" ]] || reject_prepared stale-candidate
-    destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
-    operation=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.operation')
-    active_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.state')
-    active_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedActive.identity // ""')
-    if [[ $operation == install ]]; then
-      [[ $destination == "$discovery_dir/$request_plugin_id" && ! -e $destination && ! -L $destination ]] || reject_prepared stale-active-tree
-    else
-      validate_update_destination "$destination" || reject_prepared stale-active-tree
-      [[ -d $destination && ! -L $destination ]] || reject_prepared stale-active-tree
-      [[ $(native_run identity "$destination" 2>/dev/null || true) == "$active_identity" ]] || reject_prepared stale-active-tree
-    fi
-    if ! native_run atomic-support >/dev/null 2>&1 ||
-       [[ $(stat -c %d "$candidate_store/$request_operation_id" 2>/dev/null || true) != "$(stat -c %d "$discovery_dir" 2>/dev/null || true)" ]]; then
-      if ! write_journal_transition commit-prepared-to-staged '.state="STAGED" | .reason=null'; then
-        release_ordered_locks
-        emit_error indeterminate journal-indeterminate 5 COMMIT_PREPARED
-      fi
-      release_ordered_locks
-      emit_error unavailable unsupported-atomic-operation 4 STAGED
-    fi
-    release_ordered_locks
-    if ! shell_call gateTransactionPlugin "$request_operation_id" "$request_plugin_id" >/dev/null 2>&1; then
-      emit_error unavailable shell-authority-unavailable 4 COMMIT_PREPARED
-    fi
-    wait_shell_transaction_status gate-installed-unload-acknowledged || true
-    if ! wait_gate_state UNLOAD_ACKNOWLEDGED; then
-      current_gate=$(read_gate_state "$request_plugin_id" 2>/dev/null || true)
-      [[ $current_gate == GATED ]] && emit_error in-progress unload-pending 0 COMMIT_PREPARED
-      emit_error indeterminate unload-acknowledgement-indeterminate 5 COMMIT_PREPARED
-    fi
-    if ! acquire_ordered_locks || ! read_journal_held; then
-      release_ordered_locks
-      emit_error indeterminate journal-authority-indeterminate 5
-    fi
-    [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == COMMIT_PREPARED ]] || { release_ordered_locks; emit_error manual-attention operation-state-mismatch 4; }
-    gate_path=$state_root/gates/$request_plugin_id.gate
-    [[ -f $gate_path ]] || { release_ordered_locks; emit_error indeterminate gate-missing 5; }
-    [[ $(read_gate_state "$request_plugin_id") == UNLOAD_ACKNOWLEDGED ]] || { release_ordered_locks; emit_error indeterminate unload-acknowledgement-indeterminate 5; }
-    # The unload acknowledgement is a barrier, not a pre-exposure authority
-    # snapshot.  Re-read the same O-6 producer while the ordered locks are
-    # held, immediately before recording LOAD_GATED and exposing the tree.
-    # The observation itself is a shell IPC read and must not run while the
-    # coordinator's transaction locks are held; release and reacquire them
-    # around that bounded read, then validate the durable gate again.
-    expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed')
-    release_ordered_locks
-    authority_phase=pre
-    set +e
-    commit_validate_authority
-    authority_status=$?
-    set -e
-    if ! acquire_ordered_locks || ! read_journal_held; then
-      release_ordered_locks
-      emit_error indeterminate journal-authority-indeterminate 5 COMMIT_PREPARED
-    fi
-    gate_path=$state_root/gates/$request_plugin_id.gate
-    [[ -f $gate_path && $(read_gate_state "$request_plugin_id") == UNLOAD_ACKNOWLEDGED ]] || {
-      release_ordered_locks
-      emit_error indeterminate unload-acknowledgement-indeterminate 5 COMMIT_PREPARED
-    }
-    [[ $(jq -r '.operationId' "$gate_path") == "$request_operation_id" &&
-       $(jq -r '.pluginId' "$gate_path") == "$request_plugin_id" &&
-       $(jq -r '.operationBindingSha256 // ""' "$gate_path") == $(printf '%s' "$journal" | "$jq_bin" -r '.operationBindingSha256') ]] || {
-      release_ordered_locks
-      emit_error manual-attention operation-binding-mismatch 4 COMMIT_PREPARED
-    }
-    [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == COMMIT_PREPARED ]] || {
-      release_ordered_locks
-      emit_error manual-attention operation-state-mismatch 4 COMMIT_PREPARED
-    }
-    if (( authority_status != 0 )); then
-      reason=${authority_reason:-pre-exposure-authority-indeterminate}
-      mark_recovery "pre-exposure-$reason" COMMIT_PREPARED
-    fi
-    if ! write_journal_transition commit-prepared-to-load-gated '.state="LOAD_GATED" | .gate="established" | .namespaceIntent.state="intended"'; then
-      release_ordered_locks
-      emit_error indeterminate journal-indeterminate 5
-    fi
-    else
-      gate_path=$state_root/gates/$request_plugin_id.gate
-      [[ -f $gate_path && ! -L $gate_path ]] || { release_ordered_locks; emit_error indeterminate gate-missing 5 LOAD_GATED; }
-      [[ $(read_gate_state "$request_plugin_id") == UNLOAD_ACKNOWLEDGED ]] || { release_ordered_locks; emit_error indeterminate unload-acknowledgement-indeterminate 5 LOAD_GATED; }
-      [[ $(printf '%s' "$journal" | "$jq_bin" -r '.namespaceIntent.state') == intended &&
-         $(printf '%s' "$journal" | "$jq_bin" -r '.gate') == established &&
-         $(jq -r .operationBindingSha256 "$gate_path") == $(printf '%s' "$journal" | "$jq_bin" -r '.operationBindingSha256') ]] || {
-        release_ordered_locks
-        emit_error manual-attention operation-binding-mismatch 4 LOAD_GATED
-      }
-      expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed')
-      release_ordered_locks
-      authority_phase=pre
-      set +e
-      commit_validate_authority
-      authority_status=$?
-      set -e
-      if ! acquire_ordered_locks || ! read_journal_held; then
-        release_ordered_locks
-        emit_error indeterminate journal-authority-indeterminate 5 LOAD_GATED
-      fi
-      gate_path=$state_root/gates/$request_plugin_id.gate
-      [[ -f $gate_path && $(read_gate_state "$request_plugin_id") == UNLOAD_ACKNOWLEDGED ]] || {
-        release_ordered_locks
-        emit_error indeterminate unload-acknowledgement-indeterminate 5 LOAD_GATED
-      }
-      [[ $(jq -r '.operationId' "$gate_path") == "$request_operation_id" &&
-         $(jq -r '.pluginId' "$gate_path") == "$request_plugin_id" &&
-         $(jq -r '.operationBindingSha256 // ""' "$gate_path") == $(printf '%s' "$journal" | "$jq_bin" -r '.operationBindingSha256') ]] || {
-        release_ordered_locks
-        emit_error manual-attention operation-binding-mismatch 4 LOAD_GATED
-      }
-      [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == LOAD_GATED ]] || {
-        release_ordered_locks
-        emit_error manual-attention operation-state-mismatch 4 LOAD_GATED
-      }
-      if (( authority_status != 0 )); then
-        reason=${authority_reason:-pre-exposure-authority-indeterminate}
-        mark_recovery "pre-exposure-$reason" LOAD_GATED
-      fi
-    fi
-    destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
-    source_parent=$candidate_store/$request_operation_id
-    source_name=candidate
-    dest_parent=$(/usr/bin/dirname -- "$destination")
-    dest_name=$(/usr/bin/basename -- "$destination")
-    if [[ $operation == install ]]; then
-      mutation_result=$(native_run namespace-mutate install "$source_parent" "$source_name" "$dest_parent" "$dest_name" "$expected_candidate" "$expected_candidate" 2>/dev/null) || mutation_status=$?
-    else
-      mutation_result=$(native_run namespace-mutate exchange "$source_parent" "$source_name" "$dest_parent" "$dest_name" "$expected_candidate" "$active_identity" 2>/dev/null) || mutation_status=$?
-    fi
-    mutation_status=${mutation_status:-0}
-    mutation_outcome=$(printf '%s' "$mutation_result" | "$jq_bin" -r '.status // "invalid-result"' 2>/dev/null || printf '%s' invalid-result)
-    if (( mutation_status != 0 )); then
-      case $mutation_status in
-        2) mark_recovery stale-namespace-precondition LOAD_GATED ;;
-        3) mark_recovery namespace-not-performed LOAD_GATED ;;
-        4) mark_recovery unsupported-atomic-operation LOAD_GATED ;;
-        5) mark_recovery namespace-indeterminate LOAD_GATED ;;
-        *) mark_recovery namespace-io-failure LOAD_GATED ;;
-      esac
-    fi
-    case $mutation_outcome in
-      completed-durable) : ;;
-      completed-and-exactly-compensated) mark_recovery namespace-compensated LOAD_GATED ;;
-      stale-candidate|stale-active-tree|destination-unexpectedly-present|exact-postcheck-mismatch|definitely-not-performed)
-        mark_recovery namespace-not-performed LOAD_GATED ;;
-      unsupported-atomic-operation) mark_recovery unsupported-atomic-operation LOAD_GATED ;;
-      indeterminate-namespace|invalid-result) mark_recovery namespace-indeterminate LOAD_GATED ;;
-      *) mark_recovery namespace-io-failure LOAD_GATED ;;
-    esac
-    if [[ $operation == update ]]; then
-      live_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-live.XXXXXX)
-      printf '%s' "$journal" | "$jq_bin" -cS --arg prior "$active_identity" --arg slot "$request_operation_id" \
-        '.namespaceIntent.state="completed" | .state="LIVE_TREE_EXCHANGED" | .retainedPrior={state:"captured",identity:$prior,slot:$slot}' >"$live_input"
-    else
-      live_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-live.XXXXXX)
-      printf '%s' "$journal" | "$jq_bin" -cS '.namespaceIntent.state="completed" | .state="LIVE_TREE_EXCHANGED" | .retainedPrior={state:"absent",identity:null,slot:null}' >"$live_input"
-    fi
-    chmod 0600 "$live_input"
-    if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$live_input" >/dev/null 2>&1 || ! native_run journal-replace "$state_root" "$request_operation_id" "$live_input" load-gated-to-live-tree-exchanged >/dev/null 2>&1; then
-      /usr/bin/rm -f -- "$live_input"
-      release_ordered_locks
-      emit_error indeterminate journal-indeterminate 5 LIVE_TREE_EXCHANGED
-    fi
-    /usr/bin/rm -f -- "$live_input"
-    read_journal_held
-    release_ordered_locks
-  fi
-  state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
-  if [[ $state == LIVE_TREE_EXCHANGED ]]; then
-    shell_call rescanGatedPlugin "$request_operation_id" "$request_plugin_id" >/dev/null 2>&1 || rollback_operation rescan-request-failed
-    wait_shell_transaction_status gated-rescan-complete || true
-    wait_gate_state RESCAN_ACKNOWLEDGED || rollback_operation rescan-acknowledgement-indeterminate
-    require_ordered_locks LIVE_TREE_EXCHANGED
-    read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5; }
-    gate_path=$state_root/gates/$request_plugin_id.gate
-    rescan_shell=$("$jq_bin" -r '.rescan.shellInstance' "$gate_path")
-    rescan_generation=$("$jq_bin" -r '.rescan.generation' "$gate_path")
-    rescan_epoch=$("$jq_bin" -r '.rescan.scanEpoch' "$gate_path")
-    rescan_source=$("$jq_bin" -r '.rescan.sourceDirectory' "$gate_path")
-    rescan_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-rescan.XXXXXX)
-    printf '%s' "$journal" | "$jq_bin" -cS --arg shell "$rescan_shell" --argjson generation "$rescan_generation" --argjson scanEpoch "$rescan_epoch" --arg source "$rescan_source" \
-      '.rescan={outcome:"completed",shellInstance:$shell,generation:$generation,scanEpoch:$scanEpoch,sourceDirectory:$source,expectedTree:.candidate.observed,observedTree:.candidate.observed} | .state="GATED_RESCAN_COMPLETED"' >"$rescan_input"
-    chmod 0600 "$rescan_input"
-    "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$rescan_input" >/dev/null 2>&1 || { /usr/bin/rm -f -- "$rescan_input"; release_ordered_locks; emit_error manual-attention invalid-generated-state 4; }
-    native_run journal-replace "$state_root" "$request_operation_id" "$rescan_input" live-tree-to-gated-rescan >/dev/null 2>&1 || { /usr/bin/rm -f -- "$rescan_input"; release_ordered_locks; emit_error indeterminate journal-indeterminate 5; }
-    /usr/bin/rm -f -- "$rescan_input"
-    read_journal_held
-    # Rescan acknowledgement is not a release snapshot.  Re-read the
-    # authoritative O-6 configuration and exact live candidate immediately
-    # before RELEASE_PENDING is made durable.
-    operation_kind=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.operation')
-    destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
-    expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed')
-    expected_config_kind=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.kind')
-    expected_config_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.identity')
-    expected_projection=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referenceProjection')
-    expected_reference_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referenceState')
-    reference_policy=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referencePolicy')
-    # Final authority observation is a shell IPC read, not a transaction-lock
-    # operation.  Do not hold the ordered coordinator locks while obtaining
-    # it; reacquire and revalidate the exact rescan gate before persisting
-    # RELEASE_PENDING.
-    release_ordered_locks
-    authority_phase=post
-    set +e
-    commit_validate_authority
-    authority_status=$?
-    set -e
-    if ! acquire_ordered_locks || ! read_journal_held; then
-      release_ordered_locks
-      emit_error indeterminate journal-authority-indeterminate 5 GATED_RESCAN_COMPLETED
-    fi
-    gate_path=$state_root/gates/$request_plugin_id.gate
-    [[ -f $gate_path && $(read_gate_state "$request_plugin_id") == RESCAN_ACKNOWLEDGED ]] || {
-      release_ordered_locks
-      emit_error indeterminate gated-rescan-authority-indeterminate 5 GATED_RESCAN_COMPLETED
-    }
-    [[ $(jq -r '.operationId' "$gate_path") == "$request_operation_id" &&
-       $(jq -r '.pluginId' "$gate_path") == "$request_plugin_id" &&
-       $(jq -r '.operationBindingSha256 // ""' "$gate_path") == $(printf '%s' "$journal" | "$jq_bin" -r '.operationBindingSha256') ]] || {
-      release_ordered_locks
-      emit_error manual-attention operation-binding-mismatch 4 GATED_RESCAN_COMPLETED
-    }
-    [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == GATED_RESCAN_COMPLETED ]] || {
-      release_ordered_locks
-      emit_error manual-attention operation-state-mismatch 4 GATED_RESCAN_COMPLETED
-    }
-    if (( authority_status != 0 )); then
-      reason=${authority_reason:-release-precondition-indeterminate}
-      release_ordered_locks
-      rollback_operation "release-precondition-$reason"
-    fi
-    release_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-release.XXXXXX)
-    printf '%s' "$journal" | "$jq_bin" -cS --arg kind "$authority_observed_kind" --arg identity "$authority_observed_identity" --arg raw "$authority_observed_raw_hash" --arg projection "$authority_observed_projection_hash" --arg referenceState "$authority_observed_reference_state" --argjson epoch "$authority_observed_epoch" \
-      '.state="RELEASE_PENDING" | .release={outcome:"not-requested",shellInstance:null,generation:null,configurationEpoch:$epoch,source:{kind:$kind,identity:$identity},rawSha256:$raw,referenceProjection:$projection,referenceState:$referenceState,referencePolicy:.normalizedRequest.facts.expectedConfiguration.referencePolicy}' >"$release_input"
-    chmod 0600 "$release_input"
-    "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$release_input" >/dev/null 2>&1 || { /usr/bin/rm -f -- "$release_input"; release_ordered_locks; emit_error manual-attention invalid-generated-state 4; }
-    native_run journal-replace "$state_root" "$request_operation_id" "$release_input" gated-rescan-to-release-pending >/dev/null 2>&1 || { /usr/bin/rm -f -- "$release_input"; release_ordered_locks; emit_error indeterminate journal-indeterminate 5; }
-    /usr/bin/rm -f -- "$release_input"
-    read_journal_held
-    release_ordered_locks
-  fi
-  state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
-  if [[ $state == GATED_RESCAN_COMPLETED ]]; then
-    if ! acquire_ordered_locks || ! read_journal_held; then
-      release_ordered_locks
-      emit_error indeterminate journal-authority-indeterminate 5 GATED_RESCAN_COMPLETED
-    fi
-    gate_path=$state_root/gates/$request_plugin_id.gate
-    [[ -f $gate_path && ! -L $gate_path && $(read_gate_state "$request_plugin_id") == RESCAN_ACKNOWLEDGED ]] || {
-      release_ordered_locks
-      emit_error indeterminate gated-rescan-authority-indeterminate 5 GATED_RESCAN_COMPLETED
-    }
-    [[ $(jq -r .operationBindingSha256 "$gate_path") == $(printf '%s' "$journal" | "$jq_bin" -r '.operationBindingSha256') ]] || {
-      release_ordered_locks
-      emit_error manual-attention operation-binding-mismatch 4 GATED_RESCAN_COMPLETED
-    }
-    operation_kind=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.operation')
-    destination=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.destination')
-    expected_candidate=$(printf '%s' "$journal" | "$jq_bin" -r '.candidate.observed')
-    expected_config_kind=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.kind')
-    expected_config_identity=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.source.identity')
-    expected_projection=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referenceProjection')
-    expected_reference_state=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referenceState')
-    reference_policy=$(printf '%s' "$journal" | "$jq_bin" -r '.normalizedRequest.facts.expectedConfiguration.referencePolicy')
-    authority_phase=post
-    set +e
-    commit_validate_authority
-    authority_status=$?
-    set -e
-    if (( authority_status != 0 )); then
-      reason=${authority_reason:-release-precondition-indeterminate}
-      release_ordered_locks
-      rollback_operation "release-precondition-$reason"
-    fi
-    release_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-release.XXXXXX)
-    printf '%s' "$journal" | "$jq_bin" -cS --arg kind "$authority_observed_kind" --arg identity "$authority_observed_identity" --arg raw "$authority_observed_raw_hash" --arg projection "$authority_observed_projection_hash" --arg referenceState "$authority_observed_reference_state" --argjson epoch "$authority_observed_epoch" \
-      '.state="RELEASE_PENDING" | .release={outcome:"not-requested",shellInstance:null,generation:null,configurationEpoch:$epoch,source:{kind:$kind,identity:$identity},rawSha256:$raw,referenceProjection:$projection,referenceState:$referenceState,referencePolicy:.normalizedRequest.facts.expectedConfiguration.referencePolicy}' >"$release_input"
-    chmod 0600 "$release_input"
-    if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$release_input" >/dev/null 2>&1 ||
-       ! native_run journal-replace "$state_root" "$request_operation_id" "$release_input" gated-rescan-to-release-pending >/dev/null 2>&1; then
-      /usr/bin/rm -f -- "$release_input"
-      release_ordered_locks
-      emit_error indeterminate journal-indeterminate 5 GATED_RESCAN_COMPLETED
-    fi
-    /usr/bin/rm -f -- "$release_input"
-    read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 GATED_RESCAN_COMPLETED; }
-    release_ordered_locks
-  fi
-  state=$(printf '%s' "$journal" | "$jq_bin" -r '.state')
-  if [[ $state == RELEASE_PENDING ]]; then
-    terminal_gate_state=$(read_gate_state "$request_plugin_id" 2>/dev/null || true)
-    if [[ $terminal_gate_state != TERMINAL_RECEIPT ]]; then
-      shell_call releaseTransactionPlugin "$request_operation_id" "$request_plugin_id" >/dev/null 2>&1 || rollback_operation release-request-failed
-      wait_shell_transaction_status released || true
-      terminal_gate_state=$(read_gate_state "$request_plugin_id" 2>/dev/null || true)
-      if [[ $terminal_gate_state != TERMINAL_RECEIPT ]]; then
-        wait_gate_state RELEASE_AUTHORIZED || rollback_operation release-acknowledgement-indeterminate
-      fi
-      # The real shell requests the terminal receipt only after it has
-      # published in-memory eligibility.  The coordinator must wait for that
-      # authoritative durable handoff rather than issuing a receipt request
-      # while the release callback is still pending.
-      wait_gate_state TERMINAL_RECEIPT || rollback_operation terminal-receipt-indeterminate
-    fi
-    reconcile_terminal_shell || emit_error indeterminate terminal-shell-reconciliation-required 5 RELEASE_PENDING
-    require_ordered_locks RELEASE_PENDING
-    read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5; }
-    gate_path=$state_root/gates/$request_plugin_id.gate
-    "$jq_bin" -e --arg binding "$(printf '%s' "$journal" | "$jq_bin" -r '.operationBindingSha256')" --arg op "$request_operation_id" --arg plugin "$request_plugin_id" '.state == "TERMINAL_RECEIPT" and .terminalReceipt.state == "durable" and .terminalReceipt.intendedJournalState == "COMMITTED" and .operationBindingSha256 == $binding and .operationId == $op and .pluginId == $plugin' "$gate_path" >/dev/null 2>&1 || { release_ordered_locks; rollback_operation terminal-receipt-mismatch; }
-    terminal_shell=$("$jq_bin" -r '.release.shellInstance' "$gate_path")
-    terminal_generation=$("$jq_bin" -r '.release.generation' "$gate_path")
-    terminal_configuration_epoch=$("$jq_bin" -r '.release.configurationEpoch' "$gate_path")
-    committed_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-committed.XXXXXX)
-    printf '%s' "$journal" | "$jq_bin" -cS --slurpfile receipt "$gate_path" --arg shell "$terminal_shell" --argjson generation "$terminal_generation" --argjson configurationEpoch "$terminal_configuration_epoch" \
-      '.state="COMMITTED" | .terminalReceipt=$receipt[0].terminalReceipt | .release={outcome:"authorized",shellInstance:$shell,generation:$generation,configurationEpoch:$configurationEpoch,source:.release.source,rawSha256:.release.rawSha256,referenceProjection:.release.referenceProjection,referenceState:.release.referenceState,referencePolicy:.release.referencePolicy}' >"$committed_input"
-    chmod 0600 "$committed_input"
-    "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$committed_input" >/dev/null 2>&1 || { /usr/bin/rm -f -- "$committed_input"; release_ordered_locks; emit_error manual-attention invalid-generated-state 4; }
-    native_run journal-replace "$state_root" "$request_operation_id" "$committed_input" release-pending-to-committed >/dev/null 2>&1 || { /usr/bin/rm -f -- "$committed_input"; release_ordered_locks; emit_error indeterminate journal-indeterminate 5; }
-    /usr/bin/rm -f -- "$committed_input"
-    read_journal_held
-    release_ordered_locks
-  fi
-    commit_result_from_journal "$(printf '%s' "$journal" | "$jq_bin" -r '.state')"
+  done
+  emit_error indeterminate dispatch-limit 5 "$state"
 }
 
 [[ -x $jq_bin && -x $base64_bin && -x $sha256_bin ]] || {
