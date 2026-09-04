@@ -61,7 +61,7 @@ cp -a "$SOURCE_ROOT/native" "$test_root/native"
 # The O-8 terminal handoff mode invokes the production transaction wrapper.
 # Give it a copied package root so package-relative helpers and shell IPC target
 # the same isolated offscreen shell as this harness.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
   rm "$test_root/bin"
   mkdir "$test_root/bin"
   cp "$SOURCE_ROOT/bin/omarchy-plugin-transaction" "$SOURCE_ROOT/bin/omarchy-shell" \
@@ -89,8 +89,25 @@ fi
 mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
   -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
   "$SOURCE_ROOT/native/plugin-transaction/plugin-tree.c" -o "$helper"
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
   cp "$helper" "$test_root/native/plugin-transaction/plugin-tree"
+fi
+if [[ $EXPECTATION == o8-load-gated-authority ]]; then
+  mv "$test_root/native/plugin-transaction/plugin-tree" "$test_root/native/plugin-transaction/plugin-tree.real"
+  cat >"$test_root/native/plugin-transaction/plugin-tree" <<'SH'
+#!/bin/bash
+set -euo pipefail
+tmp_root=$(cd "$(dirname "$0")/../../.." && pwd)
+hold="$tmp_root/runtime/omarchy-o8-load-gated/hold-before-namespace"
+ready="$tmp_root/runtime/omarchy-o8-load-gated/namespace-ready"
+resume="$tmp_root/runtime/omarchy-o8-load-gated/namespace-resume"
+if [[ ${1:-} == namespace-mutate && -e "$hold" ]]; then
+  : >"$ready"
+  IFS= read -r _ <"$resume"
+fi
+exec "${0}.real" "$@"
+SH
+  chmod 0755 "$test_root/native/plugin-transaction/plugin-tree"
 fi
 
 service_id=acme.lifecycle-service
@@ -103,6 +120,7 @@ o8_terminal_id=acme.lifecycle-o8-terminal
 o8_replay_live_id=acme.lifecycle-o8-replay-live
 o8_replay_rescan_id=acme.lifecycle-o8-replay-rescan
 o8_replay_release_id=acme.lifecycle-o8-replay-release
+o8_load_id=acme.lifecycle-o8-load-gated
 for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id" "$selected_bar_id" "$indeterminate_id" "$o8_terminal_id"; do
   live="$plugin_dir/$plugin"
   candidate="$TMPDIR/candidate-$plugin"
@@ -145,7 +163,7 @@ done
 # This operation is a fresh install: retain the source outside discovery while
 # the active destination is absent.  The ordinary lifecycle cases keep their
 # pre-existing active fixtures.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
   rm -rf "$plugin_dir/$o8_terminal_id"
 fi
 
@@ -275,7 +293,7 @@ mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFO
 mkfifo "$OMARCHY_LIFECYCLE_BEFORE_RESCAN_RESUME" "$OMARCHY_LIFECYCLE_AFTER_RESCAN_RESUME" \
   "$OMARCHY_LIFECYCLE_BEFORE_RELEASE_RESUME"
 export QT_QPA_PLATFORM=offscreen
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
   # The production wrapper forwards WAYLAND_DISPLAY (but not DISPLAY) to qs;
   # retain the isolated harness's display identity so its real QML process is
   # discoverable without contacting the desktop shell.
@@ -341,6 +359,127 @@ expected_raw=$(sha256sum "$config_file" | cut -d' ' -f1)
 observed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$stage_observation" | base64 -d | sha256sum | cut -d' ' -f1)
 [[ $observed_projection == "$initial_service_projection" ]] || fail "production transaction observation bypassed canonical projection"
 pass "production stage observation uses the live accepted O-6 snapshot and canonical projection"
+
+if [[ $EXPECTATION == o8-load-gated-authority ]]; then
+  # Drive a real install through the production stage/commit route until its
+  # durable LOAD_GATED image, then kill the coordinator before native exposure.
+  # The next coordinator must obtain a fresh O-6 observation before it can
+  # promote or mutate the namespace.
+  o8_load_operation=63000000-0000-4000-8000-000000000010
+  kill_process_tree() {
+    local parent=$1 child
+    for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+      kill_process_tree "$child"
+    done
+    kill "$parent" 2>/dev/null || true
+  }
+  o8_load_source="$TMPDIR/candidate-$o8_load_id"
+  mkdir -p "$o8_load_source"
+  cp "$FIXTURE_ROOT/Service.qml" "$o8_load_source/Service.qml"
+  jq --arg id "$o8_load_id" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
+    "$FIXTURE_ROOT/manifest.json" >"$o8_load_source/manifest.json"
+  o8_load_identity=$($helper identity "$o8_load_source")
+  o8_load_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$(shell_ipc shell transactionStageObservation "$o8_load_id")" | base64 -d | sha256sum | cut -d' ' -f1)
+  o8_load_token=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE
+  o8_load_request=$(jq -cn --arg operationId "$o8_load_operation" --arg token "$o8_load_token" \
+    --arg pluginId "$o8_load_id" --arg source "$o8_load_source" \
+    --arg digest "sha256:${o8_load_identity#omarchy-runtime-tree-sha256-v1:}" \
+    --arg projection "$o8_load_projection" '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",
+      operationId:$operationId,operationToken:$token,operation:"install",pluginId:$pluginId,
+      source:{kind:"directory",path:$source},candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest},
+      expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+      referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+  printf '%s' "$o8_load_request" | "$test_root/bin/omarchy-plugin-transaction" >/dev/null ||
+    fail "LOAD_GATED authority stage was not accepted"
+  load_runtime="$runtime_dir/omarchy-o8-load-gated"
+  mkdir -p "$load_runtime"
+  : >"$load_runtime/hold-before-namespace"
+  rm -f "$load_runtime/namespace-ready" "$load_runtime/namespace-resume"
+  mkfifo "$load_runtime/namespace-resume"
+  o8_load_commit=$(jq -cn --arg operationId "$o8_load_operation" --arg token "$o8_load_token" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
+  set +e
+  printf '%s' "$o8_load_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load-owner-result" 2>"$TMPDIR/load-owner-error" &
+  load_owner=$!
+  REPLAY_OWNER_PID=$load_owner
+  set -e
+  wait_for "LOAD_GATED namespace barrier" \
+    '[[ -e $load_runtime/namespace-ready && $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$o8_load_operation.journal" 2>/dev/null || true) == LOAD_GATED ]] && kill -0 "$load_owner" 2>/dev/null'
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_load_id.gate") == UNLOAD_ACKNOWLEDGED ]] ||
+    fail "LOAD_GATED image did not retain UNLOAD_ACKNOWLEDGED gate"
+  [[ ! -e "$plugin_dir/$o8_load_id" && -d "$state_dir/omarchy/plugin-candidates-v1/$o8_load_operation/candidate" ]] ||
+    fail "LOAD_GATED image was not inert"
+  kill_process_tree "$load_owner"
+  wait "$load_owner" 2>/dev/null || true
+  REPLAY_OWNER_PID=""
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$o8_load_operation.journal") == LOAD_GATED ]] ||
+    fail "coordinator did not die at LOAD_GATED"
+  rm -f "$load_runtime/hold-before-namespace" "$load_runtime/namespace-ready"
+  rm -f "$load_runtime/namespace-resume"
+  printf '%s\n' resume >"$load_runtime/namespace-resume" 2>/dev/null || true
+  # A fresh coordinator with unchanged authority must reconcile and perform
+  # exactly one forward mutation before continuing through the real shell.
+  set +e
+  printf '%s' "$o8_load_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load-fresh-result" 2>"$TMPDIR/load-fresh-error"
+  load_status=$?
+  set -e
+  (( load_status == 0 )) || { sed -n '1,120p' "$TMPDIR/load-fresh-error" >&2; cat "$TMPDIR/load-fresh-result" >&2; fail "fresh LOAD_GATED replay failed"; }
+  jq -e --arg op "$o8_load_operation" '.operationId==$op and .state=="COMMITTED" and .status=="committed"' \
+    "$TMPDIR/load-fresh-result" >/dev/null || fail "fresh unchanged LOAD_GATED replay did not commit"
+  [[ -d "$plugin_dir/$o8_load_id" && $($helper identity "$plugin_dir/$o8_load_id") == "$o8_load_identity" ]] ||
+    fail "fresh LOAD_GATED replay did not expose the exact candidate"
+  pass "real-QML fresh LOAD_GATED replay obtains fresh authority and performs one forward mutation"
+
+  # A second fresh LOAD_GATED image with an independently changed candidate
+  # must remain gated and enter the documented post-gate recovery result.
+  o8_load2_id=acme.lifecycle-o8-load-gated-changed
+  o8_load2_operation=63000000-0000-4000-8000-000000000011
+  o8_load2_source="$TMPDIR/candidate-$o8_load2_id"
+  mkdir -p "$o8_load2_source"
+  cp "$FIXTURE_ROOT/Service.qml" "$o8_load2_source/Service.qml"
+  jq --arg id "$o8_load2_id" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
+    "$FIXTURE_ROOT/manifest.json" >"$o8_load2_source/manifest.json"
+  o8_load2_identity=$($helper identity "$o8_load2_source")
+  o8_load2_projection=$o8_load_projection
+  o8_load2_token=QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI
+  o8_load2_request=$(jq -cn --arg operationId "$o8_load2_operation" --arg token "$o8_load2_token" \
+    --arg pluginId "$o8_load2_id" --arg source "$o8_load2_source" \
+    --arg digest "sha256:${o8_load2_identity#omarchy-runtime-tree-sha256-v1:}" \
+    --arg projection "$o8_load2_projection" '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",
+      operationId:$operationId,operationToken:$token,operation:"install",pluginId:$pluginId,
+      source:{kind:"directory",path:$source},candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest},
+      expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+      referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+  printf '%s' "$o8_load2_request" | "$test_root/bin/omarchy-plugin-transaction" >/dev/null ||
+    fail "changed-candidate LOAD_GATED stage was not accepted"
+  : >"$load_runtime/hold-before-namespace"
+  rm -f "$load_runtime/namespace-ready" "$load_runtime/namespace-resume"
+  mkfifo "$load_runtime/namespace-resume"
+  o8_load2_commit=$(jq -cn --arg operationId "$o8_load2_operation" --arg token "$o8_load2_token" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
+  printf '%s' "$o8_load2_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load2-owner-result" 2>"$TMPDIR/load2-owner-error" &
+  load2_owner=$!
+  REPLAY_OWNER_PID=$load2_owner
+  wait_for "changed-candidate LOAD_GATED namespace barrier" \
+    '[[ -e $load_runtime/namespace-ready && $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$o8_load2_operation.journal" 2>/dev/null || true) == LOAD_GATED ]] && kill -0 "$load2_owner" 2>/dev/null'
+  kill_process_tree "$load2_owner"
+  wait "$load2_owner" 2>/dev/null || true
+  REPLAY_OWNER_PID=""
+  printf '\nchanged-after-gate\n' >>"$state_dir/omarchy/plugin-candidates-v1/$o8_load2_operation/candidate/Service.qml"
+  rm -f "$load_runtime/hold-before-namespace" "$load_runtime/namespace-ready" "$load_runtime/namespace-resume"
+  set +e
+  printf '%s' "$o8_load2_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load2-fresh-result" 2>"$TMPDIR/load2-fresh-error"
+  load2_status=$?
+  set -e
+  (( load2_status != 0 )) || fail "changed candidate falsely completed from LOAD_GATED"
+  jq -e --arg op "$o8_load2_operation" '.operationId==$op and .state=="RECOVERY_REQUIRED" and .status=="indeterminate"' \
+    "$TMPDIR/load2-fresh-result" >/dev/null || fail "changed candidate did not produce post-gate recovery result"
+  [[ ! -e "$plugin_dir/$o8_load2_id" ]] || fail "changed candidate was exposed"
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_load2_id.gate") == UNLOAD_ACKNOWLEDGED ]] ||
+    fail "changed candidate lost its blocking gate"
+  pass "real-QML fresh LOAD_GATED candidate change is fail-closed without mutation"
+  exit 0
+fi
 
 if [[ $EXPECTATION == o8-dispatch-replay ]]; then
   declare -A replay_tokens replay_operations
