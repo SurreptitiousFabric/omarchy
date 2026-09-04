@@ -91,7 +91,7 @@ lock_operation_then_plugin() {
 }
 
 load_operation() {
-  local operation_id=$1 plugin_id=$2
+  local operation_id=$1 plugin_id=$2 allow_terminal=${3:-0}
   valid_operation "$operation_id" || fail invalid-operation-id "$operation_id"
   valid_plugin "$plugin_id" || fail invalid-plugin-id "$plugin_id"
   "$helper" state-init "$state_root"
@@ -121,9 +121,12 @@ load_operation() {
         "$helper" domain-hash omarchy-plugin-transaction-operation-binding/v1 2>/dev/null) ||
         fail invalid-operation-binding "$operation_id"
       [[ $computed_operation_binding == "$operation_binding" ]] || fail operation-binding-mismatch "$operation_id"
-      [[ $(jq -r .state "$journal") != ABORTED &&
-          $(jq -r .state "$journal") != REJECTED &&
-          $(jq -r .state "$journal") != COMMITTED ]] || fail operation-mismatch "$operation_id"
+      case $(jq -r .state "$journal") in
+        ABORTED|REJECTED) fail operation-mismatch "$operation_id" ;;
+        COMMITTED|ROLLED_BACK)
+          [[ $allow_terminal == 1 ]] || fail operation-mismatch "$operation_id"
+          ;;
+      esac
       ;;
     *) fail unsupported-journal-schema "$operation_id" ;;
   esac
@@ -131,8 +134,8 @@ load_operation() {
 }
 
 load_gate() {
-  local operation_id=$1 plugin_id=$2
-  load_operation "$operation_id" "$plugin_id"
+  local operation_id=$1 plugin_id=$2 allow_terminal=${3:-0}
+  load_operation "$operation_id" "$plugin_id" "$allow_terminal"
   "$helper" gate-sync "$state_root"
   [[ -e $gate || -L $gate ]] || fail gate-missing "$plugin_id"
   validate_canonical "$gate" "$gate_validator" plugin_id "$plugin_id" || fail gate-state-invalid "$plugin_id"
@@ -613,14 +616,14 @@ case $action in
   terminal-reconcile)
     [[ $# == 2 ]] || fail usage 'terminal-reconcile OPERATION_ID PLUGIN_ID'
     operation_id=$1; plugin_id=$2
-    load_gate "$operation_id" "$plugin_id"
+    load_gate "$operation_id" "$plugin_id" 1
     state=$(jq -r .state "$journal")
     intended_state=$(jq -r '.terminalReceipt.intendedJournalState // ""' "$gate")
     [[ $(jq -r .state "$gate") == TERMINAL_RECEIPT ]] || fail terminal-receipt-missing "$plugin_id"
     if [[ $intended_state == COMMITTED ]]; then
-      [[ $state == RELEASE_PENDING ]] || fail operation-state-mismatch "$operation_id"
+      [[ $state == COMMITTED ]] || fail operation-state-mismatch "$operation_id"
     elif [[ $intended_state == ROLLED_BACK ]]; then
-      [[ $state == ROLLBACK_STARTED ]] || fail operation-state-mismatch "$operation_id"
+      [[ $state == ROLLED_BACK ]] || fail operation-state-mismatch "$operation_id"
     else
       fail terminal-receipt-invalid "$plugin_id"
     fi

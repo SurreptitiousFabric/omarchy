@@ -58,20 +58,40 @@ case "$2" in
       jq --arg plugin "$3" '.pluginId=$plugin' "$HOME/.o8-observation.json"
     fi
     ;;
-  gateTransactionPlugin) run_gate install "$3" "$4" >/dev/null; run_gate acknowledge-unload "$3" "$4" shell-o8 >/dev/null ;;
+  gateTransactionPlugin)
+    gate_path="$XDG_STATE_HOME/omarchy/plugin-transactions-v1/gates/$4.gate"
+    if [[ -e "$HOME/.o8-fail-gate-operation" ]] && [[ $(cat "$HOME/.o8-fail-gate-operation") == "$3" ]]; then
+      exit 1
+    fi
+    if [[ -e "$HOME/.o8-force-conflict" && -f "$gate_path" ]] && [[ $(jq -r '.operationId // ""' "$gate_path") != "$3" ]]; then
+      printf '%s\n' conflict
+      exit 0
+    fi
+    run_gate install "$3" "$4" >/dev/null
+    if [[ -e "$HOME/.o8-hold-gate" ]]; then
+      printf '%s\n' pending
+      exit 0
+    fi
+    run_gate acknowledge-unload "$3" "$4" shell-o8 >/dev/null
+    printf '%s\n' pending ;;
   rescanGatedPlugin)
     if [[ -e "$HOME/.o8-fail-next-rescan" ]]; then rm -f -- "$HOME/.o8-fail-next-rescan"; exit 70; fi
     destination=$(jq -r .expected.destination "$XDG_STATE_HOME/omarchy/plugin-transactions-v1/gates/$4.gate")
-    run_gate acknowledge-rescan "$3" "$4" shell-o8 1 1 "$destination" >/dev/null ;;
+    run_gate acknowledge-rescan "$3" "$4" shell-o8 1 1 "$destination" >/dev/null
+    printf '%s\n' pending ;;
   rollbackTransactionPlugin) run_gate retarget-rollback "$3" "$4" shell-o8 "$5" "$6" >/dev/null ;;
   rescanRollbackPlugin)
     rollback_destination=$(jq -r .expected.destination "$XDG_STATE_HOME/omarchy/plugin-transactions-v1/gates/$4.gate")
-    run_gate acknowledge-rollback-rescan "$3" "$4" shell-o8 2 2 "$rollback_destination" >/dev/null ;;
+    run_gate acknowledge-rollback-rescan "$3" "$4" shell-o8 2 2 "$rollback_destination" >/dev/null
+    printf '%s\n' pending ;;
   releaseTransactionPlugin)
     run_gate authorize-release "$3" "$4" shell-o8 1 1 user omarchy-shell-config:user:v1 sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null
     run_gate terminal-receipt "$3" "$4" COMMITTED >/dev/null
     ;;
-  releaseRollbackTransactionPlugin) run_gate authorize-rollback-release "$3" "$4" shell-o8 2 2 user omarchy-shell-config:user:v1 sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null ;;
+  releaseRollbackTransactionPlugin)
+    run_gate authorize-rollback-release "$3" "$4" shell-o8 2 2 user omarchy-shell-config:user:v1 sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432 unreferenced >/dev/null
+    run_gate terminal-receipt "$3" "$4" ROLLED_BACK >/dev/null
+    ;;
   retainTransactionPlugin) run_gate retain-release "$3" "$4" shell-o8 1 >/dev/null; run_gate acknowledge-unload "$3" "$4" shell-o8 >/dev/null ;;
   transactionTerminalReceipt) run_gate terminal-receipt "$3" "$4" "$5" >/dev/null ;;
   transactionTerminalReconcile) touch "$HOME/.o8-terminal-reconciled"; printf '%s\n' pending ;;
@@ -224,3 +244,70 @@ jq -e '.schema=="omarchy-plugin-transaction-journal/v2" and .state=="REJECTED" a
 REJECT_RETRY=$(printf '%s' "$REJECT_COMMIT" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction")
 jq -e '.state=="REJECTED" and .status=="rejected" and .reason=="stale-candidate"' <<<"$REJECT_RETRY" >/dev/null
 printf 'ok - pre-gate stale candidate becomes durable v2 REJECTED and exact replay is stable\n'
+
+# A durable gate with no live holder must still produce the exact competing
+# operation result.  The fake shell returns the same `conflict` value as the
+# real QML gatePlugin method; the coordinator must not strand operation B in
+# COMMIT_PREPARED or alter operation A's authority.
+CONFLICT_PLUGIN=acme.o8.conflict
+CONFLICT_A=83000000-0000-4000-8000-000000000006
+CONFLICT_B=83000000-0000-4000-8000-000000000007
+CONFLICT_A_SOURCE="$TEST_ROOT/conflict-a"
+CONFLICT_B_SOURCE="$TEST_ROOT/conflict-b"
+make_interface_plugin "$ROOT" "$CONFLICT_A_SOURCE" "$CONFLICT_PLUGIN"
+make_interface_plugin "$ROOT" "$CONFLICT_B_SOURCE" "$CONFLICT_PLUGIN"
+CONFLICT_A_IDENTITY=$($INSTALL_ROOT/native/plugin-transaction/plugin-tree identity "$CONFLICT_A_SOURCE")
+CONFLICT_B_IDENTITY=$($INSTALL_ROOT/native/plugin-transaction/plugin-tree identity "$CONFLICT_B_SOURCE")
+stage_conflict_operation() {
+  local operation=$1 source=$2 identity=$3
+  local request
+  request=$(jq -cn --arg operation "$operation" --arg token "$TOKEN" --arg plugin "$CONFLICT_PLUGIN" \
+    --arg source "$source" --arg identity "$identity" --arg projection "$PROJECTION" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",operationId:$operation,
+      operationToken:$token,operation:"install",pluginId:$plugin,source:{kind:"directory",path:$source},
+      candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:("sha256:"+($identity|sub("^omarchy-runtime-tree-sha256-v1:";"")))},
+      expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+        referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+  printf '%s' "$request" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction" >/dev/null
+}
+stage_conflict_operation "$CONFLICT_A" "$CONFLICT_A_SOURCE" "$CONFLICT_A_IDENTITY"
+stage_conflict_operation "$CONFLICT_B" "$CONFLICT_B_SOURCE" "$CONFLICT_B_IDENTITY"
+printf '%s\n' "$CONFLICT_B" >"$HOME_DIR/.o8-fail-gate-operation"
+CONFLICT_B_PREPARE=$(jq -cn --arg operation "$CONFLICT_B" --arg token "$TOKEN" \
+  '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operation,operationToken:$token}')
+set +e
+printf '%s' "$CONFLICT_B_PREPARE" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction" >/dev/null
+CONFLICT_B_PREPARE_STATUS=$?
+set -e
+rm -f -- "$HOME_DIR/.o8-fail-gate-operation"
+[[ $CONFLICT_B_PREPARE_STATUS != 0 ]]
+[[ $(jq -r .state "$STATE_HOME/omarchy/plugin-transactions-v1/journals/$CONFLICT_B.journal") == COMMIT_PREPARED ]]
+touch "$HOME_DIR/.o8-hold-gate"
+CONFLICT_A_COMMIT=$(jq -cn --arg operation "$CONFLICT_A" --arg token "$TOKEN" \
+  '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operation,operationToken:$token}')
+set +e
+CONFLICT_A_RESULT=$(printf '%s' "$CONFLICT_A_COMMIT" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction")
+CONFLICT_A_STATUS=$?
+set -e
+rm -f -- "$HOME_DIR/.o8-hold-gate"
+[[ $CONFLICT_A_STATUS == 0 ]] || { printf '%s\n' "$CONFLICT_A_RESULT" >&2; exit "$CONFLICT_A_STATUS"; }
+[[ $(jq -r .state "$STATE_HOME/omarchy/plugin-transactions-v1/journals/$CONFLICT_A.journal") == COMMIT_PREPARED ]]
+[[ $(jq -r .state "$STATE_HOME/omarchy/plugin-transactions-v1/gates/$CONFLICT_PLUGIN.gate") == GATED ]]
+CONFLICT_GATE_BEFORE=$(sha256sum "$STATE_HOME/omarchy/plugin-transactions-v1/gates/$CONFLICT_PLUGIN.gate" | cut -d' ' -f1)
+touch "$HOME_DIR/.o8-force-conflict"
+CONFLICT_B_COMMIT=$(jq -cn --arg operation "$CONFLICT_B" --arg token "$TOKEN" \
+  '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operation,operationToken:$token}')
+set +e
+CONFLICT_B_RESULT=$(printf '%s' "$CONFLICT_B_COMMIT" | "$INSTALL_ROOT/bin/omarchy-plugin-transaction")
+CONFLICT_B_STATUS=$?
+set -e
+rm -f -- "$HOME_DIR/.o8-force-conflict"
+[[ $CONFLICT_B_STATUS == 0 ]] || { printf 'conflict status=%s result=%s\n' "$CONFLICT_B_STATUS" "$CONFLICT_B_RESULT" >&2; cat "$HOME_DIR/.o8-shell.err" >&2; exit "$CONFLICT_B_STATUS"; }
+jq -e --arg operation "$CONFLICT_B" --arg plugin "$CONFLICT_PLUGIN" \
+  '.state=="REJECTED" and .status=="rejected" and .reason=="plugin-gated-by-another-operation" and .operationId==$operation and .pluginId==$plugin' \
+  <<<"$CONFLICT_B_RESULT" >/dev/null
+[[ $(jq -r .state "$STATE_HOME/omarchy/plugin-transactions-v1/journals/$CONFLICT_B.journal") == REJECTED ]]
+[[ ! -e "$STATE_HOME/omarchy/plugin-transactions-v1/gates/$CONFLICT_PLUGIN-$CONFLICT_B.gate" ]]
+[[ $(sha256sum "$STATE_HOME/omarchy/plugin-transactions-v1/gates/$CONFLICT_PLUGIN.gate" | cut -d' ' -f1) == "$CONFLICT_GATE_BEFORE" ]]
+[[ -d "$STATE_HOME/omarchy/plugin-candidates-v1/$CONFLICT_B/candidate" ]]
+printf 'ok - durable competing gate returns conflict and terminalizes the losing operation\n'
