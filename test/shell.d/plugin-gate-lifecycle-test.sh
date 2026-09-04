@@ -11,6 +11,14 @@ TMPDIR=""
 QS_PID=""
 
 cleanup() {
+  if [[ -n ${REPLAY_OWNER_PID:-} ]] && kill -0 "$REPLAY_OWNER_PID" 2>/dev/null; then
+    if declare -F kill_process_tree >/dev/null 2>&1; then
+      kill_process_tree "$REPLAY_OWNER_PID" || true
+    else
+      kill "$REPLAY_OWNER_PID" 2>/dev/null || true
+    fi
+    wait "$REPLAY_OWNER_PID" 2>/dev/null || true
+  fi
   if [[ -n $QS_PID ]] && kill -0 "$QS_PID" 2>/dev/null; then
     kill "$QS_PID" 2>/dev/null || true
     wait "$QS_PID" 2>/dev/null || true
@@ -29,6 +37,7 @@ require_command node
 NODE_BIN=$(mise which node)
 
 TMPDIR=$(mktemp -d)
+REPLAY_OWNER_PID=""
 chmod 0700 "$TMPDIR"
 test_root="$TMPDIR/omarchy"
 test_home="$TMPDIR/home"
@@ -52,7 +61,7 @@ cp -a "$SOURCE_ROOT/native" "$test_root/native"
 # The O-8 terminal handoff mode invokes the production transaction wrapper.
 # Give it a copied package root so package-relative helpers and shell IPC target
 # the same isolated offscreen shell as this harness.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
   rm "$test_root/bin"
   mkdir "$test_root/bin"
   cp "$SOURCE_ROOT/bin/omarchy-plugin-transaction" "$SOURCE_ROOT/bin/omarchy-shell" \
@@ -80,7 +89,7 @@ fi
 mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
   -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
   "$SOURCE_ROOT/native/plugin-transaction/plugin-tree.c" -o "$helper"
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
   cp "$helper" "$test_root/native/plugin-transaction/plugin-tree"
 fi
 
@@ -91,6 +100,9 @@ active_widget_id=acme.lifecycle-active-widget
 selected_bar_id=acme.lifecycle-selected-bar
 indeterminate_id=acme.lifecycle-indeterminate
 o8_terminal_id=acme.lifecycle-o8-terminal
+o8_replay_live_id=acme.lifecycle-o8-replay-live
+o8_replay_rescan_id=acme.lifecycle-o8-replay-rescan
+o8_replay_release_id=acme.lifecycle-o8-replay-release
 for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id" "$selected_bar_id" "$indeterminate_id" "$o8_terminal_id"; do
   live="$plugin_dir/$plugin"
   candidate="$TMPDIR/candidate-$plugin"
@@ -119,10 +131,21 @@ for plugin in "$service_id" "$active_service_id" "$widget_id" "$active_widget_id
   cp -a "$live/." "$candidate/"
 done
 
+# Fresh-process dispatch cases use inert install candidates outside discovery.
+# They are intentionally not inserted into the live-plugin fixture above, so
+# the authoritative shell observation reports exact absence for each case.
+for plugin in "$o8_replay_live_id" "$o8_replay_rescan_id" "$o8_replay_release_id"; do
+  candidate="$TMPDIR/candidate-$plugin"
+  mkdir -p "$candidate"
+  cp "$FIXTURE_ROOT/Service.qml" "$candidate/Service.qml"
+  jq --arg id "$plugin" '.id=$id | .kinds=["service"] | .entryPoints={service:"Service.qml"}' \
+    "$FIXTURE_ROOT/manifest.json" >"$candidate/manifest.json"
+done
+
 # This operation is a fresh install: retain the source outside discovery while
 # the active destination is absent.  The ordinary lifecycle cases keep their
 # pre-existing active fixtures.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
   rm -rf "$plugin_dir/$o8_terminal_id"
 fi
 
@@ -228,13 +251,29 @@ fi
 export OMARCHY_LIFECYCLE_HOLD_SCAN="$TMPDIR/hold-scan"
 export OMARCHY_LIFECYCLE_SCAN_READY="$TMPDIR/scan-ready"
 export OMARCHY_LIFECYCLE_SCAN_RESUME="$TMPDIR/scan-resume"
+export OMARCHY_LIFECYCLE_HOLD_BEFORE_RESCAN=0
+replay_runtime="$runtime_dir/omarchy-o8-replay"
+mkdir -p "$replay_runtime"
+export OMARCHY_LIFECYCLE_HOLD_BEFORE_RESCAN="$replay_runtime/hold-before-rescan"
+export OMARCHY_LIFECYCLE_BEFORE_RESCAN_READY="$replay_runtime/before-rescan-ready"
+export OMARCHY_LIFECYCLE_BEFORE_RESCAN_RESUME="$replay_runtime/before-rescan-resume"
+export OMARCHY_LIFECYCLE_HOLD_AFTER_RESCAN=0
+export OMARCHY_LIFECYCLE_AFTER_RESCAN_READY="$replay_runtime/after-rescan-ready"
+export OMARCHY_LIFECYCLE_AFTER_RESCAN_RESUME="$replay_runtime/after-rescan-resume"
+export OMARCHY_LIFECYCLE_HOLD_BEFORE_RELEASE=0
+export OMARCHY_LIFECYCLE_BEFORE_RELEASE_READY="$replay_runtime/before-release-ready"
+export OMARCHY_LIFECYCLE_BEFORE_RELEASE_RESUME="$replay_runtime/before-release-resume"
+export OMARCHY_LIFECYCLE_REPLAY_OPERATION=
+export OMARCHY_LIFECYCLE_REPLAY_PLUGIN=
 export OMARCHY_LIFECYCLE_INDETERMINATE_OPERATION="$indeterminate_operation"
 export OMARCHY_LIFECYCLE_INJECT_INSTALL_PARENT_FSYNC="$TMPDIR/inject-install-parent-fsync"
 mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFORE_RESUME" \
   "$OMARCHY_LIFECYCLE_AUTHORIZE_AFTER_RESUME" "$OMARCHY_LIFECYCLE_TERMINAL_RECEIPT_RESUME" \
   "$OMARCHY_LIFECYCLE_SCAN_RESUME"
+mkfifo "$OMARCHY_LIFECYCLE_BEFORE_RESCAN_RESUME" "$OMARCHY_LIFECYCLE_AFTER_RESCAN_RESUME" \
+  "$OMARCHY_LIFECYCLE_BEFORE_RELEASE_RESUME"
 export QT_QPA_PLATFORM=offscreen
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay ]]; then
   # The production wrapper forwards WAYLAND_DISPLAY (but not DISPLAY) to qs;
   # retain the isolated harness's display identity so its real QML process is
   # discoverable without contacting the desktop shell.
@@ -300,6 +339,143 @@ expected_raw=$(sha256sum "$config_file" | cut -d' ' -f1)
 observed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$stage_observation" | base64 -d | sha256sum | cut -d' ' -f1)
 [[ $observed_projection == "$initial_service_projection" ]] || fail "production transaction observation bypassed canonical projection"
 pass "production stage observation uses the live accepted O-6 snapshot and canonical projection"
+
+if [[ $EXPECTATION == o8-dispatch-replay ]]; then
+  declare -A replay_tokens replay_operations
+  replay_operations[live]=63000000-0000-4000-8000-000000000001
+  replay_operations[rescan]=63000000-0000-4000-8000-000000000002
+  replay_operations[release]=63000000-0000-4000-8000-000000000003
+  replay_tokens[live]=QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE
+  replay_tokens[rescan]=QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI
+  replay_tokens[release]=Q0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0M
+
+  kill_process_tree() {
+    local parent=$1 child
+    for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+      kill_process_tree "$child"
+    done
+    kill "$parent" 2>/dev/null || true
+  }
+
+  stage_replay_install() {
+    local phase=$1 plugin=$2 operation=${replay_operations[$1]} token=${replay_tokens[$1]}
+    local source="$TMPDIR/candidate-$plugin" identity projection digest request
+    identity=$($helper identity "$source")
+    projection=$(jq -r .referenceProjectionBase64 <<<"$(shell_ipc shell transactionStageObservation "$plugin")" | base64 -d | sha256sum | cut -d' ' -f1)
+    digest="sha256:${identity#omarchy-runtime-tree-sha256-v1:}"
+    request=$(jq -cn --arg operationId "$operation" --arg token "$token" \
+      --arg pluginId "$plugin" --arg source "$source" --arg digest "$digest" --arg projection "sha256:$projection" \
+      '{protocol:"legacy-schema-v1-transaction/v1",action:"stage",operationId:$operationId,operationToken:$token,
+        operation:"install",pluginId:$pluginId,source:{kind:"directory",path:$source},
+        candidateTree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest},
+        expectedActive:{state:"absent"},expectedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},
+        referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"}}')
+    printf '%s' "$request" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/$phase-stage-result" ||
+      fail "$phase replay stage did not create an inert operation"
+    jq -e --arg op "$operation" --arg plugin "$plugin" \
+      '.operationId==$op and .pluginId==$plugin and .state=="STAGED"' \
+      "$TMPDIR/$phase-stage-result" >/dev/null || fail "$phase replay stage result was not STAGED"
+  }
+
+  fresh_commit_replay() {
+    local phase=$1 plugin=$2 operation=${replay_operations[$1]} token=${replay_tokens[$1]}
+    local request result status
+    request=$(jq -cn --arg operationId "$operation" --arg token "$token" \
+      '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
+    set +e
+    result=$(printf '%s' "$request" | "$test_root/bin/omarchy-plugin-transaction" 2>"$TMPDIR/$phase-fresh-error")
+    status=$?
+    set -e
+    if (( status != 0 )); then
+      sed -n '1,120p' "$TMPDIR/$phase-fresh-error" >&2
+      jq -c '{state,operationBindingSha256,namespaceIntent,rescan,release}' "$state_dir/omarchy/plugin-transactions-v1/journals/$operation.journal" >&2 2>/dev/null || true
+      jq -c '{state,operationBindingSha256,expected,rescan,release}' "$state_dir/omarchy/plugin-transactions-v1/gates/$plugin.gate" >&2 2>/dev/null || true
+      printf 'fresh-shell-state: ' >&2
+      shell_ipc shell testLifecycleState "$plugin" >&2 || true
+      fail "$phase fresh commit replay failed"
+    fi
+    jq -e --arg op "$operation" --arg plugin "$plugin" \
+      '.operationId==$op and .pluginId==$plugin and .state=="COMMITTED" and .status=="committed" and .eligibility=="released"' \
+      <<<"$result" >/dev/null || fail "$phase fresh replay did not produce a released COMMITTED result"
+    [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$operation.journal") == COMMITTED ]] ||
+      fail "$phase fresh replay did not durably reach COMMITTED"
+    pass "$phase replay resumes from the durable state in a fresh coordinator"
+  }
+
+  [[ $(shell_ipc shell testStopLocalPluginWatcher) == stopping ]] || fail "replay watcher stop was not requested"
+  wait_for "replay watcher stops" '[[ $(state "$service_id" 2>/dev/null | jq -r .pluginWatcherRunning || true) == false ]]'
+
+  stage_replay_install live "$o8_replay_live_id"
+  export OMARCHY_LIFECYCLE_REPLAY_OPERATION="${replay_operations[live]}"
+  export OMARCHY_LIFECYCLE_REPLAY_PLUGIN="$o8_replay_live_id"
+  printf '%s' "${replay_operations[live]}" >"$replay_runtime/operation"
+  printf '%s' "$o8_replay_live_id" >"$replay_runtime/plugin"
+  : >"$OMARCHY_LIFECYCLE_HOLD_BEFORE_RESCAN"
+  rm -f "$OMARCHY_LIFECYCLE_BEFORE_RESCAN_READY"
+  set +e
+  printf '%s' "$(jq -cn --arg operationId "${replay_operations[live]}" --arg token "${replay_tokens[live]}" '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')" |
+    "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/live-owner-result" 2>"$TMPDIR/live-owner-error" &
+  owner_pid=$!
+  REPLAY_OWNER_PID=$owner_pid
+  set -e
+  wait_for "LIVE_TREE_EXCHANGED replay barrier" '[[ -e $OMARCHY_LIFECYCLE_BEFORE_RESCAN_READY && $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/${replay_operations[live]}.journal" 2>/dev/null || true) == LIVE_TREE_EXCHANGED ]] && kill -0 "$owner_pid" 2>/dev/null'
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_replay_live_id.gate") == UNLOAD_ACKNOWLEDGED ]] || fail "LIVE_TREE_EXCHANGED did not retain UNLOAD_ACKNOWLEDGED gate"
+  kill_process_tree "$owner_pid"
+  wait "$owner_pid" 2>/dev/null || true
+  REPLAY_OWNER_PID=""
+  rm -f "$OMARCHY_LIFECYCLE_HOLD_BEFORE_RESCAN" "$replay_runtime/operation" "$replay_runtime/plugin"
+  rm -f "$OMARCHY_LIFECYCLE_BEFORE_RESCAN_READY"
+  fresh_commit_replay live "$o8_replay_live_id"
+
+  stage_replay_install rescan "$o8_replay_rescan_id"
+  export OMARCHY_LIFECYCLE_REPLAY_OPERATION="${replay_operations[rescan]}"
+  export OMARCHY_LIFECYCLE_REPLAY_PLUGIN="$o8_replay_rescan_id"
+  printf '%s' "${replay_operations[rescan]}" >"$replay_runtime/operation"
+  printf '%s' "$o8_replay_rescan_id" >"$replay_runtime/plugin"
+  : >"$replay_runtime/hold-after-rescan"
+  rm -f "$OMARCHY_LIFECYCLE_AFTER_RESCAN_READY"
+  set +e
+  printf '%s' "$(jq -cn --arg operationId "${replay_operations[rescan]}" --arg token "${replay_tokens[rescan]}" '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')" |
+    "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/rescan-owner-result" 2>"$TMPDIR/rescan-owner-error" &
+  owner_pid=$!
+  REPLAY_OWNER_PID=$owner_pid
+  set -e
+  wait_for "GATED_RESCAN_COMPLETED replay barrier" '[[ -e $OMARCHY_LIFECYCLE_AFTER_RESCAN_READY && $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/${replay_operations[rescan]}.journal" 2>/dev/null || true) == GATED_RESCAN_COMPLETED ]] && kill -0 "$owner_pid" 2>/dev/null'
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_replay_rescan_id.gate") == RESCAN_ACKNOWLEDGED ]] || fail "GATED_RESCAN_COMPLETED did not retain RESCAN_ACKNOWLEDGED gate"
+  kill_process_tree "$owner_pid"
+  wait "$owner_pid" 2>/dev/null || true
+  REPLAY_OWNER_PID=""
+  rm -f "$replay_runtime/hold-after-rescan" "$replay_runtime/operation" "$replay_runtime/plugin"
+  rm -f "$OMARCHY_LIFECYCLE_AFTER_RESCAN_READY"
+  fresh_commit_replay rescan "$o8_replay_rescan_id"
+
+  stage_replay_install release "$o8_replay_release_id"
+  export OMARCHY_LIFECYCLE_REPLAY_OPERATION="${replay_operations[release]}"
+  export OMARCHY_LIFECYCLE_REPLAY_PLUGIN="$o8_replay_release_id"
+  printf '%s' "${replay_operations[release]}" >"$replay_runtime/operation"
+  printf '%s' "$o8_replay_release_id" >"$replay_runtime/plugin"
+  : >"$replay_runtime/hold-before-release"
+  rm -f "$OMARCHY_LIFECYCLE_BEFORE_RELEASE_READY"
+  set +e
+  printf '%s' "$(jq -cn --arg operationId "${replay_operations[release]}" --arg token "${replay_tokens[release]}" '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')" |
+    "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/release-owner-result" 2>"$TMPDIR/release-owner-error" &
+  owner_pid=$!
+  REPLAY_OWNER_PID=$owner_pid
+  set -e
+  wait_for "RELEASE_PENDING replay barrier" '[[ -e $OMARCHY_LIFECYCLE_BEFORE_RELEASE_READY && $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/${replay_operations[release]}.journal" 2>/dev/null || true) == RELEASE_PENDING ]] && kill -0 "$owner_pid" 2>/dev/null'
+  [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_replay_release_id.gate") == RESCAN_ACKNOWLEDGED ]] || fail "RELEASE_PENDING did not retain RESCAN_ACKNOWLEDGED gate before release IPC"
+  kill_process_tree "$owner_pid"
+  wait "$owner_pid" 2>/dev/null || true
+  REPLAY_OWNER_PID=""
+  rm -f "$replay_runtime/hold-before-release" "$replay_runtime/operation" "$replay_runtime/plugin"
+  rm -f "$OMARCHY_LIFECYCLE_BEFORE_RELEASE_READY"
+  fresh_commit_replay release "$o8_replay_release_id"
+  # A second newly started coordinator exercises terminal COMMITTED replay
+  # and current-shell terminal-pair reconciliation without repeating release,
+  # receipt, rescan, or namespace work.
+  fresh_commit_replay release "$o8_replay_release_id"
+  exit 0
+fi
 
 if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure ]]; then
   o8_source="$TMPDIR/candidate-$o8_terminal_id"

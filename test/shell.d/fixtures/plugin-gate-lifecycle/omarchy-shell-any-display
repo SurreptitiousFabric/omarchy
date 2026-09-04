@@ -6,5 +6,24 @@ set -euo pipefail
 # copied shell path and --any-display because the offscreen QPA has no desktop
 # display identity.  It still invokes the real QML shell and IPC handlers.
 [[ -n ${OMARCHY_PATH:-} && -f $OMARCHY_PATH/shell/shell.qml ]] || exit 1
+replay_root="${XDG_RUNTIME_DIR:-}/omarchy-o8-replay"
+replay_operation=$(cat "$replay_root/operation" 2>/dev/null || true)
+replay_plugin=$(cat "$replay_root/plugin" 2>/dev/null || true)
+journal_state=""
+if [[ -n $replay_operation ]]; then
+  journal_state=$(jq -r .state "$XDG_STATE_HOME/omarchy/plugin-transactions-v1/journals/$replay_operation.journal" 2>/dev/null || true)
+fi
+if [[ -e $replay_root/hold-before-rescan && ${2:-} == rescanGatedPlugin && ${3:-} == "$replay_operation" ]]; then
+  : >"$replay_root/before-rescan-ready"
+  IFS= read -r _ <"$replay_root/before-rescan-resume"
+fi
+if [[ -e $replay_root/hold-after-rescan && $journal_state == GATED_RESCAN_COMPLETED && ${2:-} == transactionStageObservation && ${3:-} == "$replay_plugin" ]]; then
+  : >"$replay_root/after-rescan-ready"
+  IFS= read -r _ <"$replay_root/after-rescan-resume"
+fi
+if [[ -e $replay_root/hold-before-release && ${2:-} == releaseTransactionPlugin && ${3:-} == "$replay_operation" ]]; then
+  : >"$replay_root/before-release-ready"
+  IFS= read -r _ <"$replay_root/before-release-resume"
+fi
 exec timeout --kill-after=1s "${OMARCHY_SHELL_IPC_TIMEOUT:-5s}" \
   qs ipc -n --any-display -p "$OMARCHY_PATH/shell" call -- "$@"
