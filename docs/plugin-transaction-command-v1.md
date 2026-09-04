@@ -50,7 +50,14 @@ accepts candidate release only from durable `RELEASE_PENDING` with a
 uses descriptor-relative `renameat2` (`RENAME_NOREPLACE` for install and
 `RENAME_EXCHANGE` for update), synchronizes the candidate/operation parent
 before the discovery parent, and postchecks exact runtime-tree identities.
-There is no copy-based live-tree fallback.
+There is no copy-based live-tree fallback. A fresh `LOAD_GATED` replay takes
+one new O-6 authority observation before acquiring coordinator locks. If the
+namespace already has the visible post-mutation layout,
+`namespace-reconcile` is a no-create read boundary: it synchronizes both
+parents and rechecks every expected identity or absence before promotion to
+`LIVE_TREE_EXCHANGED`. Visibility alone never proves durability. Rollback uses
+the same exact forward/restored layout classification, so a fresh process
+never repeats an already completed reverse rename or exchange.
 
 The shell-to-coordinator terminal handoff is receipt-first: the shell writes a
 durable `TERMINAL_RECEIPT` gate targeting `COMMITTED` or `ROLLED_BACK` only
@@ -66,8 +73,14 @@ gate to exact absence for install or the retained prior tree for update, and
 requires rollback rescan plus restoration of source identity, canonical
 projection, reference policy, and reference state before publishing restored
 eligibility. Filesystem restoration without that eligibility acknowledgement
-is indeterminate, not `ROLLED_BACK`. O-8 performs only direct exact rollback
-and replay of completed steps; broad restart recovery remains O-9.
+is indeterminate, not `ROLLED_BACK`. Status and commit responses keep the
+durable operation outcome separate from current-shell eligibility: status does
+not contact the shell and therefore reports `not-observed`, while a commit
+response says `released` only after current-shell terminal reconciliation.
+`ROLLBACK_STARTED` with only an intended reverse mutation reports an
+indeterminate live occupant rather than the expected candidate. O-8 performs
+only direct exact rollback and replay of completed steps; broad restart
+recovery remains O-9.
 
 ## Request-field ledger
 

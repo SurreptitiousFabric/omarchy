@@ -1247,6 +1247,139 @@ static void namespace_mutate(const char *operation, const char *source_parent,
                         destination_identity, "", 0);
 }
 
+/* Reconcile a visible post-mutation namespace without mutating it.  This is
+ * deliberately narrower than recovery: both package-owned parents are
+ * synchronized in the forward/rollback order and every expected occupant is
+ * descriptor-pinned and rehashed afterwards. */
+static void namespace_reconcile(const char *operation,
+                                const char *source_parent,
+                                const char *source_name,
+                                const char *dest_parent,
+                                const char *dest_name,
+                                const char *expected_source,
+                                const char *expected_destination) {
+  if ((strcmp(operation, "install-post") != 0 &&
+       strcmp(operation, "exchange-post") != 0 &&
+       strcmp(operation, "rollback-install-restored") != 0 &&
+       strcmp(operation, "rollback-exchange-restored") != 0) ||
+      !simple_name(source_name) || !simple_name(dest_name))
+    reject_tree("invalid-namespace-reconciliation", operation);
+
+  int source_directory =
+      open_namespace_parent(source_parent, "open candidate parent");
+  int destination_directory =
+      open_namespace_parent(dest_parent, "open discovery parent");
+  struct stat source_parent_stat;
+  struct stat destination_parent_stat;
+  if (fstat(source_directory, &source_parent_stat) < 0 ||
+      fstat(destination_directory, &destination_parent_stat) < 0)
+    fail_io("stat namespace reconciliation parent", operation);
+  if (source_parent_stat.st_dev != destination_parent_stat.st_dev)
+    emit_namespace_result("unsupported-atomic-operation", operation, "", "",
+                          "different-filesystem", 4);
+
+  /* A visible rename/exchange is not authoritative until both parent
+   * directories have been synchronized.  The test-only names are distinct
+   * from forward mutation points so the fault matrix can target replay. */
+  if (sync_fd(source_directory, "namespace-reconcile-candidate-parent") < 0 ||
+      sync_fd(destination_directory,
+              "namespace-reconcile-discovery-parent") < 0) {
+    close(source_directory);
+    close(destination_directory);
+    emit_namespace_result("indeterminate-namespace", operation, "", "",
+                          "parent-sync-failed", 5);
+  }
+
+  bool rollback_install = strcmp(operation, "rollback-install-restored") == 0;
+  bool exchange = strcmp(operation, "exchange-post") == 0 ||
+                  strcmp(operation, "rollback-exchange-restored") == 0;
+  char source_identity[96] = "";
+  char destination_identity[96] = "";
+  if (rollback_install || exchange) {
+    struct stat source_stat;
+    if (fstatat(source_directory, source_name, &source_stat,
+                AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(source_stat.st_mode)) {
+      close(source_directory);
+      close(destination_directory);
+      emit_namespace_result("exact-postcheck-mismatch", operation, "", "",
+                            "source-slot-missing", 5);
+    }
+    int source = openat(source_directory, source_name,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (source < 0)
+      fail_io("open reconciled source", source_name);
+    identity_from_fd(source, source_identity);
+    close(source);
+    if (!identity_matches(source_identity, expected_source)) {
+      close(source_directory);
+      close(destination_directory);
+      emit_namespace_result("exact-postcheck-mismatch", operation,
+                            source_identity, "", "source-identity-mismatch",
+                            5);
+    }
+  } else {
+    struct stat source_stat;
+    if (fstatat(source_directory, source_name, &source_stat,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+      close(source_directory);
+      close(destination_directory);
+      emit_namespace_result("exact-postcheck-mismatch", operation, "", "",
+                            "source-slot-still-present", 5);
+    }
+    if (errno != ENOENT) {
+      close(source_directory);
+      close(destination_directory);
+      emit_namespace_result("indeterminate-namespace", operation, "", "",
+                            "source-slot-unreadable", 5);
+    }
+  }
+
+  struct stat destination_stat;
+  if (rollback_install) {
+    if (fstatat(destination_directory, dest_name, &destination_stat,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+      close(source_directory);
+      close(destination_directory);
+      emit_namespace_result("exact-postcheck-mismatch", operation,
+                            source_identity, "", "destination-present", 5);
+    }
+    if (errno != ENOENT) {
+      close(source_directory);
+      close(destination_directory);
+      emit_namespace_result("indeterminate-namespace", operation,
+                            source_identity, "", "destination-unreadable", 5);
+    }
+    close(source_directory);
+    close(destination_directory);
+    emit_namespace_result("reconciled-durable", operation, source_identity,
+                          "", "", 0);
+  }
+  if (fstatat(destination_directory, dest_name, &destination_stat,
+              AT_SYMLINK_NOFOLLOW) < 0 || !S_ISDIR(destination_stat.st_mode)) {
+    close(source_directory);
+    close(destination_directory);
+    emit_namespace_result("exact-postcheck-mismatch", operation,
+                          source_identity, "", "destination-missing", 5);
+  }
+  int destination = openat(destination_directory, dest_name,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (destination < 0)
+    fail_io("open reconciled destination", dest_name);
+  identity_from_fd(destination, destination_identity);
+  close(destination);
+  if (!identity_matches(destination_identity, expected_destination)) {
+    close(source_directory);
+    close(destination_directory);
+    emit_namespace_result("exact-postcheck-mismatch", operation,
+                          source_identity, destination_identity,
+                          "destination-identity-mismatch", 5);
+  }
+  close(source_directory);
+  close(destination_directory);
+  emit_namespace_result("reconciled-durable", operation, source_identity,
+                        destination_identity, "", 0);
+}
+
 static bool simple_name(const char *name) {
   size_t length = strlen(name);
   return length > 0 && length <= 128 && strcmp(name, ".") != 0 &&
@@ -2409,6 +2542,11 @@ int main(int argc, char **argv) {
                      argv[8]);
     return 0;
   }
+  if (argc == 9 && strcmp(argv[1], "namespace-reconcile") == 0) {
+    namespace_reconcile(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                        argv[8]);
+    return 0;
+  }
   if (argc == 6 && strcmp(argv[1], "journal-replace") == 0) {
     replace_journal(argv[2], argv[3], argv[4], argv[5]);
     return 0;
@@ -2488,6 +2626,7 @@ int main(int argc, char **argv) {
           "publish PARENT TEMPORARY COMPLETED | "
           "state-init STATE | journal-replace STATE OPERATION INPUT TRANSITION | "
           "namespace-mutate install|exchange|rollback-install|rollback-exchange SOURCE-PARENT SOURCE-NAME DEST-PARENT DEST-NAME EXPECTED-SOURCE EXPECTED-DEST | "
+          "namespace-reconcile install-post|exchange-post|rollback-install-restored|rollback-exchange-restored SOURCE-PARENT SOURCE-NAME DEST-PARENT DEST-NAME EXPECTED-SOURCE EXPECTED-DEST | "
           "gate-replace STATE PLUGIN INPUT TRANSITION | gate-sync STATE | "
           "domain-hash DOMAIN | sync-directory PATH POINT | atomic-support | "
           "journal-preserve STATE OPERATION DIGEST | journal-sync STATE OPERATION | "

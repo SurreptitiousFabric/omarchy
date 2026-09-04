@@ -72,6 +72,7 @@ expected_projection=""
 expected_reference_state=""
 reference_policy=""
 candidate_path=""
+current_shell_eligibility=not-observed
 
 cleanup() {
   [[ -z $journal_input ]] || /usr/bin/rm -f -- "$journal_input"
@@ -301,6 +302,33 @@ write_journal_transition() {
   read_journal_held
 }
 
+write_pre_exposure_evidence() {
+  local input
+  input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-pre-exposure.XXXXXX)
+  if ! printf '%s' "$journal" | "$jq_bin" -cS \
+      --arg kind "$authority_observed_kind" \
+      --arg identity "$authority_observed_identity" \
+      --arg raw "$authority_observed_raw_hash" \
+      --arg projection "$authority_observed_projection_hash" \
+      --arg reference_state "$authority_observed_reference_state" \
+      --arg policy "$reference_policy" \
+      --argjson epoch "$authority_observed_epoch" \
+      '.preExposureEvidence={source:{kind:$kind,identity:$identity},rawSha256:$raw,referenceProjection:$projection,referenceState:$reference_state,referencePolicy:$policy,configurationEpoch:$epoch}' >"$input"; then
+    /usr/bin/rm -f -- "$input"
+    return 1
+  fi
+  chmod 0600 "$input"
+  if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" \
+      -f "$journal_validator" "$input" >/dev/null 2>&1 ||
+     ! native_run journal-replace "$state_root" "$request_operation_id" \
+      "$input" load-gated-authority-observed >/dev/null 2>&1; then
+    /usr/bin/rm -f -- "$input"
+    return 1
+  fi
+  /usr/bin/rm -f -- "$input"
+  read_journal_held
+}
+
 operation_binding_for_journal() {
   printf '%s' "$journal" | "$jq_bin" -cS '
     {operationId,pluginId,
@@ -359,6 +387,7 @@ make_commit_prepared() {
      | .rollback="not-applicable"
      | .rollbackEvidence={state:"not-started",targetRole:"none",target:null,outcome:"not-applicable"}
      | .terminalReceipt={state:"not-requested",intendedJournalState:null,operationBindingSha256:null,operationId:null,pluginId:null,targetRole:"none",target:null,shellInstance:null,generation:null,scanEpoch:null,configurationEpoch:null,outcome:"not-requested"}
+     | .preExposureEvidence=null
      | .gate="not-established" | .registry="not-requested" | .state="COMMIT_PREPARED" | .reason=null | .corruptEvidenceSha256=null' >"$input"
   chmod 0600 "$input"
   if ! "$jq_bin" -eS --arg operation_id "$request_operation_id" -f "$journal_validator" "$input" >/dev/null 2>&1; then
@@ -375,7 +404,7 @@ make_commit_prepared() {
 
 emit_journal_response() {
   local response_action=$1 output
-  if ! output=$(printf '%s' "$journal" | "$jq_bin" -cS --arg action "$response_action" '
+  if ! output=$(printf '%s' "$journal" | "$jq_bin" -cS --arg action "$response_action" --arg currentShell "$current_shell_eligibility" '
     def public_tree($identity):
       if $identity == null or $identity == "" then null
       else {algorithm:"omarchy-runtime-tree-sha256-v1",
@@ -389,7 +418,7 @@ emit_journal_response() {
       elif .state == "ROLLBACK_STARTED" and .namespaceIntent.state == "completed" and .rollbackEvidence.target.identity != null then {state:"present",tree:public_tree(.rollbackEvidence.target.identity)}
       elif .state == "ROLLBACK_STARTED" and .namespaceIntent.state == "completed" then null
       elif .state == "RECOVERY_REQUIRED" or .state == "MANUAL_ATTENTION" then null
-      elif .state == "ROLLBACK_STARTED" then {state:"present",tree:public_tree(.candidate.observed)}
+      elif .state == "ROLLBACK_STARTED" then null
       elif $facts.expectedActive.state == "absent" then {state:"absent"}
       else {state:"present",tree:public_tree($facts.expectedActive.identity)} end;
     def public_source($facts):
@@ -463,10 +492,11 @@ emit_journal_response() {
        configuration:{before:public_configuration($facts),after:(if .state == "COMMITTED" or .state == "ROLLED_BACK" then public_after_configuration else null end)},
        registry:public_registry,
        release:public_release,
-       eligibility:(if .state == "COMMITTED" or .state == "ROLLED_BACK" then "released"
+       eligibility:{durableOutcome:(if .state == "COMMITTED" then "authorized"
+         elif .state == "ROLLED_BACK" then "restored"
          elif .state == "STAGED" or .state == "ABORTED" or .state == "REJECTED" then "not-gated"
          elif .state == "RECOVERY_REQUIRED" or .state == "MANUAL_ATTENTION" then "indeterminate"
-         else "blocked" end),
+         else "blocked" end),currentShell:$currentShell},
        rollback:public_rollback,
        recovery:{state:(if .state == "RECOVERY_REQUIRED" then "required" elif .state == "MANUAL_ATTENTION" then "manual-attention" else "none" end),reason:(if .state == "RECOVERY_REQUIRED" or .state == "MANUAL_ATTENTION" then .reason else null end)}}
   ' 2>/dev/null); then
@@ -670,7 +700,8 @@ reconcile_terminal_shell() {
   local response
   response=$(shell_call transactionTerminalReconcile "$request_operation_id" "$request_plugin_id" 2>/dev/null) || return 1
   [[ $response == pending || $response == ok ]] || return 1
-  wait_shell_transaction_status terminal-pair-reconciled
+  wait_shell_transaction_status terminal-pair-reconciled || return 1
+  current_shell_eligibility=released
 }
 
 commit_validate_authority() {
@@ -738,6 +769,50 @@ commit_validate_authority() {
     observed_source=$(printf '%s' "$output" | "$jq_bin" -r '.activeDiscovery.sourceDirectory')
     [[ $observed_source == "$destination" ]] || { authority_reason=registry-source-ambiguous; return 2; }
     [[ $(native_run identity "$destination" 2>/dev/null || true) == "${expected_candidate:-}" ]] || { authority_reason=stale-active-tree; return 2; }
+  elif [[ $authority_phase == load-gated ]]; then
+    # A fresh LOAD_GATED replay may observe either the pre-exposure registry
+    # view (the shell has not rescanned yet) or the candidate already visible
+    # after a crashed namespace operation.  Both views are valid only when
+    # they identify the one immutable operation destination; the native
+    # layout/reconciliation check below remains the authority for promotion.
+    if [[ $operation_kind == install ]]; then
+      if [[ $active_observed == absent ]]; then
+        # A crashed gated install may have completed the rename before the
+        # shell's registry observed any live source.  Accept only that exact
+        # post-layout image; namespace-reconcile below proves parent
+        # durability and the candidate identity again.
+        if [[ -e "$destination" || -L "$destination" ]]; then
+          [[ -d "$destination" && ! -L "$destination" &&
+             ! -e "$candidate_path" && ! -L "$candidate_path" &&
+             $(native_run identity "$destination" 2>/dev/null || true) == "${expected_candidate:-}" ]] || {
+            authority_reason=stale-active-tree
+            return 2
+          }
+        fi
+      elif [[ $active_observed == present ]]; then
+        observed_source=$(printf '%s' "$output" | "$jq_bin" -r '.activeDiscovery.sourceDirectory')
+        [[ $observed_source == "$destination" ]] || { authority_reason=registry-source-ambiguous; return 2; }
+        [[ $(native_run identity "$destination" 2>/dev/null || true) == "${expected_candidate:-}" ]] || {
+          authority_reason=stale-active-tree
+          return 2
+        }
+      else
+        authority_reason=invalid-shell-observation
+        return 1
+      fi
+    else
+      [[ $active_observed == present ]] || { authority_reason=stale-active-tree; return 2; }
+      observed_source=$(printf '%s' "$output" | "$jq_bin" -r '.activeDiscovery.sourceDirectory')
+      [[ $observed_source == "$destination" ]] || { authority_reason=registry-source-ambiguous; return 2; }
+      [[ -f "$destination/manifest.json" && ! -L "$destination/manifest.json" ]] || { authority_reason=registry-source-ambiguous; return 2; }
+      manifest_id=$("$jq_bin" -er '.id | select(type == "string")' "$destination/manifest.json" 2>/dev/null || true)
+      [[ $manifest_id == "$request_plugin_id" ]] || { authority_reason=registry-source-ambiguous; return 2; }
+      active_observed_identity=$(native_run identity "$destination" 2>/dev/null || true)
+      [[ $active_observed_identity == "$active_identity" || $active_observed_identity == "${expected_candidate:-}" ]] || {
+        authority_reason=stale-active-tree
+        return 2
+      }
+    fi
   elif [[ $authority_phase == rollback ]]; then
     if [[ ${rollback_target_role:-} == absence ]]; then
       [[ $active_observed == absent && ! -e "$destination" && ! -L "$destination" ]] || {
@@ -889,7 +964,30 @@ reject_staged() {
 }
 
 mark_recovery() {
-  local reason=$1 response_state=${2:-RECOVERY_REQUIRED}
+  local reason=$1 response_state=${2:-RECOVERY_REQUIRED} acquired=0 gate_status gate_operation gate_plugin gate_binding
+  if (( locks_held == 0 )); then
+    require_ordered_locks "$response_state"
+    read_journal_held || {
+      release_ordered_locks
+      emit_error indeterminate journal-authority-indeterminate 5 "$response_state"
+    }
+    acquired=1
+  fi
+  # Recovery is a post-gate state.  Never manufacture established gate
+  # authority from a journal alone when the synchronized gate has vanished or
+  # no longer binds this operation.
+  set +e
+  read_gate_state "$request_plugin_id" >/dev/null 2>&1
+  gate_status=$?
+  set -e
+  gate_operation=$(printf '%s' "${gate_record:-}" | "$jq_bin" -r '.operationId // ""' 2>/dev/null || true)
+  gate_plugin=$(printf '%s' "${gate_record:-}" | "$jq_bin" -r '.pluginId // ""' 2>/dev/null || true)
+  gate_binding=$(printf '%s' "${gate_record:-}" | "$jq_bin" -r '.operationBindingSha256 // ""' 2>/dev/null || true)
+  if (( gate_status != 0 )) || [[ $gate_operation != "$request_operation_id" || $gate_plugin != "$request_plugin_id" ]] ||
+     ! operation_binding_for_journal >/dev/null 2>&1 || [[ $gate_binding != "$(operation_binding_for_journal)" ]]; then
+    release_ordered_locks
+    emit_error indeterminate gate-authority-indeterminate 5 "$response_state"
+  fi
   # RECOVERY_REQUIRED is a v2 state with an established blocking authority.
   # Keep the state-conditioned evidence explicit when the predecessor was a
   # pre-gate reservation (where the old record still says not-established),
@@ -898,7 +996,7 @@ mark_recovery() {
     release_ordered_locks
     emit_error indeterminate journal-indeterminate 5 "$response_state"
   fi
-  release_ordered_locks
+  if (( acquired == 1 )); then release_ordered_locks; fi
   emit_error indeterminate "$reason" 5 RECOVERY_REQUIRED
 }
 
@@ -909,7 +1007,7 @@ rollback_operation() {
   local rollback_reason=$1 state operation destination expected_candidate prior_identity
   local target_role target_identity source_parent source_name dest_parent dest_name
   local mutation_result mutation_status mutation_outcome rollback_input
-  local namespace_state rollback_rescan_outcome terminal_gate_state
+  local namespace_state rollback_rescan_outcome terminal_gate_state rollback_layout
   local rollback_release_input
   local terminal_shell terminal_generation terminal_configuration_epoch
   if ! acquire_ordered_locks || ! read_journal_held; then
@@ -999,10 +1097,38 @@ rollback_operation() {
     [[ -f $gate_path && $current_gate == UNLOAD_ACKNOWLEDGED ]] ||
       { release_ordered_locks; emit_error indeterminate rollback-gate-mismatch 5 ROLLBACK_STARTED; }
   fi
+  rollback_layout=ambiguous
+  if [[ $operation == install ]]; then
+    if [[ -d $destination && ! -L $destination &&
+          $(native_run identity "$destination" 2>/dev/null || true) == "$expected_candidate" &&
+          ! -e $candidate_path && ! -L $candidate_path ]]; then
+      rollback_layout=forward
+    elif [[ ! -e $destination && ! -L $destination &&
+            -d $candidate_path && ! -L $candidate_path &&
+            $(native_run identity "$candidate_path" 2>/dev/null || true) == "$expected_candidate" ]]; then
+      rollback_layout=restored
+    fi
+  else
+    if [[ -d $destination && ! -L $destination &&
+          $(native_run identity "$destination" 2>/dev/null || true) == "$expected_candidate" &&
+          -d $candidate_path && ! -L $candidate_path &&
+          $(native_run identity "$candidate_path" 2>/dev/null || true) == "$prior_identity" ]]; then
+      rollback_layout=forward
+    elif [[ -d $destination && ! -L $destination &&
+            $(native_run identity "$destination" 2>/dev/null || true) == "$prior_identity" &&
+            -d $candidate_path && ! -L $candidate_path &&
+            $(native_run identity "$candidate_path" 2>/dev/null || true) == "$expected_candidate" ]]; then
+      rollback_layout=restored
+    fi
+  fi
+  if [[ $rollback_layout == ambiguous ]]; then
+    release_ordered_locks
+    emit_error indeterminate rollback-namespace-indeterminate 5 ROLLBACK_STARTED
+  fi
   # A fresh-process retry resumes from durable rollback evidence.  Once the
   # reverse namespace operation is recorded complete, never invoke the native
   # rename/exchange a second time.
-  if [[ $namespace_state != completed ]]; then
+  if [[ $namespace_state != completed && $rollback_layout == forward ]]; then
   dest_parent=$(/usr/bin/dirname -- "$destination")
   dest_name=$(/usr/bin/basename -- "$destination")
   if [[ $operation == install ]]; then
@@ -1022,6 +1148,27 @@ rollback_operation() {
     release_ordered_locks
     emit_error indeterminate "rollback-${mutation_outcome}" 5 ROLLBACK_STARTED
   fi
+  elif [[ $namespace_state != completed && $rollback_layout == restored ]]; then
+    source_parent=$candidate_store/$request_operation_id
+    source_name=candidate
+    dest_parent=$(/usr/bin/dirname -- "$destination")
+    dest_name=$(/usr/bin/basename -- "$destination")
+    if [[ $operation == install ]]; then
+      mutation_result=$(native_run namespace-reconcile rollback-install-restored \
+        "$source_parent" "$source_name" "$dest_parent" "$dest_name" \
+        "$expected_candidate" "" 2>/dev/null) || mutation_status=$?
+    else
+      mutation_result=$(native_run namespace-reconcile rollback-exchange-restored \
+        "$source_parent" "$source_name" "$dest_parent" "$dest_name" \
+        "$expected_candidate" "$prior_identity" 2>/dev/null) || mutation_status=$?
+    fi
+    mutation_status=${mutation_status:-0}
+    mutation_outcome=$(printf '%s' "$mutation_result" | "$jq_bin" -r '.status // "invalid-result"' 2>/dev/null || printf '%s' invalid-result)
+    if (( mutation_status != 0 )) || [[ $mutation_outcome != reconciled-durable ]]; then
+      release_ordered_locks
+      emit_error indeterminate "rollback-${mutation_outcome}" 5 ROLLBACK_STARTED
+    fi
+  fi
   rollback_input=$(/usr/bin/mktemp /tmp/omarchy-plugin-journal-rollback-complete.XXXXXX)
   printf '%s' "$journal" | "$jq_bin" -cS --arg role "$target_role" --arg identity "$target_identity" \
     '.namespaceIntent.state="completed" | .namespaceIntent.kind=(if .normalizedRequest.facts.operation=="install" then "rollback-install" else "rollback-exchange" end) | .rollbackEvidence={state:"completed",targetRole:$role,target:(if $role=="absence" then {state:"absent",identity:null} else {state:"present",identity:$identity} end),outcome:"restored"} | .retainedPrior=(if .normalizedRequest.facts.operation=="install" then {state:"absent",identity:null,slot:null} else .retainedPrior + {state:"restored"} end)' >"$rollback_input"
@@ -1034,7 +1181,6 @@ rollback_operation() {
   fi
   /usr/bin/rm -f -- "$rollback_input"
   read_journal_held || { release_ordered_locks; emit_error indeterminate rollback-journal-indeterminate 5 ROLLBACK_STARTED; }
-  fi
   release_ordered_locks
   if [[ $rollback_rescan_outcome != completed ]]; then
     set +e
@@ -1469,10 +1615,48 @@ o8_handle_commit_prepared() {
 }
 
 o8_handle_load_gated() {
+  local namespace_layout=ambiguous mutation_result mutation_status mutation_outcome
+  local entry_binding observed_binding gate_status gate_binding
   o8_require_unlocked LOAD_GATED
+
+  # LOAD_GATED can be resumed by a new process long after the observation that
+  # created it.  Obtain current O-6 authority before acquiring transaction
+  # locks, and retain the exact evidence for the durable state transition.
+  authority_phase=load-gated
+  set +e
+  commit_validate_authority
+  authority_status=$?
+  set -e
+  if (( authority_status != 0 )); then
+    [[ $authority_status == 1 ]] &&
+      emit_error unavailable "${authority_reason:-shell-authority-unavailable}" 4 LOAD_GATED
+    mark_recovery "pre-exposure-${authority_reason:-authority-indeterminate}" LOAD_GATED
+  fi
+  entry_binding=$(operation_binding_for_journal) ||
+    emit_error indeterminate operation-binding-mismatch 5 LOAD_GATED
+  set +e
+  o8_gate_status_unlocked
+  gate_status=$?
+  set -e
+  (( gate_status == 0 )) || emit_error indeterminate unload-acknowledgement-indeterminate 5 LOAD_GATED
+  [[ $gate_state == UNLOAD_ACKNOWLEDGED ]] ||
+    emit_error indeterminate unload-acknowledgement-indeterminate 5 LOAD_GATED
+  gate_binding=$(printf '%s' "$gate_record" | "$jq_bin" -r '.operationBindingSha256 // ""')
+
   require_ordered_locks LOAD_GATED
   read_journal_held || { release_ordered_locks; emit_error indeterminate journal-authority-indeterminate 5 LOAD_GATED; }
-  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == LOAD_GATED ]] || { release_ordered_locks; return 0; }
+  [[ $(printf '%s' "$journal" | "$jq_bin" -r '.state') == LOAD_GATED ]] || {
+    release_ordered_locks
+    return 0
+  }
+  observed_binding=$(operation_binding_for_journal) || {
+    release_ordered_locks
+    emit_error indeterminate operation-binding-mismatch 5 LOAD_GATED
+  }
+  [[ $observed_binding == "$entry_binding" ]] || {
+    release_ordered_locks
+    emit_error indeterminate operation-binding-mismatch 5 LOAD_GATED
+  }
   set +e
   read_gate_state "$request_plugin_id" >/dev/null 2>&1
   gate_status=$?
@@ -1481,18 +1665,31 @@ o8_handle_load_gated() {
     release_ordered_locks
     emit_error indeterminate unload-acknowledgement-indeterminate 5 LOAD_GATED
   }
-  local namespace_layout=ambiguous mutation_result mutation_status mutation_outcome
+  [[ $(printf '%s' "$gate_record" | "$jq_bin" -r '.operationBindingSha256 // ""') == "$gate_binding" ]] || {
+    release_ordered_locks
+    emit_error indeterminate operation-binding-mismatch 5 LOAD_GATED
+  }
+  [[ $gate_binding == "$entry_binding" ]] || {
+    release_ordered_locks
+    emit_error indeterminate operation-binding-mismatch 5 LOAD_GATED
+  }
+  # Persist the fresh observation before invoking any namespace operation.
+  if ! write_pre_exposure_evidence; then
+    release_ordered_locks
+    emit_error indeterminate journal-indeterminate 5 LOAD_GATED
+  fi
+
   if [[ $operation_kind == install ]]; then
-    if o8_commit_candidate_ok && [[ ! -e $destination && ! -L $destination ]]; then
-      namespace_layout=pre
+    if [[ ! -e $destination && ! -L $destination ]]; then
+      if o8_commit_candidate_ok; then namespace_layout=pre; else namespace_layout=stale-candidate; fi
     elif [[ ! -e $candidate_path && -d $destination && ! -L $destination &&
             $(native_run identity "$destination" 2>/dev/null || true) == "$expected_candidate" ]]; then
       namespace_layout=post
     fi
   else
-    if o8_commit_candidate_ok && [[ -d $destination && ! -L $destination &&
-            $(native_run identity "$destination" 2>/dev/null || true) == "$active_identity" ]]; then
-      namespace_layout=pre
+    if [[ -d $destination && ! -L $destination &&
+          $(native_run identity "$destination" 2>/dev/null || true) == "$active_identity" ]]; then
+      if o8_commit_candidate_ok; then namespace_layout=pre; else namespace_layout=stale-candidate; fi
     elif [[ -d $candidate_path && ! -L $candidate_path &&
             $(native_run identity "$candidate_path" 2>/dev/null || true) == "$active_identity" &&
             -d $destination && ! -L $destination &&
@@ -1501,6 +1698,9 @@ o8_handle_load_gated() {
     fi
   fi
   case "$namespace_layout" in
+    stale-candidate)
+      mark_recovery pre-exposure-stale-candidate LOAD_GATED
+      ;;
     pre)
       mutation_status=0
       if [[ $operation_kind == install ]]; then
@@ -1516,7 +1716,21 @@ o8_handle_load_gated() {
         emit_error indeterminate "namespace-${mutation_outcome}" 5 LOAD_GATED
       }
       ;;
-    post) : ;;
+    post)
+        mutation_status=0
+        if [[ $operation_kind == install ]]; then
+          mutation_result=$(native_run namespace-reconcile install-post "$candidate_store/$request_operation_id" candidate \
+            "$(/usr/bin/dirname -- "$destination")" "$(/usr/bin/basename -- "$destination")" "$expected_candidate" "$expected_candidate" 2>/dev/null) || mutation_status=$?
+        else
+          mutation_result=$(native_run namespace-reconcile exchange-post "$candidate_store/$request_operation_id" candidate \
+            "$(/usr/bin/dirname -- "$destination")" "$(/usr/bin/basename -- "$destination")" "$active_identity" "$expected_candidate" 2>/dev/null) || mutation_status=$?
+        fi
+      mutation_outcome=$(printf '%s' "$mutation_result" | "$jq_bin" -r '.status // "invalid-result"' 2>/dev/null || printf invalid-result)
+      (( mutation_status == 0 )) && [[ $mutation_outcome == reconciled-durable ]] || {
+        release_ordered_locks
+        emit_error indeterminate "namespace-${mutation_outcome}" 5 LOAD_GATED
+      }
+      ;;
     *)
       release_ordered_locks
       emit_error indeterminate namespace-layout-ambiguous 5 LOAD_GATED
