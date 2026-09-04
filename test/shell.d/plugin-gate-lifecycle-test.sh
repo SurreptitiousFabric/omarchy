@@ -474,6 +474,37 @@ if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   (( load2_status != 0 )) || fail "changed candidate falsely completed from LOAD_GATED"
   jq -e --arg op "$o8_load2_operation" '.operationId==$op and .state=="RECOVERY_REQUIRED" and .status=="indeterminate"' \
     "$TMPDIR/load2-fresh-result" >/dev/null || fail "changed candidate did not produce post-gate recovery result"
+  # Gate B public-result authority is state-true: a recovery response must
+  # retain the complete operation dimensions rather than collapsing to the
+  # small generic error envelope.  This literal vector is independent of the
+  # production jq response filter and is deliberately checked before any
+  # broader matrix is attempted.
+  jq -e --arg op "$o8_load2_operation" --arg plugin "$o8_load2_id" --arg reason "pre-exposure-stale-candidate" \
+    '(.protocol == "legacy-schema-v1-transaction/v1")
+     and (.action == "commit")
+     and (.operationId == $op)
+     and (.pluginId == $plugin)
+     and (.state == "RECOVERY_REQUIRED")
+     and (.status == "indeterminate")
+     and (.reason == $reason)
+     and (.operation == "install")
+     and (.candidateTree.algorithm == "omarchy-runtime-tree-sha256-v1")
+     and (.candidateTree.digest | type == "string")
+     and (.previousTree.state == "absent")
+     and (.observedActive == null)
+     and (.filesystem.live == null)
+     and (.filesystem.previous.state == "absent")
+     and (.observedConfiguration.source.kind == "user")
+     and (.configuration.before.source.kind == "user")
+     and (.configuration.after == null)
+     and (.registry.state == "not-requested")
+     and (.release.outcome == "not-requested")
+     and (.eligibility.durableOutcome == "indeterminate")
+     and (.eligibility.currentShell == "not-observed")
+     and (.rollback.state == "not-applicable")
+     and (.recovery.state == "required")
+     and (.recovery.reason == $reason)' \
+    "$TMPDIR/load2-fresh-result" >/dev/null || fail "RECOVERY_REQUIRED response omitted state-true public dimensions"
   [[ ! -e "$plugin_dir/$o8_load2_id" ]] || fail "changed candidate was exposed"
   [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_load2_id.gate") == UNLOAD_ACKNOWLEDGED ]] ||
     fail "changed candidate lost its blocking gate"
