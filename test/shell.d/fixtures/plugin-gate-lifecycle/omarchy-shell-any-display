@@ -30,6 +30,16 @@ if [[ ${2:-} == rescanGatedPlugin && -e $fail_gated_rescan ]]; then
   rm -f -- "$fail_gated_rescan"
   exit 70
 fi
+rollback_root="${XDG_RUNTIME_DIR:-}/omarchy-o8-rollback-fresh"
+if [[ ${2:-} == "rescanRollbackPlugin" && -f "$rollback_root/operation" &&
+  ${3:-} == "$(<"$rollback_root/operation")" ]]; then
+  # Hold before sending to QML, after the coordinator's durable restoration.
+  if [[ -e "$rollback_root/hold-before-rescan" ]]; then
+    : >"$rollback_root/before-rescan-ready"
+    IFS= read -r _ <"$rollback_root/before-rescan-resume"
+  fi
+  printf '%s %s %s\n' "$3" "$2" "$BASHPID" >>"$rollback_root/rescan-dispatches"
+fi
 load_root="${XDG_RUNTIME_DIR:-}/omarchy-o8-load-gated"
 if [[ ${2:-} == "transactionStageObservation" && -f "$load_root/observe-replay" &&
   ${3:-} == "$(<"$load_root/observe-replay")" ]]; then

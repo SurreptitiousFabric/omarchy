@@ -14,4 +14,24 @@ if [[ ${1:-} == "namespace-mutate" && (${2:-} == "install" || ${2:-} == "exchang
     IFS= read -r _ <"$runtime/namespace-resume"
   fi
 fi
+
+# Rollback continuation uses the same operation-specific pre-native seam.
+# Only an owned candidate parent selects this counter; never retain argv,
+# capabilities, stdin, or environments. The second log proves which calls
+# passed the barrier, separately from helper invocation counts.
+runtime="$tmp_root/runtime/omarchy-o8-rollback-fresh"
+if [[ -f "$runtime/operation" &&
+  (${1:-} == "namespace-mutate" || ${1:-} == "namespace-reconcile") ]]; then
+  operation=$(<"$runtime/operation")
+  parent="$tmp_root/home/.local/state/omarchy/plugin-candidates-v1/$operation"
+  if [[ (${3:-} == "$parent" && ${4:-} == "candidate") ||
+    (${5:-} == "$parent" && ${6:-} == "candidate") ]]; then
+    printf '%s %s %s %s\n' "$operation" "$1" "$2" "$BASHPID" >>"$runtime/namespace-calls"
+    if [[ ${1:-} == "namespace-mutate" && ${2:-} == rollback-* && -e "$runtime/hold-before-reverse" ]]; then
+      : >"$runtime/before-reverse-ready"
+      IFS= read -r _ <"$runtime/before-reverse-resume"
+    fi
+    printf '%s %s %s %s\n' "$operation" "$1" "$2" "$BASHPID" >>"$runtime/native-dispatches"
+  fi
+fi
 exec "${0}.real" "$@"

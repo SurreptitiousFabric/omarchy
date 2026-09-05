@@ -61,7 +61,7 @@ cp -a "$SOURCE_ROOT/native" "$test_root/native"
 # The O-8 terminal handoff mode invokes the production transaction wrapper.
 # Give it a copied package root so package-relative helpers and shell IPC target
 # the same isolated offscreen shell as this harness.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-rollback-fresh || $EXPECTATION == o8-load-gated-authority ]]; then
   rm "$test_root/bin"
   mkdir "$test_root/bin"
   cp "$SOURCE_ROOT/bin/omarchy-plugin-transaction" "$SOURCE_ROOT/bin/omarchy-shell" \
@@ -89,7 +89,7 @@ fi
 mise exec -- clang -std=c17 -Wall -Wextra -Werror -Wconversion -Wshadow -O2 \
   -DOMARCHY_PLUGIN_TREE_TEST_HOOKS \
   "$SOURCE_ROOT/native/plugin-transaction/plugin-tree.c" -o "$helper"
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-rollback-fresh || $EXPECTATION == o8-load-gated-authority ]]; then
   cp "$helper" "$test_root/native/plugin-transaction/plugin-tree"
 fi
 if [[ $EXPECTATION == o8-load-gated-authority ]]; then
@@ -99,6 +99,14 @@ if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   mv "$test_root/native/plugin-transaction/plugin-tree" "$test_root/native/plugin-transaction/plugin-tree.real"
   cp "$FIXTURE_ROOT/load-gated-namespace-wrapper" "$test_root/native/plugin-transaction/plugin-tree"
   chmod 0755 "$test_root/native/plugin-transaction/plugin-tree"
+fi
+
+if [[ $EXPECTATION == o8-rollback-fresh ]]; then
+  PYTHON_BIN=$(mise which python)
+  mv "$test_root/native/plugin-transaction/plugin-tree" "$test_root/native/plugin-transaction/plugin-tree.real"
+  cp "$FIXTURE_ROOT/load-gated-namespace-wrapper" "$test_root/native/plugin-transaction/plugin-tree"
+  chmod 0755 "$test_root/native/plugin-transaction/plugin-tree"
+  "$NODE_BIN" "$FIXTURE_ROOT/rollback-fresh-copy.mjs" "$test_root"
 fi
 
 service_id=acme.lifecycle-service
@@ -154,7 +162,7 @@ done
 # This operation is a fresh install: retain the source outside discovery while
 # the active destination is absent.  The ordinary lifecycle cases keep their
 # pre-existing active fixtures.
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-rollback-fresh || $EXPECTATION == o8-load-gated-authority ]]; then
   rm -rf "$plugin_dir/$o8_terminal_id"
 fi
 
@@ -284,7 +292,7 @@ mkfifo "$OMARCHY_LIFECYCLE_PROJECTION_RESUME" "$OMARCHY_LIFECYCLE_AUTHORIZE_BEFO
 mkfifo "$OMARCHY_LIFECYCLE_BEFORE_RESCAN_RESUME" "$OMARCHY_LIFECYCLE_AFTER_RESCAN_RESUME" \
   "$OMARCHY_LIFECYCLE_BEFORE_RELEASE_RESUME"
 export QT_QPA_PLATFORM=offscreen
-if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-load-gated-authority ]]; then
+if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-corrected || $EXPECTATION == o8-terminal-receipt-failure || $EXPECTATION == o8-dispatch-replay || $EXPECTATION == o8-rollback || $EXPECTATION == o8-rollback-fresh || $EXPECTATION == o8-load-gated-authority ]]; then
   # The production wrapper forwards WAYLAND_DISPLAY (but not DISPLAY) to qs;
   # retain the isolated harness's display identity so its real QML process is
   # discoverable without contacting the desktop shell.
@@ -350,6 +358,13 @@ expected_raw=$(sha256sum "$config_file" | cut -d' ' -f1)
 observed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$stage_observation" | base64 -d | sha256sum | cut -d' ' -f1)
 [[ $observed_projection == "$initial_service_projection" ]] || fail "production transaction observation bypassed canonical projection"
 pass "production stage observation uses the live accepted O-6 snapshot and canonical projection"
+
+if [[ $EXPECTATION == o8-rollback-fresh ]]; then
+  source "$FIXTURE_ROOT/load-gated-configuration.sh"
+  source "$FIXTURE_ROOT/rollback-fresh.sh"
+  run_rollback_fresh_case "$OMARCHY_LIFECYCLE_ROLLBACK_KIND" "$OMARCHY_LIFECYCLE_ROLLBACK_BOUNDARY"
+  exit 0
+fi
 
 if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   source "$FIXTURE_ROOT/load-gated-configuration.sh"
