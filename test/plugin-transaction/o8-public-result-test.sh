@@ -87,40 +87,94 @@ status() {
     HOME="$HOME_DIR" XDG_STATE_HOME="$STATE_HOME" "$INSTALL_ROOT/bin/omarchy-plugin-transaction"
 }
 
-assert_common() {
-  local result=$1 operation=$2 plugin=$3 state=$4 status_value=$5 previous=$6 live=$7 durable=$8 after=$9 candidate_digest=${10:-$install_digest} previous_digest=${11:-}
-  jq -e --arg op "$operation" --arg plugin "$plugin" --arg state "$state" \
-    --arg status "$status_value" --arg prev "$previous" --arg live "$live" \
-    --arg durable "$durable" --arg after "$after" --arg candidate "$candidate_digest" --arg prior "$previous_digest" '
-    .protocol=="legacy-schema-v1-transaction/v1" and .action=="status"
-    and .operationId==$op and .pluginId==$plugin and .state==$state and .status==$status
-    and .candidateTree=={algorithm:"omarchy-runtime-tree-sha256-v1",digest:$candidate}
-    and (.previousTree.state==$prev)
-    and (if $prev=="present" then .previousTree.tree.digest==$prior else true end)
-    and (if $live=="null" then .filesystem.live==null else .filesystem.live.state==$live end)
-    and .filesystem.previous == .previousTree
-    and (.eligibility.durableOutcome==$durable)
-    and (.eligibility.currentShell=="not-observed")
-    and (.configuration.before.source.kind=="user")
-    and (if $after=="null" then .configuration.after==null else .configuration.after.source.kind=="user" end)
-    and (.recovery.state|type=="string")
-  ' <<<"$result" >/dev/null
+assert_stdout_file() {
+  local output_file=$1
+  [[ $(wc -l <"$output_file") == 1 ]] || { printf 'response did not contain exactly one line\n' >&2; return 1; }
+  [[ $(tail -c 1 "$output_file" | od -An -t x1) == *0a* ]] || { printf 'response did not end with LF\n' >&2; return 1; }
+  jq -e 'type == "object"' "$output_file" >/dev/null
+}
 
-  jq -e '
-    ((keys | sort) == ["action","candidateTree","configuration","eligibility","filesystem",
-      "observedActive","observedConfiguration","operation","operationId","pluginId",
-      "previousTree","protocol","reason","recovery","registry","release","rollback",
-      "state","status"])
-    and ((.candidateTree | keys | sort) == ["algorithm","digest"])
-    and ((.filesystem | keys | sort) == ["live","previous"])
-    and ((.configuration | keys | sort) == ["after","before"])
-    and ((.eligibility | keys | sort) == ["currentShell","durableOutcome"])
-    and ((.registry | keys | sort) == ["generation","rescan","scanEpoch","shellInstance","state"])
-    and ((.release | keys | sort) == ["configurationEpoch","generation","outcome","shellInstance"])
-    and ((.rollback | keys | sort) == ["evidenceState","outcome","state","target","targetRole"])
-    and ((.recovery | keys | sort) == ["reason","state"])
-    and ((.configuration.before | keys | sort) == ["rawSha256","referencePolicy","referenceProjectionSha256","referenceState","source"])
-  ' <<<"$result" >/dev/null
+assert_common() {
+  local result=$1 name=$2 operation=$3 plugin=$4 state=$5 status_value=$6 durable=$7 candidate_digest=$8 previous_digest=${9:-}
+  local expected
+  expected=$(expected_result "$name" status "$operation" "$plugin" "$state" "$status_value" "$durable" \
+    not-observed "$candidate_digest" "$previous_digest")
+  diff -u <(jq -S . <<<"$expected") <(jq -S . <<<"$result")
+}
+
+# This is the complete expected-response table.  Its state-specific values are
+# authored here rather than obtained from the journal or the production mapper.
+expected_result() {
+  local name=$1 action=$2 operation=$3 plugin=$4 state=$5 status_value=$6 durable=$7 current_shell=$8 candidate_digest=$9 previous_digest=${10:-}
+  local reason=null kind=install previous='{"state":"absent"}' active='{"state":"absent"}'
+  local registry='{"state":"not-requested","rescan":"not-requested","shellInstance":null,"generation":null,"scanEpoch":null}'
+  local release='{"outcome":"not-requested","shellInstance":null,"generation":null,"configurationEpoch":null}'
+  local rollback='{"state":"not-applicable","evidenceState":"not-started","targetRole":"none","outcome":"not-applicable","target":null}'
+  local recovery='{"state":"none","reason":null}' after=null
+  local candidate previous_tree active_tree
+  candidate=$(jq -cnS --arg digest "$candidate_digest" '{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest}')
+  previous_tree=$(jq -cnS --arg digest "$previous_digest" '{state:"present",tree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest}}')
+
+  case "$name" in
+    *-update|rejected-update|rollback-restored-prior|rolled-back-update) kind=update ;;
+  esac
+  case "$name" in
+    staged-install|commit-prepared-install|load-gated-install|live-tree-exchanged-install|gated-rescan|release-pending|committed|rollback-start|rollback-restored|rollback-rescan|rolled-back|rejected|recovery|manual|aborted|rollback-release-pending|recovery-restored)
+      previous='{"state":"absent"}' ;;
+    *)
+      previous=$previous_tree ;;
+  esac
+  case "$name" in
+    live-tree-exchanged-install|gated-rescan|release-pending|committed|live-tree-exchanged-update)
+      active=$(jq -cnS --arg digest "$candidate_digest" '{state:"present",tree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest}}') ;;
+    rollback-restored|rollback-rescan|rolled-back|rollback-release-pending)
+      active='{"state":"absent"}' ;;
+    rollback-restored-prior|rolled-back-update)
+      active=$previous_tree ;;
+    rollback-start|recovery|manual|recovery-restored)
+      active=null ;;
+    staged-update|commit-prepared-update|load-gated-update|rejected-update)
+      active=$previous_tree ;;
+  esac
+  case "$name" in
+    rejected|rejected-update) reason='"stale-candidate"' ;;
+    recovery) reason='"pre-exposure-stale-candidate"' ; recovery='{"state":"required","reason":"pre-exposure-stale-candidate"}' ;;
+    recovery-restored) reason='"namespace-compensated"' ; recovery='{"state":"required","reason":"namespace-compensated"}' ;;
+    manual) reason='"manual-attention"' ; recovery='{"state":"manual-attention","reason":"manual-attention"}' ;;
+    aborted) reason='"owner-aborted"' ;;
+  esac
+  case "$name" in
+    gated-rescan|release-pending|committed)
+      registry='{"state":"not-requested","rescan":"completed","shellInstance":"vector-shell","generation":1,"scanEpoch":1}' ;;
+    rollback-rescan|rolled-back|rollback-release-pending|rolled-back-update)
+      registry='{"state":"not-requested","rescan":"completed","shellInstance":"vector-shell","generation":2,"scanEpoch":2}' ;;
+  esac
+  case "$name" in
+    release-pending) release='{"outcome":"not-requested","shellInstance":null,"generation":null,"configurationEpoch":1}' ;;
+    committed) release='{"outcome":"authorized","shellInstance":"vector-shell","generation":1,"configurationEpoch":1}' ;;
+    rolled-back|rolled-back-update) release='{"outcome":"authorized","shellInstance":"vector-shell","generation":2,"configurationEpoch":2}' ;;
+    rollback-release-pending) release='{"outcome":"not-requested","shellInstance":"vector-shell","generation":2,"configurationEpoch":2}' ;;
+  esac
+  case "$name" in
+    rollback-start) rollback='{"state":"pending","evidenceState":"intended","targetRole":"absence","outcome":"pending","target":{"state":"absent"}}' ;;
+    rollback-restored|rollback-rescan|rollback-release-pending|recovery-restored) rollback='{"state":"pending","evidenceState":"completed","targetRole":"absence","outcome":"restored","target":{"state":"absent"}}' ;;
+    rolled-back) rollback='{"state":"completed","evidenceState":"completed","targetRole":"absence","outcome":"restored","target":{"state":"absent"}}' ;;
+    rollback-restored-prior) rollback=$(jq -cnS --arg digest "$previous_digest" '{state:"pending",evidenceState:"completed",targetRole:"prior-tree",outcome:"restored",target:{state:"present",tree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest}}}') ;;
+    rolled-back-update) rollback=$(jq -cnS --arg digest "$previous_digest" '{state:"completed",evidenceState:"completed",targetRole:"prior-tree",outcome:"restored",target:{state:"present",tree:{algorithm:"omarchy-runtime-tree-sha256-v1",digest:$digest}}}') ;;
+  esac
+  case "$name" in
+    committed) after='{"source":{"kind":"user","identity":"omarchy-shell-config:user:v1"},"rawSha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","referenceProjectionSha256":"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432","referenceState":"unreferenced","referencePolicy":"require-unreferenced"}' ;;
+    rolled-back|rolled-back-update) after='{"source":{"kind":"user","identity":"omarchy-shell-config:user:v1"},"rawSha256":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","referenceProjectionSha256":"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432","referenceState":"unreferenced","referencePolicy":"require-unreferenced"}' ;;
+  esac
+  jq -cnS --arg action "$action" --arg operationId "$operation" --arg kind "$kind" --arg plugin "$plugin" --arg state "$state" --arg status "$status_value" \
+    --argjson reason "$reason" --argjson candidate "$candidate" --argjson previous "$previous" --argjson active "$active" \
+    --argjson registry "$registry" --argjson release "$release" --argjson rollback "$rollback" --argjson recovery "$recovery" --argjson after "$after" \
+    --arg raw "$RAW" --arg projection "$PROJECTION" --arg durable "$durable" --arg currentShell "$current_shell" \
+    '{protocol:"legacy-schema-v1-transaction/v1",action:$action,operationId:$operationId,pluginId:$plugin,state:$state,status:$status,reason:$reason,operation:$kind,
+      candidateTree:$candidate,previousTree:$previous,observedActive:$active,filesystem:{live:$active,previous:$previous},
+      observedConfiguration:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:$raw,referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"},
+      configuration:{before:{source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:$raw,referenceProjectionSha256:$projection,referenceState:"unreferenced",referencePolicy:"require-unreferenced"},after:$after},
+      registry:$registry,release:$release,eligibility:{durableOutcome:$durable,currentShell:$currentShell},rollback:$rollback,recovery:$recovery}'
 }
 
 make_plugin "$TEST_ROOT/install-source" acme.vector-install
@@ -134,9 +188,7 @@ cp "$install_journal" "$TEST_ROOT/install-base.journal"
 set_state() {
   local journal=$1 operation=$2 base=$3 filter=$4
   cp "$base" "$journal"
-  jq -cS "$filter" "$journal" |
-    jq -cS 'if .release.rawSha256 != null and (.release.rawSha256 | length) > 71 then .release.rawSha256=("sha256:" + (.release.rawSha256[7:71])) else . end
-      | if .preExposureEvidence.rawSha256 != null and (.preExposureEvidence.rawSha256 | length) > 71 then .preExposureEvidence.rawSha256=("sha256:" + (.preExposureEvidence.rawSha256[7:71])) else . end' >"$journal.next"
+  jq -cS "$filter" "$journal" >"$journal.next"
   chmod 0600 "$journal.next"; mv "$journal.next" "$journal"
   jq -e --arg operation_id "$operation" -f "$INSTALL_ROOT/native/plugin-transaction/validate-journal.jq" "$journal" >/dev/null
 }
@@ -150,8 +202,11 @@ vector() {
     operation=85000000-0000-4000-8000-000000000001; plugin=acme.vector-install; journal="$install_journal"; base="$TEST_ROOT/install-base.journal"; candidate_digest=$install_digest; previous_digest=
   fi
   set_state "$journal" "$operation" "$base" "$filter"
-  local result; result=$(status "$operation")
-  assert_common "$result" "$operation" "$plugin" "$state" "$expected_status" "$previous" "$live" "$durable" "$after" "$candidate_digest" "$previous_digest"
+  local result_file="$TEST_ROOT/$name.json"
+  status "$operation" >"$result_file"
+  assert_stdout_file "$result_file"
+  local result; result=$(<"$result_file")
+  assert_common "$result" "$name" "$operation" "$plugin" "$state" "$expected_status" "$durable" "$candidate_digest" "$previous_digest"
   printf 'ok - public vector %s\n' "$name"
 }
 
@@ -161,11 +216,11 @@ vector load-gated-install LOAD_GATED '.state="LOAD_GATED" | .gate="established" 
 vector live-tree-exchanged-install LIVE_TREE_EXCHANGED '.state="LIVE_TREE_EXCHANGED" | .gate="established" | .namespaceIntent.state="completed" | .namespaceIntent.kind="install" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1}' in-progress absent present blocked null
 vector gated-rescan GATED_RESCAN_COMPLETED '.state="GATED_RESCAN_COMPLETED" | .gate="established" | .namespaceIntent.state="completed" | .namespaceIntent.kind="install" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:1,scanEpoch:1,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:.candidate.observed,observedTree:.candidate.observed}' in-progress absent present blocked null
 vector release-pending RELEASE_PENDING '.state="RELEASE_PENDING" | .gate="established" | .namespaceIntent.state="completed" | .namespaceIntent.kind="install" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:1,scanEpoch:1,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:.candidate.observed,observedTree:.candidate.observed} | .release={outcome:"not-requested",shellInstance:null,generation:null,configurationEpoch:1,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"}' in-progress absent present blocked null
-vector committed COMMITTED '.state="COMMITTED" | .gate="established" | .namespaceIntent.state="completed" | .namespaceIntent.kind="install" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:1,scanEpoch:1,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:.candidate.observed,observedTree:.candidate.observed} | .release={outcome:"authorized",shellInstance:"vector-shell",generation:1,configurationEpoch:1,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"} | .terminalReceipt={state:"durable",intendedJournalState:"COMMITTED",operationBindingSha256:"0000000000000000000000000000000000000000000000000000000000000000",operationId:.operationId,pluginId:.pluginId,targetRole:"candidate",target:{state:"present",identity:.candidate.observed},shellInstance:"vector-shell",generation:1,scanEpoch:1,configurationEpoch:1,outcome:"authorized"}' committed absent present authorized present
+  vector committed COMMITTED '.state="COMMITTED" | .gate="established" | .namespaceIntent.state="completed" | .namespaceIntent.kind="install" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:1,scanEpoch:1,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:.candidate.observed,observedTree:.candidate.observed} | .release={outcome:"authorized",shellInstance:"vector-shell",generation:1,configurationEpoch:1,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"} | .terminalReceipt={state:"durable",intendedJournalState:"COMMITTED",operationBindingSha256:"0000000000000000000000000000000000000000000000000000000000000000",operationId:.operationId,pluginId:.pluginId,targetRole:"candidate",target:{state:"present",identity:.candidate.observed},shellInstance:"vector-shell",generation:1,scanEpoch:1,configurationEpoch:1,outcome:"authorized"}' committed absent present authorized present
 vector rollback-start ROLLBACK_STARTED '.state="ROLLBACK_STARTED" | .gate="established" | .namespaceIntent.kind="rollback-install" | .namespaceIntent.state="intended" | .namespaceIntent.sourceSlot="live" | .rollbackEvidence={state:"intended",targetRole:"absence",target:{state:"absent",identity:null},outcome:"pending"} | .rollback="pending" | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1}' in-progress absent null blocked null
 vector rollback-restored ROLLBACK_STARTED '.state="ROLLBACK_STARTED" | .gate="established" | .namespaceIntent.kind="rollback-install" | .state="ROLLBACK_STARTED" | .namespaceIntent.state="completed" | .namespaceIntent.sourceSlot="live" | .rollbackEvidence={state:"completed",targetRole:"absence",target:{state:"absent",identity:null},outcome:"restored"} | .rollback="pending" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1}' in-progress absent absent blocked null
-vector rollback-rescan ROLLBACK_STARTED '.state="ROLLBACK_STARTED" | .gate="established" | .namespaceIntent.kind="rollback-install" | .namespaceIntent.state="completed" | .namespaceIntent.sourceSlot="live" | .rollbackEvidence={state:"completed",targetRole:"absence",target:{state:"absent",identity:null},outcome:"restored"} | .rollback="pending" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:2,scanEpoch:2,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:null,observedTree:null}' in-progress absent absent blocked null
-vector rolled-back ROLLED_BACK '.state="ROLLED_BACK" | .gate="established" | .namespaceIntent.kind="rollback-install" | .namespaceIntent.state="completed" | .namespaceIntent.sourceSlot="live" | .rollbackEvidence={state:"completed",targetRole:"absence",target:{state:"absent",identity:null},outcome:"restored"} | .rollback="completed" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:2,scanEpoch:2,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:null,observedTree:null} | .release={outcome:"authorized",shellInstance:"vector-shell",generation:2,configurationEpoch:2,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"} | .terminalReceipt={state:"durable",intendedJournalState:"ROLLED_BACK",operationBindingSha256:"0000000000000000000000000000000000000000000000000000000000000000",operationId:.operationId,pluginId:.pluginId,targetRole:"absence",target:{state:"absent",identity:null},shellInstance:"vector-shell",generation:2,scanEpoch:2,configurationEpoch:2,outcome:"restored"}' rolled-back absent absent restored present
+vector rollback-rescan ROLLBACK_STARTED '.state="ROLLBACK_STARTED" | .gate="established" | .namespaceIntent.kind="rollback-install" | .namespaceIntent.state="completed" | .namespaceIntent.sourceSlot="live" | .rollbackEvidence={state:"completed",targetRole:"absence",target:{state:"absent",identity:null},outcome:"restored"} | .rollback="pending" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:2,scanEpoch:2,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:null,observedTree:null}' in-progress absent absent blocked null
+vector rolled-back ROLLED_BACK '.state="ROLLED_BACK" | .gate="established" | .namespaceIntent.kind="rollback-install" | .namespaceIntent.state="completed" | .namespaceIntent.sourceSlot="live" | .rollbackEvidence={state:"completed",targetRole:"absence",target:{state:"absent",identity:null},outcome:"restored"} | .rollback="completed" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:2,scanEpoch:2,sourceDirectory:(.normalizedRequest.facts.destination),expectedTree:null,observedTree:null} | .release={outcome:"authorized",shellInstance:"vector-shell",generation:2,configurationEpoch:2,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"} | .terminalReceipt={state:"durable",intendedJournalState:"ROLLED_BACK",operationBindingSha256:"0000000000000000000000000000000000000000000000000000000000000000",operationId:.operationId,pluginId:.pluginId,targetRole:"absence",target:{state:"absent",identity:null},shellInstance:"vector-shell",generation:2,scanEpoch:2,configurationEpoch:2,outcome:"restored"}' rolled-back absent absent restored present
 vector rejected REJECTED '.state="REJECTED" | .reason="stale-candidate" | .gate="not-established" | .namespaceIntent.state="none" | .rollback="not-applicable" | .rollbackEvidence={state:"not-started",targetRole:"none",target:null,outcome:"not-applicable"} | .terminalReceipt.state="not-requested" | .preExposureEvidence=null' rejected absent absent not-gated null
 vector recovery RECOVERY_REQUIRED '.state="RECOVERY_REQUIRED" | .reason="pre-exposure-stale-candidate" | .gate="established" | .namespaceIntent.state="none" | .rollback="not-applicable" | .rollbackEvidence={state:"not-started",targetRole:"none",target:null,outcome:"not-applicable"} | .terminalReceipt.state="not-requested" | .preExposureEvidence=null' indeterminate absent null indeterminate null
 vector manual MANUAL_ATTENTION '.state="MANUAL_ATTENTION" | .reason="manual-attention" | .gate="established" | .namespaceIntent.state="none" | .rollback="not-applicable" | .rollbackEvidence={state:"not-started",targetRole:"none",target:null,outcome:"not-applicable"} | .terminalReceipt.state="not-requested" | .preExposureEvidence=null' manual-attention absent null indeterminate null
@@ -204,17 +259,18 @@ vector recovery-restored 85000000-0000-4000-8000-000000000001 acme.vector-instal
 # helper proves that only an explicit terminal-pair acknowledgement yields
 # currentShell=released.
 terminal_shell="$INSTALL_ROOT/bin/omarchy-shell"
+terminal_calls="$TEST_ROOT/terminal-calls"
 terminal_commit_filter='.state="COMMITTED" | .gate="established" | .namespaceIntent.state="completed" | .namespaceIntent.kind="install" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:1,scanEpoch:1,sourceDirectory:.normalizedRequest.facts.destination,expectedTree:.candidate.observed,observedTree:.candidate.observed} | .release={outcome:"authorized",shellInstance:"vector-shell",generation:1,configurationEpoch:1,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"} | .terminalReceipt={state:"durable",intendedJournalState:"COMMITTED",operationBindingSha256:.operationBindingSha256,operationId:.operationId,pluginId:.pluginId,targetRole:"candidate",target:{state:"present",identity:.candidate.observed},shellInstance:"vector-shell",generation:1,scanEpoch:1,configurationEpoch:1,outcome:"authorized"}'
 terminal_rollback_filter='.state="ROLLED_BACK" | .gate="established" | .namespaceIntent={kind:"rollback-install",state:"completed",sourceSlot:"live",destination:.normalizedRequest.facts.destination,candidate:.candidate.observed,prior:null} | .rollbackEvidence={state:"completed",targetRole:"absence",target:{state:"absent",identity:null},outcome:"restored"} | .rollback="completed" | .retainedPrior={state:"absent",identity:null,slot:null} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:2,scanEpoch:2,sourceDirectory:.normalizedRequest.facts.destination,expectedTree:null,observedTree:null} | .release={outcome:"authorized",shellInstance:"vector-shell",generation:2,configurationEpoch:2,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"} | .terminalReceipt={state:"durable",intendedJournalState:"ROLLED_BACK",operationBindingSha256:.operationBindingSha256,operationId:.operationId,pluginId:.pluginId,targetRole:"absence",target:{state:"absent",identity:null},shellInstance:"vector-shell",generation:2,scanEpoch:2,configurationEpoch:2,outcome:"restored"}'
 terminal_request() { jq -cn --arg operationId "$1" --arg token "$TOKEN" '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}'; }
 write_terminal_shell() {
   local mode=$1
   if [[ $mode == fail ]]; then
-    printf '#!/bin/bash\nexit 1\n' >"$terminal_shell"
+    printf '%s\n' '#!/bin/bash' 'printf "%s\\n" "$*" >>"'"$terminal_calls"'"' 'exit 1' >"$terminal_shell"
   else
     printf '%s\n' '#!/bin/bash' 'case "$2" in' \
-      '  transactionTerminalReconcile) printf "%s\\n" pending ;;' \
-      '  transactionPluginState) jq -cn --arg operation "$3" '\''{operationId:$operation,status:"terminal-pair-reconciled"}'\'' ;;' \
+      '  transactionTerminalReconcile) printf "%s\\n" "$*" >>"'"$terminal_calls"'"; printf "%s\\n" pending ;;' \
+      '  transactionPluginState) printf "%s\\n" "$*" >>"'"$terminal_calls"'"; jq -cn --arg operation "$3" '\''{operationId:$operation,status:"terminal-pair-reconciled"}'\'' ;;' \
       '  *) exit 1 ;;' 'esac' >"$terminal_shell"
   fi
   chmod 0755 "$terminal_shell"
@@ -222,13 +278,20 @@ write_terminal_shell() {
 terminal_commit() {
   local operation=$1 expected_shell=$2 expected_status=$3 expected_state=$4 expected_durable=$5 expected_code=$6 result code
   set +e
-  result=$(terminal_request "$operation" | HOME="$HOME_DIR" XDG_STATE_HOME="$STATE_HOME" "$INSTALL_ROOT/bin/omarchy-plugin-transaction")
+  local result_file="$TEST_ROOT/terminal-$expected_state-$expected_shell.json"
+  terminal_request "$operation" | HOME="$HOME_DIR" XDG_STATE_HOME="$STATE_HOME" "$INSTALL_ROOT/bin/omarchy-plugin-transaction" >"$result_file"
   code=$?
   set -e
   [[ $code == "$expected_code" ]] || { printf 'terminal result exit=%s expected=%s\n' "$code" "$expected_code" >&2; return 1; }
-  jq -e --arg op "$operation" --arg shell "$expected_shell" --arg state "$expected_state" --arg durable "$expected_durable" --arg status "$expected_status" \
-    '.action=="commit" and .operationId==$op and .state==$state and .status==$status and .eligibility.durableOutcome==$durable and .eligibility.currentShell==$shell and has("filesystem") and has("configuration") and has("registry") and has("release") and has("rollback") and has("recovery")' \
-    <<<"$result" >/dev/null
+  assert_stdout_file "$result_file"
+  result=$(<"$result_file")
+  local name=committed
+  [[ $expected_state == COMMITTED ]] || name=rolled-back
+  local candidate_digest=$install_digest
+  local expected
+  expected=$(expected_result "$name" commit "$operation" acme.vector-install "$expected_state" "$expected_status" "$expected_durable" \
+    "$expected_shell" "$candidate_digest")
+  diff -u <(jq -S . <<<"$expected") <(jq -S . <<<"$result")
 }
 
 set_state "$install_journal" 85000000-0000-4000-8000-000000000001 "$TEST_ROOT/install-base.journal" "$terminal_commit_filter"
@@ -241,8 +304,13 @@ terminal_commit 85000000-0000-4000-8000-000000000001 reconciliation-required com
 terminal_status_after=$(sha256sum "$install_journal" | cut -d' ' -f1)
 [[ $terminal_status_before == "$terminal_status_after" ]] || { printf 'terminal reconciliation failure rewrote COMMITTED journal\n' >&2; exit 1; }
 printf 'ok - committed reconciliation failure retains complete durable result\n'
-status_result=$(status 85000000-0000-4000-8000-000000000001)
-jq -e '.action=="status" and .state=="COMMITTED" and .eligibility.durableOutcome=="authorized" and .eligibility.currentShell=="not-observed"' <<<"$status_result" >/dev/null
+terminal_calls_before=$(wc -l <"$terminal_calls")
+status_result_file="$TEST_ROOT/terminal-committed-status.json"
+status 85000000-0000-4000-8000-000000000001 >"$status_result_file"
+assert_stdout_file "$status_result_file"
+status_result=$(<"$status_result_file")
+assert_common "$status_result" committed 85000000-0000-4000-8000-000000000001 acme.vector-install COMMITTED committed authorized "$install_digest"
+[[ $(wc -l <"$terminal_calls") == "$terminal_calls_before" ]] || { printf 'status unexpectedly called shell\n' >&2; exit 1; }
 printf 'ok - committed read-only status does not infer current-shell release\n'
 
 set_state "$install_journal" 85000000-0000-4000-8000-000000000001 "$TEST_ROOT/install-base.journal" "$terminal_rollback_filter"
@@ -255,8 +323,13 @@ terminal_commit 85000000-0000-4000-8000-000000000001 reconciliation-required rol
 terminal_status_after=$(sha256sum "$install_journal" | cut -d' ' -f1)
 [[ $terminal_status_before == "$terminal_status_after" ]] || { printf 'terminal reconciliation failure rewrote ROLLED_BACK journal\n' >&2; exit 1; }
 printf 'ok - rolled-back reconciliation failure retains complete durable result\n'
-status_result=$(status 85000000-0000-4000-8000-000000000001)
-jq -e '.action=="status" and .state=="ROLLED_BACK" and .eligibility.durableOutcome=="restored" and .eligibility.currentShell=="not-observed"' <<<"$status_result" >/dev/null
+terminal_calls_before=$(wc -l <"$terminal_calls")
+status_result_file="$TEST_ROOT/terminal-rolled-back-status.json"
+status 85000000-0000-4000-8000-000000000001 >"$status_result_file"
+assert_stdout_file "$status_result_file"
+status_result=$(<"$status_result_file")
+assert_common "$status_result" rolled-back 85000000-0000-4000-8000-000000000001 acme.vector-install ROLLED_BACK rolled-back restored "$install_digest"
+[[ $(wc -l <"$terminal_calls") == "$terminal_calls_before" ]] || { printf 'status unexpectedly called shell\n' >&2; exit 1; }
 printf 'ok - rolled-back read-only status does not infer current-shell release\n'
 
 # Copied-install negative control: replacing the authoritative previous-tree
@@ -273,6 +346,45 @@ if jq -e '.previousTree == {state:"absent"} and .filesystem.previous == {state:"
   exit 1
 fi
 printf 'ok - copied-install negative control detects missing known previous absence\n'
+
+# Assertion negative controls deliberately corrupt captured responses.  Each
+# mutation is checked by the same whole-object comparator used above.
+assert_rejects_corruption() {
+  local label=$1 source=$2 mutation=$3 candidate_digest=$4 previous_digest=${5:-} corrupted
+  corrupted=$(jq -c "$mutation" <<<"$source")
+  [[ $corrupted != "$source" ]] || { printf 'negative control did not mutate %s\n' "$label" >&2; exit 1; }
+  if assert_common "$corrupted" committed 85000000-0000-4000-8000-000000000001 "acme.vector-install" COMMITTED committed authorized "$candidate_digest" "$previous_digest" >/dev/null 2>&1; then
+    printf 'negative control accepted %s\n' "$label" >&2
+    exit 1
+  fi
+  printf 'ok - assertion negative control rejects %s\n' "$label"
+}
+
+set_state "$install_journal" 85000000-0000-4000-8000-000000000001 "$TEST_ROOT/install-base.journal" "$terminal_commit_filter"
+negative_status_file="$TEST_ROOT/negative-status.json"
+status 85000000-0000-4000-8000-000000000001 >"$negative_status_file"
+assert_stdout_file "$negative_status_file"
+negative_committed=$(<"$negative_status_file")
+assert_rejects_corruption wrong-reason "$negative_committed" '.reason="wrong-reason"' "$install_digest"
+assert_rejects_corruption wrong-live-tree "$negative_committed" '.filesystem.live.tree.digest="sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' "$install_digest"
+assert_rejects_corruption wrong-registry-generation "$negative_committed" '.registry.generation=99' "$install_digest"
+assert_rejects_corruption wrong-registry-scan-epoch "$negative_committed" '.registry.scanEpoch=99' "$install_digest"
+assert_rejects_corruption configuration-after-copied-before "$negative_committed" '.configuration.after=.configuration.before' "$install_digest"
+assert_rejects_corruption current-shell-released-in-status "$negative_committed" '.eligibility.currentShell="released"' "$install_digest"
+assert_rejects_corruption missing-result-section "$negative_committed" 'del(.rollback)' "$install_digest"
+assert_rejects_corruption unexpected-extra-field "$negative_committed" '.unexpected="not-contract"' "$install_digest"
+
+set_state "$update_journal" 85000000-0000-4000-8000-000000000002 "$TEST_ROOT/update-base.journal" \
+  '.state="ROLLED_BACK" | .gate="established" | .namespaceIntent={kind:"rollback-exchange",state:"completed",sourceSlot:.candidate.completedSlot,destination:.normalizedRequest.facts.destination,candidate:.candidate.observed,prior:.normalizedRequest.facts.expectedActive.identity} | .rollbackEvidence={state:"completed",targetRole:"prior-tree",target:{state:"present",identity:.normalizedRequest.facts.expectedActive.identity},outcome:"restored"} | .rollback="completed" | .retainedPrior={state:"restored",identity:.normalizedRequest.facts.expectedActive.identity,slot:.candidate.completedSlot} | .rescan={outcome:"completed",shellInstance:"vector-shell",generation:2,scanEpoch:2,sourceDirectory:.normalizedRequest.facts.destination,expectedTree:.normalizedRequest.facts.expectedActive.identity,observedTree:.normalizedRequest.facts.expectedActive.identity} | .release={outcome:"authorized",shellInstance:"vector-shell",generation:2,configurationEpoch:2,source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced"} | .terminalReceipt={state:"durable",intendedJournalState:"ROLLED_BACK",operationBindingSha256:.operationBindingSha256,operationId:.operationId,pluginId:.pluginId,targetRole:"prior-tree",target:{state:"present",identity:.normalizedRequest.facts.expectedActive.identity},shellInstance:"vector-shell",generation:2,scanEpoch:2,configurationEpoch:2,outcome:"restored"} | .preExposureEvidence={source:{kind:"user",identity:"omarchy-shell-config:user:v1"},rawSha256:"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",referenceProjection:"sha256:d1b70136d50b542b1c5646d3235047314bd09a2074c5e73e6c2389b7c3209432",referenceState:"unreferenced",referencePolicy:"require-unreferenced",configurationEpoch:1}'
+negative_update_file="$TEST_ROOT/negative-update.json"
+status 85000000-0000-4000-8000-000000000002 >"$negative_update_file"
+assert_stdout_file "$negative_update_file"
+negative_update=$(<"$negative_update_file")
+if assert_common "$(jq -c '.rollback.target.tree.digest="sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"' <<<"$negative_update")" rolled-back-update 85000000-0000-4000-8000-000000000002 acme.vector-update ROLLED_BACK rolled-back restored "$update_digest" "$prior_digest" >/dev/null 2>&1; then
+  printf 'negative control accepted wrong rollback target identity\n' >&2
+  exit 1
+fi
+printf 'ok - assertion negative control rejects wrong rollback target identity\n'
 
 printf 'ok - complete public-result vectors cover 25 O-8 durable states and rollback variants\n'
 exit 0
