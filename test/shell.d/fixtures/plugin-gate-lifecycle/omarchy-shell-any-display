@@ -30,5 +30,17 @@ if [[ ${2:-} == rescanGatedPlugin && -e $fail_gated_rescan ]]; then
   rm -f -- "$fail_gated_rescan"
   exit 70
 fi
+load_root="${XDG_RUNTIME_DIR:-}/omarchy-o8-load-gated"
+if [[ ${2:-} == "transactionStageObservation" && -f "$load_root/observe-replay" &&
+  ${3:-} == "$(<"$load_root/observe-replay")" ]]; then
+  # Observe the actual production IPC response without manufacturing or
+  # altering authority. Retain no request, bearer token, or environment.
+  status=0
+  timeout --kill-after=1s "${OMARCHY_SHELL_IPC_TIMEOUT:-5s}" \
+    qs ipc -n --any-display -p "$OMARCHY_PATH/shell" call -- "$@" \
+    >"$load_root/replay-observation.json" || status=$?
+  cat "$load_root/replay-observation.json"
+  exit "$status"
+fi
 exec timeout --kill-after=1s "${OMARCHY_SHELL_IPC_TIMEOUT:-5s}" \
   qs ipc -n --any-display -p "$OMARCHY_PATH/shell" call -- "$@"

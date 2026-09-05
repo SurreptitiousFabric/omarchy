@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+
+tmp_root=$(cd "$(dirname "$0")/../../.." && pwd)
+runtime="$tmp_root/runtime/omarchy-o8-load-gated"
+# Count only this operation's forward helper invocation, never argv or the
+# environment. This is a helper count, not a kernel syscall count.
+if [[ ${1:-} == "namespace-mutate" && (${2:-} == "install" || ${2:-} == "exchange") &&
+  ${4:-} == "candidate" && -f "$runtime/operation" &&
+  ${3:-} == "$tmp_root/home/.local/state/omarchy/plugin-candidates-v1/$(<"$runtime/operation")" ]]; then
+  printf '%s %s\n' "$2" "$BASHPID" >>"$runtime/namespace-calls"
+  if [[ -e "$runtime/hold-before-namespace" ]]; then
+    : >"$runtime/namespace-ready"
+    IFS= read -r _ <"$runtime/namespace-resume"
+  fi
+fi
+exec "${0}.real" "$@"

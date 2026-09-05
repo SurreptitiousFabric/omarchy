@@ -395,6 +395,8 @@ replaceOnce(
         shellInstance: shell.pluginEligibility.shellInstanceId,
         inventoryReady: shell.pluginEligibility.inventoryReady,
         gate: shell.pluginEligibility.gates[key] || null,
+        thirdPartyAllowed: shell.pluginEligibility.allows(key, false),
+        referenceSnapshot: shell.pluginEligibility.referenceSnapshot(key),
         directUrl: shell.pluginRegistry.installedPlugins[key]
           ? shell.pluginRegistry.entryPointUrl(shell.pluginRegistry.installedPlugins[key], "service") : "",
         results: shell.pluginEligibility.results,

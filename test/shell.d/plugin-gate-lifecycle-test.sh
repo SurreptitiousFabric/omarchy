@@ -93,20 +93,11 @@ if [[ $EXPECTATION == o8-terminal-reviewed || $EXPECTATION == o8-terminal-correc
   cp "$helper" "$test_root/native/plugin-transaction/plugin-tree"
 fi
 if [[ $EXPECTATION == o8-load-gated-authority ]]; then
+  PYTHON_BIN=$(mise which python)
+  rm "$test_root/config"
+  cp -a "$SOURCE_ROOT/config" "$test_root/config"
   mv "$test_root/native/plugin-transaction/plugin-tree" "$test_root/native/plugin-transaction/plugin-tree.real"
-  cat >"$test_root/native/plugin-transaction/plugin-tree" <<'SH'
-#!/bin/bash
-set -euo pipefail
-tmp_root=$(cd "$(dirname "$0")/../../.." && pwd)
-hold="$tmp_root/runtime/omarchy-o8-load-gated/hold-before-namespace"
-ready="$tmp_root/runtime/omarchy-o8-load-gated/namespace-ready"
-resume="$tmp_root/runtime/omarchy-o8-load-gated/namespace-resume"
-if [[ ${1:-} == namespace-mutate && -e "$hold" ]]; then
-  : >"$ready"
-  IFS= read -r _ <"$resume"
-fi
-exec "${0}.real" "$@"
-SH
+  cp "$FIXTURE_ROOT/load-gated-namespace-wrapper" "$test_root/native/plugin-transaction/plugin-tree"
   chmod 0755 "$test_root/native/plugin-transaction/plugin-tree"
 fi
 
@@ -361,17 +352,20 @@ observed_projection=sha256:$(jq -r .referenceProjectionBase64 <<<"$stage_observa
 pass "production stage observation uses the live accepted O-6 snapshot and canonical projection"
 
 if [[ $EXPECTATION == o8-load-gated-authority ]]; then
+  source "$FIXTURE_ROOT/load-gated-configuration.sh"
+  if [[ ${OMARCHY_LIFECYCLE_AUTHORITY_CASE:-all} != "all" ]]; then
+    run_configuration_cases
+    exit 0
+  fi
   # Drive a real install through the production stage/commit route until its
   # durable LOAD_GATED image, then kill the coordinator before native exposure.
   # The next coordinator must obtain a fresh O-6 observation before it can
   # promote or mutate the namespace.
   o8_load_operation=63000000-0000-4000-8000-000000000010
   kill_process_tree() {
-    local parent=$1 child
-    for child in $(pgrep -P "$parent" 2>/dev/null || true); do
-      kill_process_tree "$child"
-    done
-    kill "$parent" 2>/dev/null || true
+    # The test subreaper signals only its coordinator's private process group
+    # and reaps every owned helper before this shell's wait completes.
+    kill "$1" 2>/dev/null || true
   }
   o8_load_source="$TMPDIR/candidate-$o8_load_id"
   mkdir -p "$o8_load_source"
@@ -393,13 +387,16 @@ if [[ $EXPECTATION == o8-load-gated-authority ]]; then
     fail "LOAD_GATED authority stage was not accepted"
   load_runtime="$runtime_dir/omarchy-o8-load-gated"
   mkdir -p "$load_runtime"
+  printf '%s\n' "$o8_load_operation" >"$load_runtime/operation"
+  : >"$load_runtime/namespace-calls"
   : >"$load_runtime/hold-before-namespace"
   rm -f "$load_runtime/namespace-ready" "$load_runtime/namespace-resume"
   mkfifo "$load_runtime/namespace-resume"
   o8_load_commit=$(jq -cn --arg operationId "$o8_load_operation" --arg token "$o8_load_token" \
     '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
   set +e
-  printf '%s' "$o8_load_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load-owner-result" 2>"$TMPDIR/load-owner-error" &
+  printf '%s' "$o8_load_commit" | "$PYTHON_BIN" "$FIXTURE_ROOT/load-gated-coordinator.py" \
+    "$TMPDIR/load-owner-process.json" "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load-owner-result" 2>"$TMPDIR/load-owner-error" &
   load_owner=$!
   REPLAY_OWNER_PID=$load_owner
   set -e
@@ -412,22 +409,29 @@ if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   kill_process_tree "$load_owner"
   wait "$load_owner" 2>/dev/null || true
   REPLAY_OWNER_PID=""
+  assert_reaped "$TMPDIR/load-owner-process.json"
   [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/journals/$o8_load_operation.journal") == LOAD_GATED ]] ||
     fail "coordinator did not die at LOAD_GATED"
   rm -f "$load_runtime/hold-before-namespace" "$load_runtime/namespace-ready"
   rm -f "$load_runtime/namespace-resume"
   printf '%s\n' resume >"$load_runtime/namespace-resume" 2>/dev/null || true
+  : >"$load_runtime/namespace-calls"
   # A fresh coordinator with unchanged authority must reconcile and perform
   # exactly one forward mutation before continuing through the real shell.
   set +e
-  printf '%s' "$o8_load_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load-fresh-result" 2>"$TMPDIR/load-fresh-error"
+  printf '%s' "$o8_load_commit" | "$PYTHON_BIN" "$FIXTURE_ROOT/load-gated-coordinator.py" \
+    "$TMPDIR/load-fresh-process.json" "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load-fresh-result" 2>"$TMPDIR/load-fresh-error"
   load_status=$?
   set -e
+  assert_fresh_process "$TMPDIR/load-owner-process.json" "$TMPDIR/load-fresh-process.json"
+  [[ $(wc -l <"$load_runtime/namespace-calls") == 1 ]] || fail "unchanged replay namespace-helper invocation count must be one"
+  cp "$load_runtime/namespace-calls" "$TMPDIR/load-namespace-calls"
   (( load_status == 0 )) || { sed -n '1,120p' "$TMPDIR/load-fresh-error" >&2; cat "$TMPDIR/load-fresh-result" >&2; fail "fresh LOAD_GATED replay failed"; }
   jq -e --arg op "$o8_load_operation" '.operationId==$op and .state=="COMMITTED" and .status=="committed"' \
     "$TMPDIR/load-fresh-result" >/dev/null || fail "fresh unchanged LOAD_GATED replay did not commit"
   [[ -d "$plugin_dir/$o8_load_id" && $($helper identity "$plugin_dir/$o8_load_id") == "$o8_load_identity" ]] ||
     fail "fresh LOAD_GATED replay did not expose the exact candidate"
+  [[ ! -e "$state_dir/omarchy/plugin-candidates-v1/$o8_load_operation/candidate" ]] || fail "unchanged replay retained candidate slot"
   pass "real-QML fresh LOAD_GATED replay obtains fresh authority and performs one forward mutation"
 
   # A second fresh LOAD_GATED image with an independently changed candidate
@@ -453,11 +457,14 @@ if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   printf '%s' "$o8_load2_request" | "$test_root/bin/omarchy-plugin-transaction" >/dev/null ||
     fail "changed-candidate LOAD_GATED stage was not accepted"
   : >"$load_runtime/hold-before-namespace"
+  printf '%s\n' "$o8_load2_operation" >"$load_runtime/operation"
+  : >"$load_runtime/namespace-calls"
   rm -f "$load_runtime/namespace-ready" "$load_runtime/namespace-resume"
   mkfifo "$load_runtime/namespace-resume"
   o8_load2_commit=$(jq -cn --arg operationId "$o8_load2_operation" --arg token "$o8_load2_token" \
     '{protocol:"legacy-schema-v1-transaction/v1",action:"commit",operationId:$operationId,operationToken:$token}')
-  printf '%s' "$o8_load2_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load2-owner-result" 2>"$TMPDIR/load2-owner-error" &
+  printf '%s' "$o8_load2_commit" | "$PYTHON_BIN" "$FIXTURE_ROOT/load-gated-coordinator.py" \
+    "$TMPDIR/load2-owner-process.json" "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load2-owner-result" 2>"$TMPDIR/load2-owner-error" &
   load2_owner=$!
   REPLAY_OWNER_PID=$load2_owner
   wait_for "changed-candidate LOAD_GATED namespace barrier" \
@@ -465,12 +472,21 @@ if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   kill_process_tree "$load2_owner"
   wait "$load2_owner" 2>/dev/null || true
   REPLAY_OWNER_PID=""
+  assert_reaped "$TMPDIR/load2-owner-process.json"
   printf '\nchanged-after-gate\n' >>"$state_dir/omarchy/plugin-candidates-v1/$o8_load2_operation/candidate/Service.qml"
+  changed_candidate_identity=$($helper identity "$state_dir/omarchy/plugin-candidates-v1/$o8_load2_operation/candidate")
   rm -f "$load_runtime/hold-before-namespace" "$load_runtime/namespace-ready" "$load_runtime/namespace-resume"
+  : >"$load_runtime/namespace-calls"
   set +e
-  printf '%s' "$o8_load2_commit" | "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load2-fresh-result" 2>"$TMPDIR/load2-fresh-error"
+  printf '%s' "$o8_load2_commit" | "$PYTHON_BIN" "$FIXTURE_ROOT/load-gated-coordinator.py" \
+    "$TMPDIR/load2-fresh-process.json" "$test_root/bin/omarchy-plugin-transaction" >"$TMPDIR/load2-fresh-result" 2>"$TMPDIR/load2-fresh-error"
   load2_status=$?
   set -e
+  assert_fresh_process "$TMPDIR/load2-owner-process.json" "$TMPDIR/load2-fresh-process.json"
+  [[ ! -s "$load_runtime/namespace-calls" ]] || fail "changed-candidate namespace-helper invocation count must be zero"
+  cp "$load_runtime/namespace-calls" "$TMPDIR/load2-namespace-calls"
+  [[ $($helper identity "$state_dir/omarchy/plugin-candidates-v1/$o8_load2_operation/candidate") == "$changed_candidate_identity" ]] || fail "fresh replay changed the stale candidate"
+  ((load2_status == 5)) || fail "changed-candidate replay must return exit 5"
   (( load2_status != 0 )) || fail "changed candidate falsely completed from LOAD_GATED"
   jq -e --arg op "$o8_load2_operation" '.operationId==$op and .state=="RECOVERY_REQUIRED" and .status=="indeterminate"' \
     "$TMPDIR/load2-fresh-result" >/dev/null || fail "changed candidate did not produce post-gate recovery result"
@@ -509,6 +525,7 @@ if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   [[ $(jq -r .state "$state_dir/omarchy/plugin-transactions-v1/gates/$o8_load2_id.gate") == UNLOAD_ACKNOWLEDGED ]] ||
     fail "changed candidate lost its blocking gate"
   pass "real-QML fresh LOAD_GATED candidate change is fail-closed without mutation"
+  run_configuration_cases
   exit 0
 fi
 
