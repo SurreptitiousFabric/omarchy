@@ -382,6 +382,8 @@ replaceOnce(
         registryScanning: shell.pluginRegistry.scanning,
         pluginWatcherRunning: shell.pluginRegistry.testLocalWatcherRunning(),
         registryGeneration: shell.pluginRegistry.registryGeneration,
+        registryAuthority: shell.pluginRegistry.authoritySnapshot(key),
+        registrySources: shell.pluginRegistry.lastScanOutcome.thirdPartySources[key] || [],
         scanEpoch: ("scanEpoch" in shell.pluginRegistry) ? shell.pluginRegistry.scanEpoch : -1,
         configurationEpoch: shell.pluginEligibility.configurationEpoch,
         shellConfig: shell.shellConfig,

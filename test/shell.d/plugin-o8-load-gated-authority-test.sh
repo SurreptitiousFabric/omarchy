@@ -33,3 +33,33 @@ for comparison in source projection; do
   [[ $(wc -l <"$negative/configuration-$comparison/namespace-calls") == 1 ]] || fail "negative control lacked attempted exposure"
   pass "test-only $comparison comparison bypass detected: one attempted forward namespace-helper invocation at the barrier"
 done
+
+# Each continuation gets the same harness in a fresh isolated installation.
+# Keep going across this fixed five-case set to preserve a bounded discrepancy
+# list if one real authority scenario fails. Checkpoint 2A above is unchanged.
+remaining_failures=()
+for remaining in active-tree duplicate-id moved-source malformed-observation shell-unavailable; do
+  status=0
+  OMARCHY_LIFECYCLE_EXPECTATION=o8-load-gated-authority \
+    OMARCHY_LIFECYCLE_REMAINING_CASE="$remaining" \
+    OMARCHY_LIFECYCLE_EVIDENCE_DIR="$evidence_root/remaining-$remaining" \
+    "$ROOT/test/shell.d/plugin-gate-lifecycle-test.sh" >"$evidence_root/remaining-$remaining.log" 2>&1 || status=$?
+  printf '%s\n' "$status" >"$evidence_root/remaining-$remaining.exit"
+  cat "$evidence_root/remaining-$remaining.log"
+  if ((status != 0)); then remaining_failures+=("$remaining"); fi
+done
+
+status=0
+OMARCHY_LIFECYCLE_EXPECTATION=o8-load-gated-authority \
+  OMARCHY_LIFECYCLE_REMAINING_CASE=active-tree \
+  OMARCHY_LIFECYCLE_REMAINING_BYPASS=active-tree \
+  OMARCHY_LIFECYCLE_EVIDENCE_DIR="$evidence_root/negative-active-tree" \
+  "$ROOT/test/shell.d/plugin-gate-lifecycle-test.sh" >"$evidence_root/negative-active-tree.log" 2>&1 || status=$?
+if [[ $status == 1 && -s "$evidence_root/negative-active-tree/remaining-active-tree/detected-comparison-bypass" ]] \
+  && rg -Fx 'not ok - active-tree post-gate response lost exact durable-result dimensions' "$evidence_root/negative-active-tree.log" >/dev/null; then
+  pass "copied active-tree comparison bypass detected; independent namespace-layout safeguard still blocks exposure"
+else
+  cat "$evidence_root/negative-active-tree.log" >&2
+  remaining_failures+=(active-tree-bypass)
+fi
+((${#remaining_failures[@]} == 0)) || fail "remaining LOAD_GATED cases failed: ${remaining_failures[*]}"

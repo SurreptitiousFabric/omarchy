@@ -36,9 +36,21 @@ if [[ ${2:-} == "transactionStageObservation" && -f "$load_root/observe-replay" 
   # Observe the actual production IPC response without manufacturing or
   # altering authority. Retain no request, bearer token, or environment.
   status=0
+  observation_started=$EPOCHREALTIME
   timeout --kill-after=1s "${OMARCHY_SHELL_IPC_TIMEOUT:-5s}" \
     qs ipc -n --any-display -p "$OMARCHY_PATH/shell" call -- "$@" \
     >"$load_root/replay-observation.json" || status=$?
+  printf '%s %s %s %s\n' "$observation_started" "$EPOCHREALTIME" "$status" \
+    "${OMARCHY_SHELL_IPC_TIMEOUT:-5s}" >"$load_root/observation-timing"
+  if [[ -e "$load_root/truncate-observation" && $status == 0 ]]; then
+    # Transport fault only: retain the real producer response, then remove its
+    # closing brace. Never substitute a fabricated valid authority object.
+    rm "$load_root/truncate-observation"
+    observation=$(<"$load_root/replay-observation.json")
+    printf '%s' "${observation%?}" >"$load_root/transport-observation"
+    cat "$load_root/transport-observation"
+    exit 0
+  fi
   cat "$load_root/replay-observation.json"
   exit "$status"
 fi

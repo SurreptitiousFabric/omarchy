@@ -353,6 +353,11 @@ pass "production stage observation uses the live accepted O-6 snapshot and canon
 
 if [[ $EXPECTATION == o8-load-gated-authority ]]; then
   source "$FIXTURE_ROOT/load-gated-configuration.sh"
+  if [[ -n ${OMARCHY_LIFECYCLE_REMAINING_CASE:-} ]]; then
+    source "$FIXTURE_ROOT/load-gated-remaining.sh"
+    run_remaining_authority_case "$OMARCHY_LIFECYCLE_REMAINING_CASE"
+    exit 0
+  fi
   if [[ ${OMARCHY_LIFECYCLE_AUTHORITY_CASE:-all} != "all" ]]; then
     run_configuration_cases
     exit 0
